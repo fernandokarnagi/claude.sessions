@@ -75,10 +75,21 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
     return summary
 
 
+# Sessions that are idle and waiting on the user (the "needs attention" set).
+ATTENTION_STATUSES = {"WAITING", "SITTING", "SLEEPING"}
+
+
 @app.get("/api/sessions")
-def api_sessions(limit: str = Query("10"), offset: int = Query(0)):
+def api_sessions(limit: str = Query("10"), offset: int = Query(0),
+                 status: str | None = Query(None)):
     lim = None if limit == "all" else int(limit)
-    data = parser.list_sessions(limit=lim, offset=offset)
+    statuses = None
+    if status:
+        if status.lower() == "attention":
+            statuses = ATTENTION_STATUSES
+        else:
+            statuses = {x.strip().upper() for x in status.split(",") if x.strip()}
+    data = parser.list_sessions(limit=lim, offset=offset, statuses=statuses)
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles)
@@ -106,6 +117,28 @@ def api_session(session_id: str):
 # Statuses for which a "what's expected from you" summary makes sense:
 # idle and the assistant spoke last (waiting on the user).
 _WAITING_STATUSES = {"WAITING", "SITTING", "SLEEPING"}
+
+
+@app.get("/api/sessions/{session_id}/status")
+def api_status(session_id: str):
+    """Cheap, cached summary (no activities) — for live header refresh on the
+    detail page without re-parsing the full transcript each poll."""
+    s = parser.get_summary(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _decorate(s, registry.web_mtimes(), runner.running_ids())
+    return s
+
+
+@app.get("/api/sessions/{session_id}/tail")
+def api_tail(session_id: str, offset: int = Query(0)):
+    """Incremental history: events written after byte `offset`. For live
+    streaming on the detail page without re-parsing the whole transcript."""
+    path = parser.session_path(session_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    activities, new_offset = parser.tail_activities(path, offset)
+    return {"activities": activities, "offset": new_offset}
 
 
 @app.get("/api/sessions/{session_id}/summary")

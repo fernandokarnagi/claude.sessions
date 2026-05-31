@@ -32,8 +32,8 @@ SUMMARIZER_CWD = os.path.expanduser("~/.claude_dashboard_summarizer")
 
 # Status thresholds, in seconds, based on time since the file was last written.
 # Tiers (each is the UPPER bound of that status):
-THINKING_MAX_AGE = 10            # < 10s        -> THINKING (actively working)
-WAITING_MAX_AGE = 30 * 60        # 10s … 30min  -> WAITING
+THINKING_MAX_AGE = 30            # < 30s        -> THINKING (actively working)
+WAITING_MAX_AGE = 30 * 60        # 30s … 30min  -> WAITING
 SITTING_MAX_AGE = 2 * 3600       # 30min … 2h   -> SITTING
 SLEEPING_MAX_AGE = 24 * 3600     # 2h … 24h     -> SLEEPING
 # >= 24h -> ENDED (logs have no real end-marker; this is an idle assumption)
@@ -280,16 +280,21 @@ def _summary_for(path: str) -> Optional[dict]:
     return summary
 
 
-def list_sessions(limit: Optional[int] = 10, offset: int = 0) -> dict:
-    """Return summaries sorted by created datetime, newest first.
+def list_sessions(limit: Optional[int] = 10, offset: int = 0,
+                  statuses: Optional[set] = None) -> dict:
+    """Return summaries sorted by last activity, newest first.
 
-    limit=None means 'all'. Returns {sessions, total}.
+    limit=None means 'all'. `statuses` (a set like {"WAITING","SITTING"}) filters
+    to only those statuses. Returns {sessions, total} where total is the count
+    after filtering.
     """
     paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
     summaries = [s for s in (_summary_for(p) for p in paths)
                  if s and s.get("cwd") != SUMMARIZER_CWD]
     # Sort by last activity (file mtime) so THINKING/WAITING sessions surface first.
     summaries.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+    if statuses:
+        summaries = [s for s in summaries if s.get("status") in statuses]
     total = len(summaries)
     window = summaries[offset:] if limit is None else summaries[offset: offset + limit]
     return {"sessions": window, "total": total}
@@ -299,6 +304,56 @@ def session_cwd(session_id: str) -> Optional[str]:
     """Return the working directory recorded for a session (for resume cwd)."""
     s = _summary_for_id(session_id)
     return s.get("cwd") if s else None
+
+
+def get_summary(session_id: str) -> Optional[dict]:
+    """Lightweight summary (no activities) for a single session; uses the cache."""
+    return _summary_for_id(session_id)
+
+
+def session_path(session_id: str) -> Optional[str]:
+    """Absolute path to a session's transcript, or None."""
+    matches = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    return matches[0] if matches else None
+
+
+def tail_activities(path: str, offset: int) -> tuple[list[dict], int]:
+    """Read transcript events written after byte `offset`.
+
+    Returns (activities, new_offset) where activities are in chronological order
+    (oldest first) and new_offset is the byte position after the last COMPLETE
+    line consumed. A partial trailing line (no newline yet) is left for next time.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], offset
+    if offset > size:
+        return [], size  # file shrank/rotated -> resync pointer, skip content
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        data = fh.read()
+    if not data:
+        return [], offset
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return [], offset  # no complete line yet
+    consumed = data[: last_nl + 1]
+    new_offset = offset + len(consumed)
+
+    activities: list[dict] = []
+    for raw in consumed.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            evt = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for block in render_blocks(evt):
+            if block.get("text", "").strip() or block.get("name"):
+                activities.append(block)
+    return activities, new_offset
 
 
 def session_mtime(session_id: str) -> Optional[float]:
@@ -388,4 +443,8 @@ def get_session(session_id: str) -> Optional[dict]:
 
     detail = dict(summary)
     detail["activities"] = activities
+    try:
+        detail["file_size"] = os.path.getsize(path)  # tail starting offset
+    except OSError:
+        detail["file_size"] = 0
     return detail

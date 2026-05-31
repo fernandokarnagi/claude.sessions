@@ -54,6 +54,18 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 }
 .navlink:hover { color: var(--accent); border-color: var(--accent); }
 
+.toggle {
+  font-size: 13px; color: var(--muted); cursor: pointer;
+  padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--panel-2); white-space: nowrap;
+}
+.toggle:hover { color: var(--text); border-color: var(--muted); }
+.toggle.active {
+  color: var(--accent); border-color: var(--accent);
+  background: rgba(88,166,255,.14); font-weight: 600;
+}
+#attentionToggle.active { color: var(--tool); border-color: var(--tool); background: rgba(210,153,34,.14); }
+
 .search-bar { margin-bottom: 20px; }
 .search-bar input {
   width: 100%; box-sizing: border-box;
@@ -175,6 +187,13 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .event.result .kind { color: var(--result); }
 
 .back { color: var(--accent); font-size: 13px; }
+
+/* newly-streamed history events briefly highlight */
+@keyframes flashIn {
+  0% { background: rgba(88,166,255,.22); }
+  100% { background: var(--panel); }
+}
+.event.flash { animation: flashIn 1.6s ease-out; }
 
 /* ---- origin badge + live dot ---- */
 .origin {

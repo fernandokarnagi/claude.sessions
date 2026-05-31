@@ -51,40 +51,136 @@ async function getJSON(url) {
 
 const Dashboard = {
   FAST_MS: 1000,   // poll rate while any session is live/THINKING
-  SLOW_MS: 5000,   // poll rate when everything is idle
+  SLOW_MS: 5000,   // poll rate when everything is idle (or backgrounded)
   timer: null,
+  mode: "all",            // "all" | "attention"
+  notifyOn: false,
+  prevStatus: {},         // session_id -> last seen status (for transition detection)
+  baselineSet: false,
 
   init() {
     document.getElementById("limit").addEventListener("change", () => this.tick());
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) this.tick();  // refresh immediately when tab refocused
+    document.getElementById("attentionToggle").addEventListener("click", () => {
+      this.mode = this.mode === "attention" ? "all" : "attention";
+      this.updateToggles();
+      this.tick();
     });
+    document.getElementById("notifyToggle").addEventListener("click", () => this.toggleNotify());
+    this.notifyOn = localStorage.getItem("notifyOn") === "1"
+      && ("Notification" in window) && Notification.permission === "granted";
+    this.updateToggles();
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) this.tick(); });
     this.tick();
   },
 
-  // self-pacing loop: fetch, render, then schedule the next tick based on activity
+  updateToggles() {
+    document.getElementById("attentionToggle").classList.toggle("active", this.mode === "attention");
+    document.getElementById("limitLabel").style.display = this.mode === "attention" ? "none" : "";
+    const nt = document.getElementById("notifyToggle");
+    nt.classList.toggle("active", this.notifyOn);
+    nt.textContent = this.notifyOn ? "🔔 Notifying" : "🔔 Notify";
+  },
+
+  async toggleNotify() {
+    if (!("Notification" in window)) {
+      alert("This browser doesn't support the Notification API.");
+      return;
+    }
+    if (!window.isSecureContext) {
+      alert("Notifications need a secure context. Open the dashboard via http://127.0.0.1 or http://localhost (not a LAN IP).");
+      return;
+    }
+    if (this.notifyOn) {
+      this.notifyOn = false; localStorage.setItem("notifyOn", "0");
+      this.updateToggles();
+      return;
+    }
+    let perm = Notification.permission;
+    if (perm === "default") perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      alert("Notifications are blocked for this site.\n\nEnable them in your browser's site settings (click the icon left of the URL), and make sure your OS allows notifications for the browser (macOS: System Settings → Notifications → your browser; turn off Do Not Disturb/Focus).");
+      this.updateToggles();
+      return;
+    }
+    this.notifyOn = true; localStorage.setItem("notifyOn", "1");
+    this.updateToggles();
+    // Immediate confirmation so you know the pipeline works without waiting for
+    // a real THINKING->WAITING transition.
+    try {
+      const n = new Notification("✅ Notifications enabled", {
+        body: "You'll be alerted here when a session starts waiting for you.",
+      });
+      n.onclick = () => window.focus();
+      setTimeout(() => n.close(), 5000);
+    } catch (e) {
+      alert("Permission is granted, but the browser couldn't show a notification. Check your OS notification settings for this browser (and Do Not Disturb / Focus).");
+    }
+  },
+
   async tick() {
     clearTimeout(this.timer);
-    const limit = document.getElementById("limit").value;
     let active = false;
     try {
-      const data = await getJSON(`/api/sessions?limit=${limit}`);
+      const url = this.mode === "attention"
+        ? "/api/sessions?status=attention&limit=all"
+        : `/api/sessions?limit=${document.getElementById("limit").value}`;
+      const data = await getJSON(url);
+      this.detectTransitions(data.sessions);
       this.render(data);
       active = data.sessions.some((s) => s.status === "THINKING" || s.live);
     } catch (e) {
       document.getElementById("meta").textContent = "error: " + e.message;
     }
-    if (document.hidden) return;  // pause polling while tab is hidden
+    // Keep polling in the background only when notifications are on (so we can
+    // alert you while away); otherwise pause to save resources.
+    if (document.hidden) {
+      if (this.notifyOn) this.timer = setTimeout(() => this.tick(), this.SLOW_MS);
+      return;
+    }
     this.timer = setTimeout(() => this.tick(), active ? this.FAST_MS : this.SLOW_MS);
+  },
+
+  // Fire a notification when a session goes THINKING -> WAITING.
+  detectTransitions(sessions) {
+    const cur = {};
+    for (const s of sessions) cur[s.session_id] = s.status;
+    if (this.baselineSet && this.notifyOn) {
+      for (const s of sessions) {
+        if (this.prevStatus[s.session_id] === "THINKING" && s.status === "WAITING") {
+          this.notify(s);
+        }
+      }
+    }
+    Object.assign(this.prevStatus, cur);
+    this.baselineSet = true;
+  },
+
+  notify(s) {
+    try {
+      const n = new Notification("⏳ Session waiting for you", {
+        body: `${s.title}\n${s.project || ""}`,
+        tag: s.session_id,          // collapse repeats per session
+        renotify: false,
+      });
+      n.onclick = () => {
+        window.focus();
+        location.href = `/session.html?id=${encodeURIComponent(s.session_id)}`;
+      };
+    } catch (e) { /* notifications best-effort */ }
   },
 
   render(data) {
     const grid = document.getElementById("grid");
     const empty = document.getElementById("empty");
     const meta = document.getElementById("meta");
-    meta.textContent =
-      `${data.sessions.length} of ${data.total} sessions · updated ${new Date().toLocaleTimeString()}`;
-
+    const t = new Date().toLocaleTimeString();
+    if (this.mode === "attention") {
+      meta.textContent = `${data.total} waiting on you · updated ${t}`;
+      empty.textContent = "🎉 Nothing needs your attention right now.";
+    } else {
+      meta.textContent = `${data.sessions.length} of ${data.total} sessions · updated ${t}`;
+      empty.textContent = "No sessions found.";
+    }
     empty.style.display = data.sessions.length ? "none" : "block";
     grid.innerHTML = data.sessions.map((s) => this.card(s)).join("");
   },
@@ -159,17 +255,51 @@ const Detail = {
   id: null,
   busy: false,
   activeModel: null,
+  pollTimer: null,
+  offset: 0,
+  FAST_MS: 1500,
+  SLOW_MS: 5000,
 
   init() {
     this.id = new URLSearchParams(location.search).get("id");
     if (!this.id) { document.getElementById("header").textContent = "Missing session id"; return; }
-    this.load();
+    this.load().then(() => this.poll());   // start polling only after first load
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.poll();
+    });
+  },
+
+  // lightweight status refresh so the detail header tracks live CLI activity
+  async poll() {
+    clearTimeout(this.pollTimer);
+    let active = false;
+    try {
+      const s = await getJSON(`/api/sessions/${encodeURIComponent(this.id)}/status`);
+      active = s.status === "THINKING" || s.live;
+      this.applyStatus(s);
+      await this.tailNew();   // stream any newly-written history
+    } catch (e) { /* keep last known state */ }
+    if (document.hidden) return;
+    this.pollTimer = setTimeout(() => this.poll(), active ? this.FAST_MS : this.SLOW_MS);
+  },
+
+  applyStatus(s) {
+    // don't disturb an in-progress title edit
+    if (document.getElementById("titleInput")) return;
+    const prev = this.detail ? this.detail.status : null;
+    // merge fresh status fields onto the loaded detail (keep activities)
+    this.detail = Object.assign({}, this.detail || {}, s);
+    this.renderHeader(this.detail);
+    // when a session transitions into a waiting state, fetch its summary
+    const WAIT = ["WAITING", "SITTING", "SLEEPING"];
+    if (WAIT.includes(s.status) && !WAIT.includes(prev)) this.loadSummary(this.detail);
   },
 
   async load() {
     try {
       const d = await getJSON(`/api/sessions/${encodeURIComponent(this.id)}`);
       document.title = d.title;
+      this.offset = d.file_size || 0;   // start tailing from here
       this.renderHeader(d);
       this.renderChat(d);
       this.renderEvents(d.activities || []);
@@ -184,6 +314,8 @@ const Detail = {
     const box = document.getElementById("summary");
     const WAITING = ["WAITING", "SITTING", "SLEEPING"];
     if (!WAITING.includes(d.status)) { box.innerHTML = ""; return; }
+    if (this._summaryBusy) return;   // avoid concurrent generation
+    this._summaryBusy = true;
 
     box.innerHTML = `
       <div class="summary-panel">
@@ -205,6 +337,8 @@ const Detail = {
       }
     } catch (e) {
       box.querySelector(".summary-body").textContent = "Could not generate summary: " + e.message;
+    } finally {
+      this._summaryBusy = false;
     }
   },
 
@@ -399,17 +533,42 @@ const Detail = {
     }
   },
 
-  renderEvents(events) {
-    const wrap = document.getElementById("events");
-    if (!events.length) { wrap.innerHTML = `<div class="empty">No activity.</div>`; return; }
-    wrap.innerHTML = events.map((e) => {
-      const cls = "event " + e.kind + (e.is_error ? " error" : "");
-      const label = e.name ? `${e.kind} · ${esc(e.name)}` : e.kind;
-      return `
+  eventHTML(e, isNew) {
+    const cls = "event " + e.kind + (e.is_error ? " error" : "") + (isNew ? " flash" : "");
+    const label = e.name ? `${e.kind} · ${esc(e.name)}` : e.kind;
+    return `
       <div class="${cls}">
         <div class="hd"><span class="kind">${label}</span><span class="ts">${fmtTime(e.ts)}</span></div>
         <pre>${esc(e.text)}</pre>
       </div>`;
-    }).join("");
+  },
+
+  renderEvents(events) {
+    const wrap = document.getElementById("events");
+    if (!events.length) { wrap.innerHTML = `<div class="empty">No activity.</div>`; return; }
+    wrap.innerHTML = events.map((e) => this.eventHTML(e, false)).join("");
+  },
+
+  // append newly-written events to the TOP of the history (newest first)
+  prependEvents(acts) {
+    const wrap = document.getElementById("events");
+    const placeholder = wrap.querySelector(".empty");
+    if (placeholder) placeholder.remove();
+    // acts are chronological (old->new); reverse so the newest ends up at top
+    const html = acts.slice().reverse().map((e) => this.eventHTML(e, true)).join("");
+    wrap.insertAdjacentHTML("afterbegin", html);
+  },
+
+  async tailNew() {
+    if (this.busy) return;  // chat turn streams into #stream; load() resyncs after
+    try {
+      const r = await getJSON(`/api/sessions/${encodeURIComponent(this.id)}/tail?offset=${this.offset || 0}`);
+      if (r.activities && r.activities.length) {
+        this.offset = r.offset;
+        this.prependEvents(r.activities);
+      } else if (typeof r.offset === "number") {
+        this.offset = r.offset;
+      }
+    } catch (e) { /* keep last offset; retry next poll */ }
   },
 };

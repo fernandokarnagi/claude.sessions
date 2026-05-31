@@ -76,12 +76,25 @@ def test_status_ended():
 
 def test_status_tier_boundaries():
     now = 1_000_000.0
+    assert parser.compute_status(now - 29, now) == "THINKING"       # just under 30s
+    assert parser.compute_status(now - 30, now) == "WAITING"        # exactly 30s -> WAITING
     assert parser.compute_status(now - 30 * 60, now) == "SITTING"   # exactly 30min -> next tier
     assert parser.compute_status(now - 2 * 3600, now) == "SLEEPING" # exactly 2h -> next tier
     assert parser.compute_status(now - 24 * 3600, now) == "ENDED"   # exactly 24h -> ENDED
 
 
 # ---- summaries ---------------------------------------------------------------
+
+def test_list_sessions_status_filter(transcript, monkeypatch):
+    # fixture session is old (2026 timestamps) -> ENDED; filter should respect it
+    s = parser.list_sessions()["sessions"][0]
+    st = s["status"]
+    # filtering to its own status keeps it
+    assert parser.list_sessions(statuses={st})["total"] == 1
+    # filtering to a different status excludes it
+    other = "THINKING" if st != "THINKING" else "WAITING"
+    assert parser.list_sessions(statuses={other})["total"] == 0
+
 
 def test_list_sessions_basic(transcript):
     out = parser.list_sessions()
