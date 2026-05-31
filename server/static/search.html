@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Search sessions</title>
+  <link rel="stylesheet" href="/static/style.css?v=6" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="back" href="/">← Dashboard</a>
+    <h1 style="font-size:15px;margin:0 0 0 8px">🔎 Search</h1>
+    <span class="spacer"></span>
+    <span class="meta" id="meta"></span>
+  </header>
+  <main>
+    <div class="search-bar">
+      <input id="q" type="text" autofocus
+             placeholder="Search by title, session ID, or path — wildcards ok (e.g. *docker*, build*, df8c1588) …" />
+    </div>
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty">Type to search by title, session ID, or project path. Wildcards * and ? supported.</div>
+  </main>
+  <script src="/static/app.js?v=6"></script>
+  <script>Search.init();</script>
+</body>
+</html>

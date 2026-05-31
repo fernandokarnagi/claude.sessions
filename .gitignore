@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Local runtime state (per-user data, not code)
+server/.web_sessions.json
+server/.title_overrides.json
+server/.waiting_summaries.json
+server/.adopted.json
+server/.*.tmp
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

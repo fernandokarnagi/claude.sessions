@@ -1,0 +1,208 @@
+"""
+app.py — FastAPI layer over parser.py + runner.py.
+
+Endpoints:
+    GET  /api/sessions?limit=10&offset=0   -> {sessions, total}  (origin/live merged in)
+    GET  /api/sessions/{id}                -> full detail
+    POST /api/sessions/{id}/send           -> SSE stream of a resumed turn
+    GET  /                                  -> dashboard
+    GET  /session.html                      -> detail page
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from . import overrides, parser, registry, runner, summaries, summarizer
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+app = FastAPI(title="Claude Sessions Dashboard")
+
+
+@app.middleware("http")
+async def no_store(request, call_next):
+    """Local dev tool — never let the browser cache HTML/JS/CSS, so updates to
+    static assets always take effect on reload."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
+
+
+# mtime slop (seconds) to absorb timestamp resolution between our recorded
+# post-turn mtime and a subsequent stat of the same file.
+_MTIME_EPS = 1.0
+
+
+def _decorate(summary: dict, web_mtimes: dict, running: set[str],
+              titles: dict | None = None) -> dict:
+    """Attach origin (cli/vscode/web), live flags, and any title override.
+
+    A session is 'web' only if either (a) a web turn is generating right now,
+    or (b) the web app wrote last — i.e. the file has NOT been written since
+    our recorded post-turn mtime. If the CLI writes afterwards, it flips back.
+    """
+    sid = summary["session_id"]
+
+    # Apply user title override (dashboard-only; transcript is untouched).
+    titles = titles if titles is not None else overrides.all_titles()
+    summary["default_title"] = summary["title"]
+    if sid in titles:
+        summary["title"] = titles[sid]
+        summary["renamed"] = True
+    else:
+        summary["renamed"] = False
+
+    cur_mtime = summary.get("mtime") or 0
+    web_mtime = web_mtimes.get(sid)
+
+    if sid in running:
+        summary["origin"], summary["live_web"] = "web", True
+    elif web_mtime is not None and cur_mtime <= web_mtime + _MTIME_EPS:
+        summary["origin"], summary["live_web"] = "web", False
+    else:
+        summary["origin"], summary["live_web"] = summary.get("entrypoint", "cli"), False
+
+    is_web = summary["origin"] == "web"
+    # CLI "live" = actively writing (THINKING) and not driven by us
+    summary["live"] = summary["live_web"] or (not is_web and summary.get("status") == "THINKING")
+    return summary
+
+
+@app.get("/api/sessions")
+def api_sessions(limit: str = Query("10"), offset: int = Query(0)):
+    lim = None if limit == "all" else int(limit)
+    data = parser.list_sessions(limit=lim, offset=offset)
+    web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
+    for s in data["sessions"]:
+        _decorate(s, web_mtimes, running, titles)
+    return data
+
+
+@app.get("/api/search")
+def api_search(q: str = Query("")):
+    web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
+    data = parser.search_sessions(q, extra_titles=titles)
+    for s in data["sessions"]:
+        _decorate(s, web_mtimes, running, titles)
+    return data
+
+
+@app.get("/api/sessions/{session_id}")
+def api_session(session_id: str):
+    detail = parser.get_session(session_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    _decorate(detail, registry.web_mtimes(), runner.running_ids())
+    return detail
+
+
+# Statuses for which a "what's expected from you" summary makes sense:
+# idle and the assistant spoke last (waiting on the user).
+_WAITING_STATUSES = {"WAITING", "SITTING", "SLEEPING"}
+
+
+@app.get("/api/sessions/{session_id}/summary")
+async def api_summary(session_id: str):
+    """One-paragraph summary of what response the session is waiting for.
+
+    Only generated when the session is idle-waiting and the assistant spoke
+    last. Cached per waiting episode (keyed by transcript mtime).
+    """
+    detail = parser.get_session(session_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    status = detail.get("status")
+    if status == "THINKING":
+        return {"status": status, "summary": None, "reason": "still working"}
+    if status not in _WAITING_STATUSES:
+        return {"status": status, "summary": None, "reason": "not waiting"}
+
+    # last assistant message = the turn that ended before the pause
+    last_assistant = next(
+        (a["text"] for a in detail.get("activities", [])
+         if a.get("kind") == "assistant" and a.get("text", "").strip()),
+        None,
+    )
+    if not last_assistant:
+        return {"status": status, "summary": None, "reason": "no assistant message"}
+
+    mtime = detail.get("mtime") or 0
+    cached = summaries.get(session_id, mtime)
+    if cached:
+        return {"status": status, "summary": cached, "cached": True}
+
+    text = await summarizer.generate(last_assistant)
+    if not text:
+        return {"status": status, "summary": None, "reason": "generation failed"}
+    summaries.set(session_id, mtime, text)
+    return {"status": status, "summary": text, "cached": False}
+
+
+class TitleBody(BaseModel):
+    title: str = ""
+
+
+@app.put("/api/sessions/{session_id}/title")
+def api_set_title(session_id: str, body: TitleBody):
+    """Set a custom title override (empty title reverts to the original)."""
+    if parser.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    overrides.set_title(session_id, body.title)
+    return {"session_id": session_id, "title": overrides.get_title(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}/title")
+def api_clear_title(session_id: str):
+    """Remove the override, reverting to the transcript-derived title."""
+    overrides.clear_title(session_id)
+    return {"session_id": session_id, "title": None}
+
+
+class SendBody(BaseModel):
+    text: str
+    permission_mode: str = "acceptEdits"
+
+
+@app.post("/api/sessions/{session_id}/send")
+async def api_send(session_id: str, body: SendBody):
+    if parser.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    cwd = parser.session_cwd(session_id)
+
+    async def event_stream():
+        async for evt in runner.run_turn(
+            session_id, body.text, cwd, body.permission_mode
+        ):
+            yield f"data: {json.dumps(evt)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/")
+def index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/session.html")
+def session_page():
+    return FileResponse(os.path.join(STATIC_DIR, "session.html"))
+
+
+@app.get("/search.html")
+def search_page():
+    return FileResponse(os.path.join(STATIC_DIR, "search.html"))
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

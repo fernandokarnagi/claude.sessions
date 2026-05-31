@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session detail</title>
+  <link rel="stylesheet" href="/static/style.css?v=6" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="back" href="/">← Dashboard</a>
+    <span class="spacer"></span>
+    <span class="meta" id="meta"></span>
+  </header>
+  <main>
+    <div id="header"></div>
+    <div id="summary"></div>
+    <div id="chat" class="chat"></div>
+    <h3 class="hist-title">History (newest first)</h3>
+    <div id="events"></div>
+  </main>
+  <script src="/static/app.js?v=6"></script>
+  <script>Detail.init();</script>
+</body>
+</html>

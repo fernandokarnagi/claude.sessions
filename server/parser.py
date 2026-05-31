@@ -1,0 +1,391 @@
+"""
+parser.py — turn Claude Code session transcripts into summaries and details.
+
+Claude Code writes each session as JSONL at:
+    ~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl
+
+This module reads those files and exposes two functions:
+    list_sessions(limit, offset)  -> dashboard summaries, most-recently-active first
+    get_session(session_id)       -> full ordered detail for one session
+
+All logic is pure/file-based so it can be unit-tested without a server.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import glob
+import json
+import os
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+# ---- Tunable constants -------------------------------------------------------
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+# Throwaway summarizer runs use this cwd; sessions created there are internal
+# to the dashboard and excluded from listings/search.
+SUMMARIZER_CWD = os.path.expanduser("~/.claude_dashboard_summarizer")
+
+# Status thresholds, in seconds, based on time since the file was last written.
+# Tiers (each is the UPPER bound of that status):
+THINKING_MAX_AGE = 10            # < 10s        -> THINKING (actively working)
+WAITING_MAX_AGE = 30 * 60        # 10s … 30min  -> WAITING
+SITTING_MAX_AGE = 2 * 3600       # 30min … 2h   -> SITTING
+SLEEPING_MAX_AGE = 24 * 3600     # 2h … 24h     -> SLEEPING
+# >= 24h -> ENDED (logs have no real end-marker; this is an idle assumption)
+
+PREVIEW_LEN = 160              # truncation for activity/result previews
+
+# ---- In-memory cache ---------------------------------------------------------
+# Keyed by file path -> (mtime, size, summary_dict). Re-parse only on change.
+_summary_cache: dict[str, tuple[float, int, dict]] = {}
+
+
+# ---- Data shapes -------------------------------------------------------------
+
+@dataclass
+class Tokens:
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    cache_creation: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.input + self.output + self.cache_read + self.cache_creation
+
+    def as_dict(self) -> dict:
+        d = asdict(self)
+        d["total"] = self.total
+        return d
+
+
+# ---- Helpers -----------------------------------------------------------------
+
+def _project_label(cwd: Optional[str], path: str) -> str:
+    """Prefer the real cwd from events; fall back to decoding the dir name."""
+    if cwd:
+        return cwd
+    raw = os.path.basename(os.path.dirname(path))
+    return "/" + raw.lstrip("-").replace("-", "/")
+
+
+def _iter_events(path: str):
+    """Yield parsed JSON objects from a transcript, skipping bad lines."""
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _short(text: Any) -> str:
+    s = str(text).strip().replace("\n", " ")
+    return s[:PREVIEW_LEN]
+
+
+def render_activity(evt: dict) -> Optional[dict]:
+    """Render one event into {kind, ts, text}, or None if not displayable.
+
+    kind is one of: user, assistant, thinking, tool, result.
+    Assistant content blocks expand into multiple activities (newest logic
+    keeps them in original order; callers slice as needed).
+    """
+    msg = evt.get("message")
+    if not isinstance(msg, dict):
+        return None
+    role = msg.get("role")
+    content = msg.get("content")
+    ts = evt.get("timestamp")
+
+    if isinstance(content, str):
+        return {"kind": role, "ts": ts, "text": content}
+
+    if isinstance(content, list):
+        # Collapse a content list into a single representative activity line.
+        # (Detail view expands every block; dashboard only needs a summary.)
+        parts = []
+        kind = role
+        for b in content:
+            bt = b.get("type")
+            if bt == "text":
+                kind = "assistant"; parts.append(b.get("text", ""))
+            elif bt == "thinking":
+                kind = "thinking"; parts.append("(thinking) " + b.get("thinking", ""))
+            elif bt == "tool_use":
+                kind = "tool"
+                parts.append(f"→ {b.get('name')}: {json.dumps(b.get('input', {}))}")
+            elif bt == "tool_result":
+                kind = "result"
+                res = b.get("content")
+                if isinstance(res, list):
+                    res = " ".join(x.get("text", "") for x in res if isinstance(x, dict))
+                parts.append("← " + str(res))
+        if parts:
+            return {"kind": kind, "ts": ts, "text": _short(" ".join(parts))}
+    return None
+
+
+def render_blocks(evt: dict) -> list[dict]:
+    """Expand one event into one-or-more activities for the detail view."""
+    msg = evt.get("message")
+    if not isinstance(msg, dict):
+        return []
+    role = msg.get("role")
+    content = msg.get("content")
+    ts = evt.get("timestamp")
+    out: list[dict] = []
+
+    if isinstance(content, str):
+        return [{"kind": role, "ts": ts, "text": content}]
+
+    if isinstance(content, list):
+        for b in content:
+            bt = b.get("type")
+            if bt == "text":
+                out.append({"kind": "assistant", "ts": ts, "text": b.get("text", "")})
+            elif bt == "thinking":
+                out.append({"kind": "thinking", "ts": ts, "text": b.get("thinking", "")})
+            elif bt == "tool_use":
+                out.append({
+                    "kind": "tool", "ts": ts,
+                    "name": b.get("name"),
+                    "text": json.dumps(b.get("input", {}), indent=2),
+                })
+            elif bt == "tool_result":
+                res = b.get("content")
+                if isinstance(res, list):
+                    res = "\n".join(x.get("text", "") for x in res if isinstance(x, dict))
+                out.append({
+                    "kind": "result", "ts": ts,
+                    "is_error": bool(b.get("is_error")),
+                    "text": str(res),
+                })
+    return out
+
+
+def compute_status(mtime: float, now: Optional[float] = None) -> str:
+    """THINKING / WAITING / SITTING / SLEEPING / ENDED from idle time."""
+    now = now if now is not None else time.time()
+    age = now - mtime
+    if age < THINKING_MAX_AGE:
+        return "THINKING"
+    if age < WAITING_MAX_AGE:
+        return "WAITING"
+    if age < SITTING_MAX_AGE:
+        return "SITTING"
+    if age < SLEEPING_MAX_AGE:
+        return "SLEEPING"
+    return "ENDED"
+
+
+# ---- Summaries ---------------------------------------------------------------
+
+def _build_summary(path: str) -> dict:
+    """Full single-pass parse of a transcript into a dashboard summary."""
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    mtime = os.path.getmtime(path)
+
+    title = None
+    cwd = None
+    model = None
+    entrypoint = None
+    created_at = None
+    last_ts = None
+    tokens = Tokens()
+    recent: list[dict] = []  # rolling list of rendered activities
+
+    for evt in _iter_events(path):
+        etype = evt.get("type")
+        if etype == "ai-title" and evt.get("aiTitle"):
+            title = evt["aiTitle"]
+
+        if evt.get("cwd") and not cwd:
+            cwd = evt["cwd"]
+
+        if evt.get("entrypoint"):
+            entrypoint = evt["entrypoint"]
+
+        ts = evt.get("timestamp")
+        if ts:
+            if created_at is None:
+                created_at = ts
+            last_ts = ts
+
+        msg = evt.get("message")
+        if isinstance(msg, dict):
+            if msg.get("model"):
+                model = msg["model"]
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                tokens.input += usage.get("input_tokens", 0) or 0
+                tokens.output += usage.get("output_tokens", 0) or 0
+                tokens.cache_read += usage.get("cache_read_input_tokens", 0) or 0
+                tokens.cache_creation += usage.get("cache_creation_input_tokens", 0) or 0
+
+            act = render_activity(evt)
+            if act and act.get("text"):
+                recent.append(act)
+                if len(recent) > 2:
+                    recent.pop(0)
+
+        # Title fallback: first user message text
+        if title is None and isinstance(msg, dict) and msg.get("role") == "user":
+            c = msg.get("content")
+            if isinstance(c, str) and c.strip():
+                title = _short(c)
+
+    return {
+        "session_id": session_id,
+        "title": title or "(untitled session)",
+        "project": _project_label(cwd, path),
+        "cwd": cwd,
+        "model": model,
+        "entrypoint": entrypoint or "cli",
+        "status": compute_status(mtime),
+        "created_at": created_at,
+        "updated_at": last_ts or _iso(mtime),
+        "tokens": tokens.as_dict(),
+        "last_activities": recent,
+    }
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def _summary_for(path: str) -> Optional[dict]:
+    """Cached summary: re-parse only when mtime/size changes. Status is always
+    recomputed (it depends on wall-clock age, not file content)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    cached = _summary_cache.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        summary = dict(cached[2])
+    else:
+        summary = _build_summary(path)
+        _summary_cache[path] = (st.st_mtime, st.st_size, summary)
+    summary["status"] = compute_status(st.st_mtime)
+    summary["mtime"] = st.st_mtime
+    return summary
+
+
+def list_sessions(limit: Optional[int] = 10, offset: int = 0) -> dict:
+    """Return summaries sorted by created datetime, newest first.
+
+    limit=None means 'all'. Returns {sessions, total}.
+    """
+    paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
+    summaries = [s for s in (_summary_for(p) for p in paths)
+                 if s and s.get("cwd") != SUMMARIZER_CWD]
+    # Sort by last activity (file mtime) so THINKING/WAITING sessions surface first.
+    summaries.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+    total = len(summaries)
+    window = summaries[offset:] if limit is None else summaries[offset: offset + limit]
+    return {"sessions": window, "total": total}
+
+
+def session_cwd(session_id: str) -> Optional[str]:
+    """Return the working directory recorded for a session (for resume cwd)."""
+    s = _summary_for_id(session_id)
+    return s.get("cwd") if s else None
+
+
+def session_mtime(session_id: str) -> Optional[float]:
+    """Current transcript mtime for a session, or None if not found."""
+    matches = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    try:
+        return os.path.getmtime(matches[0]) if matches else None
+    except OSError:
+        return None
+
+
+def _summary_for_id(session_id: str) -> Optional[dict]:
+    matches = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    return _summary_for(matches[0]) if matches else None
+
+
+def _field_match(q: str, fields: list) -> bool:
+    """Match query `q` (already lowercased) against any of `fields`.
+
+    If `q` contains a wildcard (* or ?), each field is matched as a glob
+    pattern (e.g. 'build*', '*docker*'). Otherwise it's a case-insensitive
+    substring ('contains') match.
+    """
+    wild = "*" in q or "?" in q
+    for f in fields:
+        if not f:
+            continue
+        f = str(f).lower()
+        if wild:
+            if fnmatch.fnmatch(f, q):
+                return True
+        elif q in f:
+            return True
+    return False
+
+
+def search_sessions(query: str, limit: int = 50, extra_titles: dict | None = None) -> dict:
+    """Find sessions by id, cwd/project path, auto title, or renamed title.
+
+    Case-insensitive. Supports glob wildcards (* and ?) — see _field_match.
+    `extra_titles` maps session_id -> override title so renamed sessions are
+    searchable by their new name. Returns {sessions, total}, newest-active first.
+    Empty query returns no results.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return {"sessions": [], "total": 0}
+    extra_titles = extra_titles or {}
+
+    paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
+    matches = []
+    for p in paths:
+        s = _summary_for(p)
+        if not s or s.get("cwd") == SUMMARIZER_CWD:
+            continue
+        sid = s.get("session_id", "")
+        fields = [
+            sid,
+            s.get("cwd"),
+            s.get("project"),
+            s.get("title"),
+            extra_titles.get(sid),  # renamed/override title
+        ]
+        if _field_match(q, fields):
+            matches.append(s)
+
+    matches.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+    return {"sessions": matches[:limit], "total": len(matches)}
+
+
+def get_session(session_id: str) -> Optional[dict]:
+    """Full detail for one session: summary header + events in DESC order."""
+    matches = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    if not matches:
+        return None
+    path = matches[0]
+    summary = _summary_for(path)
+    if not summary:
+        return None
+
+    activities: list[dict] = []
+    for evt in _iter_events(path):
+        for block in render_blocks(evt):
+            if block.get("text", "").strip() or block.get("name"):
+                activities.append(block)
+    activities.reverse()  # newest first
+
+    detail = dict(summary)
+    detail["activities"] = activities
+    return detail
