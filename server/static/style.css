@@ -47,6 +47,43 @@ header.topbar select, header.topbar button {
 
 main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 
+/* ---- Kanban board ---- */
+.board {
+  display: flex; gap: 14px;
+  height: calc(100vh - 58px);   /* fill viewport below the topbar */
+  padding: 16px; overflow-x: auto; align-items: stretch;
+}
+.lane {
+  flex: 0 0 310px; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; max-height: 100%; overflow: hidden;
+}
+.lane-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; font-weight: 600; font-size: 13px;
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: inherit;
+}
+.lane-label { white-space: nowrap; }
+.lane-tools { display: flex; align-items: center; gap: 8px; }
+.lane-limit {
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 6px; padding: 2px 4px; font-size: 11px;
+}
+.lane-count {
+  font-size: 11px; color: var(--muted); background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+}
+.lane-more { color: var(--muted); text-align: center; font-size: 11px; padding: 8px 0 2px; }
+.lane-body {
+  flex: 1; overflow-y: auto; padding: 10px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.lane-empty { color: var(--muted); text-align: center; font-size: 12px; padding: 16px 0; }
+
+/* board lanes reuse the dashboard .card widget */
+.lane-body .card { gap: 8px; padding: 13px; }
+
 .navlink {
   font-size: 13px; color: var(--muted);
   padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
@@ -157,6 +194,12 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .title-input:focus { outline: none; }
 .detail-header .stats { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .detail-header .stats b { color: var(--text); }
+.hdr-btn {
+  margin-left: auto; cursor: pointer; font-size: 12px;
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px;
+}
+.hdr-btn:hover { color: var(--tool); border-color: var(--tool); }
 .token-grid { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
 .token-grid div { background: var(--panel-2); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 14px; font-variant-numeric: tabular-nums; }

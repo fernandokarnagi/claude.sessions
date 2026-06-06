@@ -21,16 +21,27 @@ Code's own transcripts** (renames and other state live in separate JSON files).
 ## Quick start
 
 ```bash
-# from the project directory
+# 1. Point the app at your Claude Code transcripts (defaults to ~/.claude/projects).
+#    Only needed if your transcripts live somewhere else.
+export CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+
+# 2. Launch (from the project directory)
 ./serve.sh                  # → http://127.0.0.1:8765
 PORT=9000 ./serve.sh        # custom port
-
-# or from anywhere
-~/App/ccoe/start-claude-sessions.sh
 ```
 
 `serve.sh` creates a local `.venv`, installs deps on first run (FastAPI, uvicorn,
 pytest), and starts uvicorn. Open the URL in your browser. Stop with **Ctrl+C**.
+
+> **Set `CLAUDE_PROJECTS_DIR` before running.** This env var tells the app where Claude
+> Code writes its session JSONL files. It defaults to `~/.claude/projects`, so if you use the
+> standard location you can skip it. Override it (and export it in the same shell that runs
+> `serve.sh` / `watch.sh`) when your transcripts live elsewhere — e.g. a custom `CLAUDE_CONFIG_DIR`,
+> a different user's home, or a mounted backup:
+>
+> ```bash
+> export CLAUDE_PROJECTS_DIR="/path/to/your/.claude/projects"
+> ```
 
 > **Tip:** the server sends `Cache-Control: no-store` and versions its static assets,
 > so a normal reload always picks up changes. If a page ever looks stale, hard-refresh once
@@ -169,6 +180,7 @@ These hold per-user runtime data. Back them up if you want to preserve renames a
 
 | What | Where |
 |------|-------|
+| Transcripts location | `CLAUDE_PROJECTS_DIR` env var (default `~/.claude/projects`) |
 | Port | `PORT` env var (default 8765) |
 | Status thresholds | `THINKING/WAITING/SITTING/SLEEPING_MAX_AGE` in `server/parser.py` |
 | Dashboard poll rates | `Dashboard.FAST_MS` / `SLOW_MS` in `server/static/app.js` |
@@ -218,4 +230,4 @@ when changing `app.js` / `style.css` so browsers don't serve stale copies.
 
 ---
 
-_Repo: `https://gitlab.com/ctc.sg/ccoe/ai/claude/claude.sessions.git`_
+_Repo: `https://github.com/fernandokarnagi/claude.sessions.git`_

@@ -24,7 +24,11 @@ from typing import Any, Optional
 
 # ---- Tunable constants -------------------------------------------------------
 
-PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# Location of Claude Code session transcripts. Override with the
+# CLAUDE_PROJECTS_DIR environment variable; defaults to ~/.claude/projects.
+PROJECTS_DIR = os.path.expanduser(
+    os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
+)
 
 # Throwaway summarizer runs use this cwd; sessions created there are internal
 # to the dashboard and excluded from listings/search.
@@ -281,16 +285,26 @@ def _summary_for(path: str) -> Optional[dict]:
 
 
 def list_sessions(limit: Optional[int] = 10, offset: int = 0,
-                  statuses: Optional[set] = None) -> dict:
+                  statuses: Optional[set] = None,
+                  archived_ids: Optional[set] = None,
+                  archived_mode: str = "all") -> dict:
     """Return summaries sorted by last activity, newest first.
 
     limit=None means 'all'. `statuses` (a set like {"WAITING","SITTING"}) filters
-    to only those statuses. Returns {sessions, total} where total is the count
-    after filtering.
+    to only those statuses. `archived_mode` controls archived sessions:
+    'all' (no filtering), 'exclude' (drop archived), or 'only' (archived only),
+    using `archived_ids`. Returns {sessions, total} after filtering.
     """
     paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
     summaries = [s for s in (_summary_for(p) for p in paths)
                  if s and s.get("cwd") != SUMMARIZER_CWD]
+
+    if archived_ids is not None and archived_mode != "all":
+        if archived_mode == "exclude":
+            summaries = [s for s in summaries if s["session_id"] not in archived_ids]
+        elif archived_mode == "only":
+            summaries = [s for s in summaries if s["session_id"] in archived_ids]
+
     # Sort by last activity (file mtime) so THINKING/WAITING sessions surface first.
     summaries.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
     if statuses:

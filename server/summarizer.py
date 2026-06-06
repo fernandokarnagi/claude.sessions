@@ -36,7 +36,7 @@ Assistant's last message:
 
 
 def _delete_throwaway(session_id: str) -> None:
-    for p in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl")):
+    for p in glob.glob(os.path.join(parser.PROJECTS_DIR, "*", f"{session_id}.jsonl")):
         try:
             os.remove(p)
         except OSError:

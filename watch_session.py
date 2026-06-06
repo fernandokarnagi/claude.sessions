@@ -23,7 +23,11 @@ import os
 import sys
 import time
 
-PROJECTS = os.path.expanduser("~/.claude/projects")
+# Override the transcript location with the CLAUDE_PROJECTS_DIR environment
+# variable; defaults to ~/.claude/projects.
+PROJECTS = os.path.expanduser(
+    os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
+)
 
 # ANSI colors (auto-disabled when not a TTY)
 C = {
@@ -55,7 +59,7 @@ def list_sessions(limit=15):
 def newest_session():
     files = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
     if not files:
-        sys.exit("No session transcripts found under ~/.claude/projects")
+        sys.exit(f"No session transcripts found under {PROJECTS}")
     return max(files, key=os.path.getmtime)
 
 

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import overrides, parser, registry, runner, summaries, summarizer
+from . import archives, overrides, parser, registry, runner, summaries, summarizer
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -41,8 +41,8 @@ _MTIME_EPS = 1.0
 
 
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
-              titles: dict | None = None) -> dict:
-    """Attach origin (cli/vscode/web), live flags, and any title override.
+              titles: dict | None = None, archived: set | None = None) -> dict:
+    """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
     or (b) the web app wrote last — i.e. the file has NOT been written since
@@ -58,6 +58,9 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["renamed"] = True
     else:
         summary["renamed"] = False
+
+    archived = archived if archived is not None else archives.archived_ids()
+    summary["archived"] = sid in archived
 
     cur_mtime = summary.get("mtime") or 0
     web_mtime = web_mtimes.get(sid)
@@ -81,7 +84,7 @@ ATTENTION_STATUSES = {"WAITING", "SITTING", "SLEEPING"}
 
 @app.get("/api/sessions")
 def api_sessions(limit: str = Query("10"), offset: int = Query(0),
-                 status: str | None = Query(None)):
+                 status: str | None = Query(None), archived: str | None = Query(None)):
     lim = None if limit == "all" else int(limit)
     statuses = None
     if status:
@@ -89,10 +92,16 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
             statuses = ATTENTION_STATUSES
         else:
             statuses = {x.strip().upper() for x in status.split(",") if x.strip()}
-    data = parser.list_sessions(limit=lim, offset=offset, statuses=statuses)
+
+    arch_ids = archives.archived_ids()
+    # default: hide archived from normal listings; board passes archived=all
+    mode = {"all": "all", "only": "only"}.get((archived or "").lower(), "exclude")
+
+    data = parser.list_sessions(limit=lim, offset=offset, statuses=statuses,
+                                archived_ids=arch_ids, archived_mode=mode)
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles)
+        _decorate(s, web_mtimes, running, titles, arch_ids)
     return data
 
 
@@ -179,6 +188,20 @@ async def api_summary(session_id: str):
     return {"status": status, "summary": text, "cached": False}
 
 
+@app.post("/api/sessions/{session_id}/archive")
+def api_archive(session_id: str):
+    if parser.session_path(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    archives.set_archived(session_id, True)
+    return {"session_id": session_id, "archived": True}
+
+
+@app.delete("/api/sessions/{session_id}/archive")
+def api_unarchive(session_id: str):
+    archives.set_archived(session_id, False)
+    return {"session_id": session_id, "archived": False}
+
+
 class TitleBody(BaseModel):
     title: str = ""
 
@@ -236,6 +259,11 @@ def session_page():
 @app.get("/search.html")
 def search_page():
     return FileResponse(os.path.join(STATIC_DIR, "search.html"))
+
+
+@app.get("/archived.html")
+def archived_page():
+    return FileResponse(os.path.join(STATIC_DIR, "archived.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

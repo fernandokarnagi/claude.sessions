@@ -12,6 +12,7 @@ venv/
 server/.web_sessions.json
 server/.title_overrides.json
 server/.waiting_summaries.json
+server/.archived.json
 server/.adopted.json
 server/.*.tmp
 

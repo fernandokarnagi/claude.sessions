@@ -249,6 +249,178 @@ const Search = {
   },
 };
 
+// ---- Board (Kanban) — the home page ------------------------------------------
+
+const Board = {
+  FAST_MS: 1500,
+  SLOW_MS: 5000,
+  timer: null,
+  notifyOn: false,
+  prevStatus: {},
+  baselineSet: false,
+  lastSessions: [],
+  limits: {},
+  DEFAULT_LIMIT: "25",
+  // THINKING first, then WAITING, then the rest. Archived has its own page.
+  LANES: [
+    { key: "THINKING", label: "💭 Thinking" },
+    { key: "WAITING", label: "⏳ Waiting" },
+    { key: "SITTING", label: "🪑 Sitting" },
+    { key: "SLEEPING", label: "😴 Sleeping" },
+    { key: "ENDED", label: "🏁 Ended" },
+  ],
+
+  init() {
+    this.LANES.forEach((l) => {
+      this.limits[l.key] = localStorage.getItem("laneLimit:" + l.key) || this.DEFAULT_LIMIT;
+    });
+    this.renderShell();
+    this.notifyOn = localStorage.getItem("notifyOn") === "1"
+      && ("Notification" in window) && Notification.permission === "granted";
+    this.updateNotifyBtn();
+    document.getElementById("notifyToggle").addEventListener("click", () => this.toggleNotify());
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) this.tick(); });
+    this.tick();
+  },
+
+  renderShell() {
+    const opts = (sel) => ["10", "25", "50", "all"]
+      .map((v) => `<option value="${v}"${v === sel ? " selected" : ""}>${v === "all" ? "All" : v}</option>`).join("");
+    document.getElementById("board").innerHTML = this.LANES.map((l) => `
+      <section class="lane" data-key="${l.key}">
+        <div class="lane-head">
+          <span class="lane-label">${l.label}</span>
+          <span class="lane-tools">
+            <select class="lane-limit" data-key="${l.key}" title="Sessions to show in this lane">${opts(this.limits[l.key])}</select>
+            <span class="lane-count" id="count-${l.key}">0</span>
+          </span>
+        </div>
+        <div class="lane-body" id="lane-${l.key}"></div>
+      </section>`).join("");
+    document.querySelectorAll(".lane-limit").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        this.limits[sel.dataset.key] = sel.value;
+        localStorage.setItem("laneLimit:" + sel.dataset.key, sel.value);
+        this.distribute(this.lastSessions);   // re-render with the new cap
+      });
+    });
+  },
+
+  async tick() {
+    clearTimeout(this.timer);
+    let active = false;
+    try {
+      const data = await getJSON("/api/sessions?limit=all");  // archived excluded by default
+      this.lastSessions = data.sessions;
+      this.detectTransitions(data.sessions);
+      this.distribute(data.sessions);
+      document.getElementById("meta").textContent =
+        `${data.total} sessions · updated ${new Date().toLocaleTimeString()}`;
+      active = data.sessions.some((s) => s.status === "THINKING" || s.live);
+    } catch (e) {
+      document.getElementById("meta").textContent = "error: " + e.message;
+    }
+    if (document.hidden) {                       // keep polling in background only to notify
+      if (this.notifyOn) this.timer = setTimeout(() => this.tick(), this.SLOW_MS);
+      return;
+    }
+    this.timer = setTimeout(() => this.tick(), active ? this.FAST_MS : this.SLOW_MS);
+  },
+
+  distribute(sessions) {
+    const buckets = {};
+    this.LANES.forEach((l) => (buckets[l.key] = []));
+    for (const s of sessions) {
+      if (buckets[s.status]) buckets[s.status].push(s);
+      else buckets.ENDED.push(s);
+    }
+    for (const l of this.LANES) {
+      const body = document.getElementById("lane-" + l.key);
+      const keepScroll = body.scrollTop;
+      const items = buckets[l.key];
+      document.getElementById("count-" + l.key).textContent = items.length;
+      const lim = this.limits[l.key] === "all" ? Infinity : parseInt(this.limits[l.key], 10);
+      const shown = items.slice(0, lim);
+      let html = shown.map((s) => Dashboard.card(s)).join("");
+      if (items.length > shown.length) {
+        html += `<div class="lane-more">+ ${items.length - shown.length} more — raise the limit</div>`;
+      }
+      body.innerHTML = html || `<div class="lane-empty">—</div>`;
+      body.scrollTop = keepScroll;
+    }
+  },
+
+  // notify when a session goes THINKING -> WAITING
+  detectTransitions(sessions) {
+    const cur = {};
+    for (const s of sessions) cur[s.session_id] = s.status;
+    if (this.baselineSet && this.notifyOn) {
+      for (const s of sessions) {
+        if (this.prevStatus[s.session_id] === "THINKING" && s.status === "WAITING") this.notify(s);
+      }
+    }
+    Object.assign(this.prevStatus, cur);
+    this.baselineSet = true;
+  },
+
+  notify(s) {
+    try {
+      const n = new Notification("⏳ Session waiting for you", {
+        body: `${s.title}\n${s.project || ""}`, tag: s.session_id,
+      });
+      n.onclick = () => { window.focus(); location.href = `/session.html?id=${encodeURIComponent(s.session_id)}`; };
+    } catch (e) { /* best-effort */ }
+  },
+
+  updateNotifyBtn() {
+    const nt = document.getElementById("notifyToggle");
+    nt.classList.toggle("active", this.notifyOn);
+    nt.textContent = this.notifyOn ? "🔔 Notifying" : "🔔 Notify";
+  },
+
+  async toggleNotify() {
+    if (!("Notification" in window)) { alert("This browser doesn't support the Notification API."); return; }
+    if (!window.isSecureContext) { alert("Notifications need a secure context — open via http://127.0.0.1 or http://localhost."); return; }
+    if (this.notifyOn) { this.notifyOn = false; localStorage.setItem("notifyOn", "0"); this.updateNotifyBtn(); return; }
+    let perm = Notification.permission;
+    if (perm === "default") perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      alert("Notifications are blocked. Enable them in your browser's site settings and your OS (macOS: System Settings → Notifications; turn off Focus/Do Not Disturb).");
+      this.updateNotifyBtn(); return;
+    }
+    this.notifyOn = true; localStorage.setItem("notifyOn", "1"); this.updateNotifyBtn();
+    try {
+      const n = new Notification("✅ Notifications enabled", { body: "You'll be alerted when a session starts waiting for you." });
+      n.onclick = () => window.focus(); setTimeout(() => n.close(), 5000);
+    } catch (e) {
+      alert("Permission granted, but the browser couldn't show a notification. Check your OS notification settings / Focus.");
+    }
+  },
+};
+
+// ---- Archived page -----------------------------------------------------------
+
+const Archived = {
+  init() {
+    this.load();
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) this.load(); });
+  },
+  async load() {
+    try {
+      const data = await getJSON("/api/sessions?archived=only&limit=all");
+      const grid = document.getElementById("grid");
+      const empty = document.getElementById("empty");
+      document.getElementById("meta").textContent =
+        `${data.total} archived · updated ${new Date().toLocaleTimeString()}`;
+      grid.innerHTML = data.sessions.map((s) => Dashboard.card(s)).join("");
+      empty.textContent = "No archived sessions. Archive one from its detail page.";
+      empty.style.display = data.sessions.length ? "none" : "block";
+    } catch (e) {
+      document.getElementById("meta").textContent = "error: " + e.message;
+    }
+  },
+};
+
 // ---- Detail ------------------------------------------------------------------
 
 const Detail = {
@@ -363,6 +535,7 @@ const Detail = {
           <span>created <b>${fmtTime(d.created_at)}</b></span>
           <span>updated <b>${fmtTime(d.updated_at)}</b></span>
           <span>${esc(d.project)}</span>
+          <button class="hdr-btn" id="archiveBtn">${d.archived ? "↩ Unarchive" : "📦 Archive"}</button>
         </div>
         <div class="token-grid">
           <div><span>total</span><b>${fmtNum(t.total)}</b></div>
@@ -376,6 +549,19 @@ const Detail = {
     document.getElementById("editTitle").addEventListener("click", () => this.startEdit());
     const rb = document.getElementById("resetTitle");
     if (rb) rb.addEventListener("click", () => this.resetTitle());
+    document.getElementById("archiveBtn").addEventListener("click", () => this.toggleArchive(d.archived));
+  },
+
+  async toggleArchive(isArchived) {
+    const msg = isArchived
+      ? "Unarchive this session? It will return to the dashboard and its status lane on the board."
+      : "Archive this session? It will be hidden from the dashboard and moved to the board's Archived lane.";
+    if (!confirm(msg)) return;
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(this.id)}/archive`,
+        { method: isArchived ? "DELETE" : "POST" });
+    } catch (e) { alert("Archive action failed: " + e.message); return; }
+    this.load();
   },
 
   startEdit() {
