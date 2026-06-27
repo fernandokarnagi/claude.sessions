@@ -109,11 +109,17 @@ def parse_prompt(screen: str) -> Optional[dict]:
 
     # Question = nearest non-empty, non-option line above the block.
     question = ""
+    q_idx = first_opt_idx
     for j in range(first_opt_idx - 1, -1, -1):
         cand = _strip(lines[j])
         if cand:
-            question = cand
+            question, q_idx = cand, j
             break
+
+    # Context = the tool/command preview rendered above the question, e.g. the
+    # "Bash command" block + "This command requires approval". Walk up from the
+    # question, collecting until a box top-border or a previous REPL message.
+    context = _extract_context(lines, q_idx)
 
     blob = (question + " " + " ".join(o["label"] for o in options)).lower()
     has_pointer = any(o["selected"] for o in options)
@@ -124,7 +130,40 @@ def parse_prompt(screen: str) -> Optional[dict]:
     if not (has_pointer or looks_like_gate):
         return None
 
-    return {"question": question, "options": options, "raw": screen}
+    return {
+        "question": question,
+        "context": context,
+        "options": options,
+        "raw": screen,
+    }
+
+
+# Glyphs that mark the start of a *previous* REPL message (not part of the box).
+_STOP_GLYPHS = ("⏺", "✻", "✽", "●", "❯", "⎿", ">")
+
+
+def _unbox(line: str) -> str:
+    """Strip a leading/trailing box border but keep inner indentation."""
+    s = line.rstrip()
+    s = re.sub(r"^\s*[│|]\s?", "", s)
+    s = re.sub(r"\s*[│|]\s*$", "", s)
+    return s
+
+
+def _extract_context(lines: list[str], q_idx: int, max_lines: int = 40) -> str:
+    """The command/tool preview block sitting above the question line."""
+    collected: list[str] = []
+    for j in range(q_idx - 1, -1, -1):
+        raw = lines[j]
+        if "╭" in raw or "─" * 6 in raw:        # box top / horizontal rule
+            break
+        if any(_strip(raw).startswith(g) for g in _STOP_GLYPHS):
+            break
+        collected.append(_unbox(raw))
+        if len(collected) >= max_lines:
+            break
+    collected.reverse()
+    return "\n".join(collected).strip("\n")
 
 
 def pending(session_id: str) -> Optional[dict]:
@@ -159,6 +198,22 @@ def _send_keys(session_id: str, *keys: str) -> None:
         ["tmux", "send-keys", "-t", session_id, *keys],
         capture_output=True, text=True, timeout=5,
     )
+
+
+def say(session_id: str, text: str) -> dict:
+    """Type `text` into the live REPL prompt and submit it.
+
+    Drives the *live* tmux session (one continuous conversation, visible in
+    tmux) — unlike runner.run_turn which forks a separate headless resume.
+    """
+    if not text.strip():
+        return {"ok": False, "error": "empty message"}
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    # -l = literal, so a word like "Enter" inside the text isn't taken as a key.
+    _send_keys(session_id, "-l", "--", text)
+    _send_keys(session_id, "Enter")
+    return {"ok": True}
 
 
 def answer(session_id: str, choice: int, text: str = "") -> dict:

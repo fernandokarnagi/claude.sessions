@@ -11,19 +11,28 @@ Endpoints:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import archives, overrides, parser, registry, runner, summaries, summarizer, tmuxio
+from . import archives, overrides, parser, registry, runner, slackbot, summaries, summarizer, tmuxio
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="Claude Sessions Dashboard")
+
+
+@app.on_event("startup")
+def _start_slack():
+    # No-op unless SLACK_BOT_TOKEN/APP_TOKEN/CHANNEL are set.
+    slackbot.start()
 
 
 @app.middleware("http")
@@ -263,6 +272,59 @@ def api_tmux(session_id: str):
         "prompt": tmuxio.parse_prompt(screen),
         "screen": screen,
     }
+
+
+PASTE_DIR = os.path.expanduser("~/.claude_dashboard_pastes")
+_PASTE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+              "image/webp": "webp"}
+_MAX_PASTE_BYTES = 20 * 1024 * 1024
+
+
+class PasteBody(BaseModel):
+    data: str           # base64 (with or without data: URI prefix)
+    mime: str = "image/png"
+
+
+@app.post("/api/sessions/{session_id}/paste")
+def api_paste(session_id: str, body: PasteBody):
+    """Save a pasted image to disk and return its path.
+
+    The path is meant to be typed into the live REPL — Claude Code reads image
+    files referenced by path in the prompt.
+    """
+    ext = _PASTE_EXT.get(body.mime)
+    if ext is None:
+        raise HTTPException(status_code=415, detail="unsupported image type")
+    raw = body.data.split(",", 1)[-1]   # tolerate a data: URI prefix
+    try:
+        blob = base64.b64decode(raw, validate=True)
+    except (ValueError, Exception):
+        raise HTTPException(status_code=400, detail="bad base64")
+    if not blob or len(blob) > _MAX_PASTE_BYTES:
+        raise HTTPException(status_code=413, detail="image too large or empty")
+    os.makedirs(PASTE_DIR, exist_ok=True)
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.{ext}"
+    path = os.path.join(PASTE_DIR, name)
+    with open(path, "wb") as f:
+        f.write(blob)
+    return {"path": path, "bytes": len(blob)}
+
+
+class SayBody(BaseModel):
+    text: str
+
+
+@app.post("/api/sessions/{session_id}/say")
+def api_say(session_id: str, body: SayBody):
+    """Type a message into the live tmux REPL (continuous conversation).
+
+    Use this for sessions running in tmux instead of /send (which forks a
+    separate headless `claude --resume`).
+    """
+    result = tmuxio.say(session_id, body.text)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "say failed"))
+    return result
 
 
 class AnswerBody(BaseModel):

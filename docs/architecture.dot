@@ -1,0 +1,66 @@
+digraph claude_sessions {
+  rankdir=LR;
+  bgcolor="white";
+  fontname="Helvetica";
+  labelloc="t";
+  fontsize=22;
+  label="Claude Sessions Dashboard — Architecture";
+  nodesep=0.35;
+  ranksep=0.9;
+
+  node [fontname="Helvetica", fontsize=12, style="filled,rounded", shape=box, penwidth=1.2];
+  edge [fontname="Helvetica", fontsize=10, color="#5b6470", arrowsize=0.8];
+
+  /* ---------- Claude Code (the source of truth) ---------- */
+  subgraph cluster_cc {
+    label="Claude Code (CLI · VS Code · SDK)";
+    style="rounded,filled"; color="#d9b38c"; fillcolor="#fbf3e9"; fontsize=13; fontcolor="#7a5320";
+    cc      [label="claude agent\nsessions", fillcolor="#f5d9b8", color="#c98a3c"];
+  }
+
+  /* ---------- Transcripts on disk ---------- */
+  subgraph cluster_disk {
+    label="Filesystem  (read-only source)";
+    style="rounded,filled"; color="#9bb8d8"; fillcolor="#eef4fb"; fontsize=13; fontcolor="#2f5277";
+    transcripts [label="JSONL transcripts\n$CLAUDE_PROJECTS_DIR\n(~/.claude/projects)", shape=folder, fillcolor="#d6e6f7", color="#5b8fc4"];
+  }
+
+  /* ---------- The app: Python / FastAPI ---------- */
+  subgraph cluster_server {
+    label="Backend  —  Python · FastAPI  (127.0.0.1:8765)";
+    style="rounded,filled"; color="#8fbf8f"; fillcolor="#eef7ee"; fontsize=13; fontcolor="#2f6b2f";
+
+    app        [label="app.py\nHTTP + SSE\nno-store middleware", fillcolor="#cfeccf", color="#5aa05a"];
+    parser     [label="parser.py\nparse · status · search · tail\n(cached by mtime)", fillcolor="#cfeccf", color="#5aa05a"];
+    runner     [label="runner.py\nheadless resume turns\n(streamed)", fillcolor="#cfeccf", color="#5aa05a"];
+    summarizer [label="summarizer.py\n\"what's expected\"\nsummaries", fillcolor="#cfeccf", color="#5aa05a"];
+
+    state [label="Local state (flat JSON, gitignored)\nregistry · overrides · summaries · archives", shape=note, fillcolor="#fdf6cf", color="#caa93c", fontsize=11];
+  }
+
+  /* ---------- Frontend ---------- */
+  subgraph cluster_browser {
+    label="Frontend  —  static files, no build step";
+    style="rounded,filled"; color="#b89bd8"; fillcolor="#f4eefb"; fontsize=13; fontcolor="#5a2f77";
+    browser [label="Browser\nindex · session · search\napp.js  (adaptive polling + SSE)", fillcolor="#e3d3f7", color="#9a6fc4"];
+    notify  [label="Desktop\nnotifications", shape=box, fillcolor="#e3d3f7", color="#9a6fc4"];
+  }
+
+  /* ---------- Edges: data flow ---------- */
+  cc          -> transcripts [label="writes\nappend-only", color="#c98a3c", fontcolor="#a86a1c", penwidth=1.6];
+  transcripts -> parser      [label="reads\n(never modifies)", color="#5b8fc4", fontcolor="#2f5277", penwidth=1.6];
+
+  parser     -> app          [label="summaries / detail / tail"];
+  state      -> app          [dir=both, label="titles · origin · cache", style=dashed, color="#caa93c", fontcolor="#8a6f1c"];
+  summarizer -> parser       [style=dashed, label="last msg"];
+
+  app  -> browser  [label="JSON API + SSE stream", color="#9a6fc4", fontcolor="#5a2f77", penwidth=1.6];
+  browser -> app   [label="poll · search · resume", color="#9a6fc4", fontcolor="#5a2f77", style=dashed];
+  browser -> notify [label="THINKING → WAITING", style=dotted, color="#9a6fc4", fontcolor="#5a2f77"];
+
+  /* ---------- App invokes the claude CLI ---------- */
+  runner     -> cc [label="claude --resume\n(stream-json)", color="#c98a3c", fontcolor="#a86a1c", constraint=false];
+  summarizer -> cc [label="claude --print\n(isolated, cleaned up)", color="#c98a3c", fontcolor="#a86a1c", constraint=false, style=dashed];
+  app -> runner [style=invis];
+  app -> summarizer [style=invis];
+}

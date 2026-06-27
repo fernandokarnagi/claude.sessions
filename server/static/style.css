@@ -514,3 +514,41 @@ body.world-page { overflow: hidden; }
   border-color: rgba(255, 183, 77, .7);
   box-shadow: 0 0 0 1px rgba(255, 183, 77, .35), 0 8px 26px -14px rgba(255, 150, 30, .6);
 }
+
+.approval-ctx {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  max-height: 240px;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  background: rgba(0, 0, 0, .35);
+  color: #cdd3da;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+/* pasted-image attachment chips */
+.attach { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 0; }
+.attach:empty { margin: 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 8px 4px 4px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(255, 255, 255, .05);
+  font-size: 12px; color: #cfd3da;
+}
+.chip.err { border-color: rgba(255, 110, 110, .5); color: #ffb4b4; }
+.chip img {
+  width: 34px; height: 34px; object-fit: cover;
+  border-radius: 6px; display: block;
+}
+.chip-label { opacity: .85; }
+.chip-x {
+  border: none; background: transparent; color: #aaa;
+  cursor: pointer; font-size: 12px; padding: 0 2px;
+}
+.chip-x:hover { color: #fff; }

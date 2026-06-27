@@ -684,10 +684,13 @@ const Detail = {
       this._promptSig = null;
       return;
     }
-    const sig = prompt.question + "|" + prompt.options.map((o) => o.num + o.label).join("|");
+    const sig = prompt.question + "|" + (prompt.context || "") + "|" + prompt.options.map((o) => o.num + o.label).join("|");
     if (sig === this._promptSig) return;   // unchanged — avoid re-render churn
     this._promptSig = sig;
     this._answering = false;
+
+    const ctx = prompt.context
+      ? `<pre class="approval-ctx">${esc(prompt.context)}</pre>` : "";
 
     const btns = prompt.options.map((o) => {
       const needsText = /tell claude|differently|what to do/i.test(o.label);
@@ -699,6 +702,7 @@ const Detail = {
     box.innerHTML = `
       <div class="approval-panel">
         <div class="approval-head">⚠ Needs your approval</div>
+        ${ctx}
         <div class="approval-q">${esc(prompt.question)}</div>
         <div class="approval-opts">${btns}</div>
         <div class="approval-text" id="apprText" hidden>
@@ -881,11 +885,14 @@ const Detail = {
         </select>
         <span class="now-model" id="nowModel"></span>
       </div>
+      <div id="attach" class="attach"></div>
       <div class="chat-input">
-        <textarea id="msg" rows="2" placeholder="Resume this session — type a message and press ⌘/Ctrl+Enter…"></textarea>
+        <textarea id="msg" rows="2" placeholder="Resume this session — type a message (paste an image to attach) and press ⌘/Ctrl+Enter…"></textarea>
         <button id="send">Send</button>
       </div>
       <div id="stream" class="stream"></div>`;
+    this.attachments = [];
+    this.renderAttach();
 
     const ta = document.getElementById("msg");
     const btn = document.getElementById("send");
@@ -893,13 +900,71 @@ const Detail = {
     ta.addEventListener("keydown", (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); this.send(); }
     });
+    ta.addEventListener("paste", (e) => this.handlePaste(e, ta));
+  },
+
+  // Paste an image: upload it, show it as a thumbnail chip. Its saved path is
+  // appended to the message on send (Claude Code reads image paths).
+  async handlePaste(e, ta) {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    const img = [...items].find((it) => it.type && it.type.startsWith("image/"));
+    if (!img) return;   // normal text paste — leave it alone
+    e.preventDefault();
+    const file = img.getAsFile();
+    if (!file) return;
+
+    const dataUrl = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result); r.onerror = rej;
+      r.readAsDataURL(file);
+    });
+    const chip = { id: "a" + Date.now(), path: null, dataUrl, busy: true, err: null };
+    (this.attachments = this.attachments || []).push(chip);
+    this.renderAttach();
+    try {
+      const resp = await fetch(`/api/sessions/${encodeURIComponent(this.id)}/paste`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: dataUrl, mime: file.type }),
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const r = await resp.json();
+      chip.path = r.path; chip.busy = false;
+    } catch (err) {
+      chip.busy = false; chip.err = err.message;
+    }
+    this.renderAttach();
+    ta.focus();
+  },
+
+  renderAttach() {
+    const box = document.getElementById("attach");
+    if (!box) return;
+    const list = this.attachments || [];
+    if (!list.length) { box.innerHTML = ""; return; }
+    box.innerHTML = list.map((a) => `
+      <span class="chip ${a.err ? "err" : ""}" title="${esc(a.err || a.path || "uploading…")}">
+        <img src="${a.dataUrl}" alt="" />
+        <span class="chip-label">${a.busy ? "⏳" : a.err ? "⚠ failed" : "image"}</span>
+        <button class="chip-x" data-id="${a.id}" aria-label="remove">✕</button>
+      </span>`).join("");
+    box.querySelectorAll(".chip-x").forEach((b) =>
+      b.addEventListener("click", () => this.removeAttach(b.dataset.id)));
+  },
+
+  removeAttach(id) {
+    this.attachments = (this.attachments || []).filter((a) => a.id !== id);
+    this.renderAttach();
   },
 
   async send() {
     if (this.busy) return;
     const ta = document.getElementById("msg");
-    const text = ta.value.trim();
-    if (!text) return;
+    const typed = ta.value.trim();
+    const paths = (this.attachments || []).filter((a) => a.path).map((a) => a.path);
+    if (!typed && !paths.length) return;
+    // Append image paths so the live REPL / headless resume can read them.
+    const text = paths.length ? (typed ? typed + "\n" + paths.join("\n") : paths.join("\n")) : typed;
     const perm = document.getElementById("perm").value;
     const stream = document.getElementById("stream");
     const btn = document.getElementById("send");
@@ -907,15 +972,36 @@ const Detail = {
     this.busy = true; btn.disabled = true; btn.textContent = "Running…";
     stream.innerHTML = `<div class="event user"><div class="hd"><span class="kind">you</span></div><pre>${esc(text)}</pre></div>`;
     ta.value = "";
+    this.attachments = [];
+    this.renderAttach();
+
+    // If this session is running live in tmux, type into the live REPL (one
+    // continuous conversation) instead of forking a headless `claude --resume`.
+    let live = false;
+    try {
+      const t = await getJSON(`/api/sessions/${encodeURIComponent(this.id)}/tmux`);
+      live = !!t.has_tmux;
+    } catch (e) { /* fall back to headless */ }
 
     try {
-      const resp = await fetch(`/api/sessions/${encodeURIComponent(this.id)}/send`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, permission_mode: perm }),
-      });
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      await this.consume(resp, stream);
+      if (live) {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(this.id)}/say`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        stream.insertAdjacentHTML("beforeend",
+          `<div class="result-line">→ sent to live tmux session · reply streams into History below</div>`);
+      } else {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(this.id)}/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, permission_mode: perm }),
+        });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        await this.consume(resp, stream);
+      }
     } catch (e) {
       stream.insertAdjacentHTML("beforeend",
         `<div class="event result error"><pre>${esc(e.message)}</pre></div>`);
