@@ -3,21 +3,22 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Claude Sessions</title>
+  <title>Claude Sessions — World</title>
   <link rel="stylesheet" href="/static/style.css?v=14" />
 </head>
-<body>
+<body class="world-page">
   <header class="topbar">
-    <h1>🪐 Claude Sessions</h1>
-    <a class="navlink" href="/world.html">🗺️ World</a>
-    <a class="navlink" href="/archived.html">📦 Archived</a>
+    <a class="back" href="/">← Board</a>
+    <h1 style="font-size:15px;margin:0 0 0 8px">🗺️ World</h1>
     <a class="navlink" href="/search.html">🔎 Search</a>
     <span class="spacer"></span>
-    <button class="toggle" id="notifyToggle" title="Notify me when a session starts waiting">🔔 Notify</button>
     <span class="meta" id="meta"></span>
   </header>
-  <div id="board" class="board"></div>
+  <div id="world" class="world-stage">
+    <div class="world-zones" id="zones"></div>
+    <div class="world-actors" id="actors"></div>
+  </div>
   <script src="/static/app.js?v=14"></script>
-  <script>Board.init();</script>
+  <script>World.init();</script>
 </body>
 </html>

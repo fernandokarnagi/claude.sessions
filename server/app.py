@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import archives, overrides, parser, registry, runner, summaries, summarizer
+from . import archives, overrides, parser, registry, runner, summaries, summarizer, tmuxio
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -100,8 +100,10 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     data = parser.list_sessions(limit=lim, offset=offset, statuses=statuses,
                                 archived_ids=arch_ids, archived_mode=mode)
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
+    gated = tmuxio.pending_ids()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids)
+        s["pending_approval"] = s["session_id"] in gated
     return data
 
 
@@ -246,6 +248,41 @@ async def api_send(session_id: str, body: SendBody):
     )
 
 
+@app.get("/api/sessions/{session_id}/tmux")
+def api_tmux(session_id: str):
+    """Live tmux screen + any pending permission prompt for this session.
+
+    `prompt` is non-null only when the live REPL is sitting at a Yes/No/... gate.
+    """
+    screen = tmuxio.capture_pane(session_id)
+    if screen is None:
+        return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
+    return {
+        "session_id": session_id,
+        "has_tmux": True,
+        "prompt": tmuxio.parse_prompt(screen),
+        "screen": screen,
+    }
+
+
+class AnswerBody(BaseModel):
+    choice: int
+    text: str = ""
+
+
+@app.post("/api/sessions/{session_id}/answer")
+def api_answer(session_id: str, body: AnswerBody):
+    """Answer a live permission prompt by selecting a numbered option.
+
+    For a "No, and tell Claude what to do differently" option, include `text`
+    to type the follow-up guidance after selecting it.
+    """
+    result = tmuxio.answer(session_id, body.choice, body.text)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "answer failed"))
+    return result
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -264,6 +301,11 @@ def search_page():
 @app.get("/archived.html")
 def archived_page():
     return FileResponse(os.path.join(STATIC_DIR, "archived.html"))
+
+
+@app.get("/world.html")
+def world_page():
+    return FileResponse(os.path.join(STATIC_DIR, "world.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
