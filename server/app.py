@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import archives, overrides, parser, registry, runner, slackbot, summaries, summarizer, tmuxio
+from . import (archives, autonomy, overrides, parser, registry, runner,
+               slackbot, summaries, summarizer, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -30,8 +31,10 @@ app = FastAPI(title="Claude Sessions Dashboard")
 
 
 @app.on_event("startup")
-def _start_slack():
-    # No-op unless SLACK_BOT_TOKEN/APP_TOKEN/CHANNEL are set.
+def _start_background():
+    # Auto-approver for sessions on auto-safe/yolo (always on; honours its own
+    # kill switches). Slack is a no-op unless its tokens are set.
+    autonomy.start_watcher()
     slackbot.start()
 
 
@@ -110,9 +113,12 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
                                 archived_ids=arch_ids, archived_mode=mode)
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     gated = tmuxio.pending_ids()
+    levels = autonomy.all()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids)
-        s["pending_approval"] = s["session_id"] in gated
+        sid = s["session_id"]
+        s["pending_approval"] = sid in gated
+        s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
     return data
 
 
@@ -131,6 +137,7 @@ def api_session(session_id: str):
     if detail is None:
         raise HTTPException(status_code=404, detail="session not found")
     _decorate(detail, registry.web_mtimes(), runner.running_ids())
+    detail["autonomy"] = autonomy.get(session_id)
     return detail
 
 
@@ -147,6 +154,7 @@ def api_status(session_id: str):
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _decorate(s, registry.web_mtimes(), runner.running_ids())
+    s["autonomy"] = autonomy.get(session_id)
     return s
 
 
@@ -310,6 +318,19 @@ def api_paste(session_id: str, body: PasteBody):
     return {"path": path, "bytes": len(blob)}
 
 
+@app.post("/api/sessions/{session_id}/spawn")
+def api_spawn(session_id: str):
+    """Start a live tmux session that resumes this Claude session, so /say and
+    permission gates work against a live REPL."""
+    if parser.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    cwd = parser.session_cwd(session_id)
+    result = tmuxio.spawn(session_id, cwd)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "spawn failed"))
+    return result
+
+
 class SayBody(BaseModel):
     text: str
 
@@ -345,6 +366,91 @@ def api_answer(session_id: str, body: AnswerBody):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Triage — the single inbox of sessions that need you (gated or WAITING),
+# longest-waiting first. Includes the live prompt so the view can answer inline.
+# ---------------------------------------------------------------------------
+@app.get("/api/triage")
+def api_triage():
+    arch_ids = archives.archived_ids()
+    data = parser.list_sessions(limit=None, archived_ids=arch_ids,
+                                archived_mode="exclude")
+    gated = tmuxio.pending_ids()
+    web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
+    levels = autonomy.all()
+    out = []
+    for s in data["sessions"]:
+        sid = s["session_id"]
+        is_gated = sid in gated
+        if not (is_gated or s.get("status") == "WAITING"):
+            continue
+        _decorate(s, web_mtimes, running, titles, arch_ids)
+        s["pending_approval"] = is_gated
+        s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
+        s["prompt"] = tmuxio.pending(sid) if is_gated else None
+        out.append(s)
+    out.sort(key=lambda x: x.get("mtime") or 0)   # oldest = longest waiting, on top
+    return {"sessions": out, "total": len(out),
+            "autonomy_paused": autonomy.is_paused()}
+
+
+# ---------------------------------------------------------------------------
+# Autonomy — per-session trust level + a global pause kill switch.
+# ---------------------------------------------------------------------------
+@app.get("/api/autonomy")
+def api_autonomy():
+    return {"levels": autonomy.all(), "paused": autonomy.is_paused(),
+            "env_disabled": autonomy.env_disabled(), "options": list(autonomy.LEVELS)}
+
+
+class AutonomyBody(BaseModel):
+    level: str
+
+
+@app.put("/api/sessions/{session_id}/autonomy")
+def api_set_autonomy(session_id: str, body: AutonomyBody):
+    if body.level not in autonomy.LEVELS:
+        raise HTTPException(status_code=400,
+                            detail=f"level must be one of {autonomy.LEVELS}")
+    autonomy.set(session_id, body.level)
+    return {"session_id": session_id, "autonomy": body.level}
+
+
+class PauseBody(BaseModel):
+    paused: bool
+
+
+@app.post("/api/autonomy/pause")
+def api_autonomy_pause(body: PauseBody):
+    return {"paused": autonomy.set_paused(body.paused),
+            "env_disabled": autonomy.env_disabled()}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch — spawn a brand-new Claude session for a task, in tmux.
+# ---------------------------------------------------------------------------
+class DispatchBody(BaseModel):
+    cwd: str
+    prompt: str
+    model: str = "opus"
+    autonomy: str = "manual"
+
+
+@app.post("/api/dispatch")
+def api_dispatch(body: DispatchBody):
+    if body.autonomy not in autonomy.LEVELS:
+        raise HTTPException(status_code=400,
+                            detail=f"autonomy must be one of {autonomy.LEVELS}")
+    result = tmuxio.dispatch(body.cwd, body.prompt, model=body.model)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "dispatch failed"))
+    sid = result["session_id"]
+    if body.autonomy != autonomy.DEFAULT:
+        autonomy.set(sid, body.autonomy)
+    result["autonomy"] = body.autonomy
+    return result
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -368,6 +474,11 @@ def archived_page():
 @app.get("/world.html")
 def world_page():
     return FileResponse(os.path.join(STATIC_DIR, "world.html"))
+
+
+@app.get("/triage.html")
+def triage_page():
+    return FileResponse(os.path.join(STATIC_DIR, "triage.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

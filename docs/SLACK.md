@@ -10,8 +10,13 @@ dashboard needs no public URL — the bot dials out to Slack over a WebSocket.
   showing the command/context + a button per option.
 - **Answer from Slack** — click a button → it’s typed into the live tmux REPL.
   The “No, and tell Claude what to do differently” option opens a text modal.
-- **`/pending`** slash command — lists every session currently at a gate.
-- **Waiting notice** — a message when a session transitions into `WAITING`.
+- **Two-way chat** — each session gets its own **Slack thread**. Reply in the
+  thread and it’s typed into the live session; the session’s assistant replies
+  are mirrored back into the same thread.
+- **`/pending`** — lists every session currently at a gate.
+- **`/sessions`** — lists active sessions, each with a **💬 Talk** button that
+  opens a thread you can converse in.
+- **Waiting notice** — a message in the thread when a session enters `WAITING`.
 
 ## 1. Create the Slack app
 
@@ -23,13 +28,20 @@ dashboard needs no public URL — the bot dials out to Slack over a WebSocket.
 3. **OAuth & Permissions** → **Bot Token Scopes** → add:
    - `chat:write`
    - `commands`
-4. **Slash Commands** → **Create New Command**: command `/pending`, any short
-   description. (Socket Mode → no Request URL needed.)
-5. **Interactivity & Shortcuts** → toggle **on** (no URL needed under Socket
-   Mode — this is what makes the buttons/modal work).
-6. **Install App** (OAuth & Permissions → Install to Workspace). Copy the
+   - `channels:history`  ← needed for two-way chat (read your thread replies)
+   - `groups:history`    ← only if you’ll use it in a private channel
+   - `reactions:write`   ← optional, for the ✓/✗ ack on your replies
+4. **Slash Commands** → **Create New Command** twice: `/pending` and
+   `/sessions` (Socket Mode → no Request URL needed).
+5. **Interactivity & Shortcuts** → toggle **on** (no URL under Socket Mode —
+   powers the buttons/modal).
+6. **Event Subscriptions** → toggle **on**. Under **Subscribe to bot events**
+   add `message.channels` (and `message.groups` for private channels). This is
+   what delivers your thread replies. (Socket Mode → no Request URL.)
+   After adding scopes/events you must **Reinstall** the app.
+7. **Install App** (OAuth & Permissions → Install to Workspace). Copy the
    **Bot User OAuth Token** — this is `SLACK_BOT_TOKEN` (`xoxb-…`).
-7. In Slack, create/choose a channel and **invite the bot**:
+8. In Slack, create/choose a channel and **invite the bot**:
    `/invite @YourApp`. Get the channel id (channel → View details → bottom, or
    right-click → Copy link → the `C…` id) — this is `SLACK_CHANNEL`.
 

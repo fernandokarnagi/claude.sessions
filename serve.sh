@@ -9,6 +9,14 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$DIR/.venv"
 PORT="${PORT:-8765}"
 
+# Load Slack credentials if present (gitignored). Without these the Slack bot
+# stays disabled and the dashboard runs web-only.
+if [ -f "$DIR/.env.slack" ]; then
+    # shellcheck disable=SC1091
+    source "$DIR/.env.slack"
+fi
+export PYTHONUNBUFFERED=1
+
 if [ ! -x "$VENV/bin/python" ]; then
     echo "Creating venv at $VENV ..."
     python3 -m venv "$VENV"

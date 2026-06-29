@@ -19,10 +19,17 @@ in the live pane, so this module is the path for that.
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import time
+import uuid
 from typing import Optional
+
+CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+READY_MARKER = "? for shortcuts"   # REPL idle-input footer (see runclaude_base.sh)
 
 # A numbered menu row, optionally pointed at by the ❯ selector and wrapped in
 # box-drawing borders, e.g. "│ ❯ 1. Yes                     │".
@@ -198,6 +205,89 @@ def _send_keys(session_id: str, *keys: str) -> None:
         ["tmux", "send-keys", "-t", session_id, *keys],
         capture_output=True, text=True, timeout=5,
     )
+
+
+def has_session(session_id: str) -> bool:
+    return capture_pane(session_id) is not None
+
+
+def spawn(session_id: str, cwd: Optional[str], ready_timeout: int = 60) -> dict:
+    """Start a live tmux session that resumes this Claude session.
+
+    Mirrors ccoe/runclaude_base.sh: a detached tmux session named == the Claude
+    id, rooted at the project cwd, running `claude --resume <id>`. The session's
+    own model/settings are restored by --resume. Inherits the dashboard's env
+    (so e.g. ANTHROPIC_BASE_URL for non-default backends carries through).
+
+    Returns {ok, has_tmux} (ok False with `error` on failure).
+    """
+    if has_session(session_id):
+        return {"ok": True, "has_tmux": True, "already": True}
+    if not cwd or not os.path.isdir(cwd):
+        return {"ok": False, "error": f"project dir not found: {cwd}"}
+    try:
+        r = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session_id, "-c", cwd],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "error": r.stderr.strip() or "tmux new-session failed"}
+        time.sleep(1.0)   # let the shell prompt settle before send-keys
+        _send_keys(session_id, "-l", "--", f"{CLAUDE_BIN} --resume {session_id}")
+        _send_keys(session_id, "Enter")
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "error": str(e)}
+
+    # Wait for the REPL to come up (idle-input footer marker).
+    waited = 0.0
+    while waited < ready_timeout:
+        screen = capture_pane(session_id) or ""
+        if READY_MARKER in screen or parse_prompt(screen):
+            return {"ok": True, "has_tmux": True}
+        time.sleep(1.0)
+        waited += 1.0
+    # Session exists but didn't show the marker in time — still usable.
+    return {"ok": True, "has_tmux": True, "ready": False}
+
+
+def dispatch(cwd: str, prompt: str, model: str = "opus",
+             ready_timeout: int = 90) -> dict:
+    """Start a *brand-new* Claude session for a task and seed it with `prompt`.
+
+    Mirrors ccoe/runclaude_base.sh's new-session path: generate a uuid, create a
+    detached tmux session named == that id, run `claude --model M --session-id
+    <id>` (so tmux name == Claude session id, keeping the rest of this module's
+    machinery valid), wait for the REPL, then type the task prompt and submit.
+
+    Returns {ok, session_id, has_tmux} (ok False with `error` on failure).
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {"ok": False, "error": f"project dir not found: {cwd}"}
+    if not prompt or not prompt.strip():
+        return {"ok": False, "error": "empty task prompt"}
+    sid = str(uuid.uuid4())
+    try:
+        r = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", sid, "-c", cwd],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "error": r.stderr.strip() or "tmux new-session failed"}
+        time.sleep(1.0)   # let the shell prompt settle before send-keys
+        cmd = f"{shlex.quote(CLAUDE_BIN)} --model {shlex.quote(model)} --session-id {sid}"
+        _send_keys(sid, "-l", "--", cmd)
+        _send_keys(sid, "Enter")
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "error": str(e)}
+
+    waited = 0.0
+    while waited < ready_timeout:
+        screen = capture_pane(sid) or ""
+        if READY_MARKER in screen or parse_prompt(screen):
+            break
+        time.sleep(1.0)
+        waited += 1.0
+
+    say(sid, prompt)
+    return {"ok": True, "session_id": sid, "has_tmux": True}
 
 
 def say(session_id: str, text: str) -> dict:

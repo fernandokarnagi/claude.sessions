@@ -47,6 +47,18 @@ async function getJSON(url) {
   return r.json();
 }
 
+// Autonomy level → small badge (nothing for the default "manual").
+const AUTONOMY_META = {
+  "manual":    { icon: "🙋", label: "Manual" },
+  "auto-safe": { icon: "🤖", label: "Auto-safe" },
+  "yolo":      { icon: "🚀", label: "YOLO" },
+};
+function autonomyBadge(level) {
+  if (!level || level === "manual") return "";
+  const m = AUTONOMY_META[level] || { icon: "🤖", label: level };
+  return `<span class="auto-badge ${level}" title="Autonomy: ${esc(m.label)}">${m.icon} ${esc(m.label)}</span>`;
+}
+
 // ---- Dashboard ---------------------------------------------------------------
 
 const Dashboard = {
@@ -198,6 +210,7 @@ const Dashboard = {
       <div class="row">
         ${originBadge(s)}
         <span class="pill ${s.status}">${s.status}</span>
+        ${autonomyBadge(s.autonomy)}
         <span class="badge">${esc(modelShort(s.model))}</span>
         <span class="badge tokens"><b>${fmtNum(s.tokens.total)}</b> tok</span>
         <span class="badge" title="${esc(s.created_at || "")}">${relTime(s.updated_at)}</span>
@@ -675,6 +688,7 @@ const Detail = {
     try {
       const r = await getJSON(`/api/sessions/${encodeURIComponent(this.id)}/tmux`);
       prompt = r.prompt;
+      this.applyTmux(!!r.has_tmux);
     } catch (e) { return; /* keep last render */ }
 
     if (!prompt) {
@@ -883,6 +897,12 @@ const Detail = {
           <option value="bypassPermissions">bypassPermissions</option>
           <option value="default">default</option>
         </select>
+        <button id="spawnBtn" class="hdr-btn" title="Start a live tmux session (resume) so messages & approvals run in a live REPL">▶ Start live session</button>
+        <select id="autoSel" title="Autonomy: how this session's permission gates are answered">
+          ${["manual", "auto-safe", "yolo"].map((l) =>
+            `<option value="${l}"${(d.autonomy || "manual") === l ? " selected" : ""}>auto: ${l}</option>`).join("")}
+        </select>
+        <span class="live-tmux" id="liveTmux"></span>
         <span class="now-model" id="nowModel"></span>
       </div>
       <div id="attach" class="attach"></div>
@@ -901,6 +921,32 @@ const Detail = {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); this.send(); }
     });
     ta.addEventListener("paste", (e) => this.handlePaste(e, ta));
+    document.getElementById("spawnBtn").addEventListener("click", () => this.spawn());
+    document.getElementById("autoSel").addEventListener("change", (e) => this.setAutonomy(e.target.value));
+  },
+
+  // Reflect whether a live tmux session exists; toggle the Start button.
+  applyTmux(hasTmux) {
+    const btn = document.getElementById("spawnBtn");
+    const ind = document.getElementById("liveTmux");
+    if (!btn || !ind) return;
+    btn.style.display = hasTmux ? "none" : "";
+    ind.textContent = hasTmux ? "● live tmux" : "";
+  },
+
+  async spawn() {
+    const btn = document.getElementById("spawnBtn");
+    btn.disabled = true; btn.textContent = "Starting…";
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(this.id)}/spawn`, { method: "POST" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      this.applyTmux(true);
+      await this.refreshApproval();
+    } catch (e) {
+      btn.textContent = "▶ Start live session";
+      btn.disabled = false;
+      alert("Could not start live session: " + e.message);
+    }
   },
 
   // Paste an image: upload it, show it as a thumbnail chip. Its saved path is
@@ -1107,5 +1153,232 @@ const Detail = {
         this.offset = r.offset;
       }
     } catch (e) { /* keep last offset; retry next poll */ }
+  },
+
+  // ---- autonomy selector ----------------------------------------------------
+  async setAutonomy(level) {
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(this.id)}/autonomy`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level }),
+      });
+      if (this.detail) this.detail.autonomy = level;
+    } catch (e) { alert("Could not set autonomy: " + e.message); }
+  },
+};
+
+// ---- Triage (the inbox of sessions needing you) ------------------------------
+//
+// One column, longest-waiting on top. Each row shows what the session is blocked
+// on — a permission gate (answer inline) or "waiting for your reply" — plus a
+// quick autonomy dial. The whole point: clear the queue without opening tabs.
+
+const Triage = {
+  FAST_MS: 2000,
+  SLOW_MS: 5000,
+  timer: null,
+  paused: false,
+  _answering: {},      // sid -> true while an answer is in flight (don't churn)
+
+  init() {
+    document.getElementById("pauseToggle").addEventListener("click", () => this.togglePause());
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) this.tick(); });
+    this.tick();
+  },
+
+  async tick() {
+    clearTimeout(this.timer);
+    try {
+      const data = await getJSON("/api/triage");
+      this.paused = data.autonomy_paused;
+      this.render(data);
+    } catch (e) {
+      document.getElementById("meta").textContent = "error: " + e.message;
+    }
+    if (document.hidden) return;
+    this.timer = setTimeout(() => this.tick(), this.FAST_MS);
+  },
+
+  render(data) {
+    const list = document.getElementById("triage");
+    const empty = document.getElementById("empty");
+    document.getElementById("meta").textContent =
+      `${data.total} need you · updated ${new Date().toLocaleTimeString()}`;
+    const pt = document.getElementById("pauseToggle");
+    pt.classList.toggle("active", this.paused);
+    pt.textContent = this.paused ? "⏸ Autonomy paused" : "⏯ Autonomy live";
+    empty.style.display = data.sessions.length ? "none" : "block";
+    list.innerHTML = data.sessions.map((s) => this.row(s)).join("");
+    list.querySelectorAll("[data-answer]").forEach((b) =>
+      b.addEventListener("click", () => this.answer(b.dataset.sid, parseInt(b.dataset.answer, 10), b.dataset.needs === "1")));
+    list.querySelectorAll("[data-auto]").forEach((sel) =>
+      sel.addEventListener("change", () => this.setAutonomy(sel.dataset.sid, sel.value)));
+  },
+
+  row(s) {
+    const wait = relTime(s.updated_at);
+    const href = `/session.html?id=${encodeURIComponent(s.session_id)}`;
+    const autoSel = `
+      <select class="tri-auto" data-sid="${s.session_id}" title="Autonomy level">
+        ${["manual", "auto-safe", "yolo"].map((l) =>
+          `<option value="${l}"${s.autonomy === l ? " selected" : ""}>${l}</option>`).join("")}
+      </select>`;
+
+    let body;
+    if (s.prompt) {
+      const ctx = s.prompt.context
+        ? `<pre class="approval-ctx">${esc(s.prompt.context)}</pre>` : "";
+      const btns = s.prompt.options.map((o) => {
+        const needsText = /tell claude|differently|what to do/i.test(o.label);
+        const tone = o.num === 1 ? "yes" : (/^no\b/i.test(o.label) ? "no" : "");
+        return `<button class="appr-btn ${tone}" data-sid="${s.session_id}" data-answer="${o.num}" data-needs="${needsText ? 1 : 0}"><b>${o.num}</b> ${esc(o.label)}</button>`;
+      }).join("");
+      body = `
+        <div class="tri-gate">
+          <div class="approval-head">⚠ Needs approval</div>
+          ${ctx}
+          <div class="approval-q">${esc(s.prompt.question)}</div>
+          <div class="approval-opts">${btns}</div>
+        </div>`;
+    } else {
+      body = `<div class="tri-wait">⏳ Waiting for your reply — <a href="${href}">open to respond</a></div>`;
+    }
+
+    return `
+      <div class="tri-card${s.prompt ? " gated" : ""}">
+        <div class="tri-head">
+          <a class="tri-title" href="${href}">${esc(s.title)}</a>
+          <span class="tri-meta">
+            ${autonomyBadge(s.autonomy)}
+            <span class="badge">${esc(modelShort(s.model))}</span>
+            <span class="badge">${wait}</span>
+            ${autoSel}
+          </span>
+        </div>
+        <div class="tri-project">${esc(s.project || "")}</div>
+        ${body}
+      </div>`;
+  },
+
+  async answer(sid, choice, needsText) {
+    if (needsText) {   // free-text follow-up belongs on the detail page
+      location.href = `/session.html?id=${encodeURIComponent(sid)}`;
+      return;
+    }
+    if (this._answering[sid]) return;
+    this._answering[sid] = true;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/answer`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ choice, text: "" }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } catch (e) { alert("Answer failed: " + e.message); }
+    finally {
+      delete this._answering[sid];
+      setTimeout(() => this.tick(), 600);   // let the REPL advance, then refresh
+    }
+  },
+
+  async setAutonomy(sid, level) {
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(sid)}/autonomy`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level }),
+      });
+    } catch (e) { alert("Could not set autonomy: " + e.message); }
+    this.tick();
+  },
+
+  async togglePause() {
+    try {
+      const r = await fetch("/api/autonomy/pause", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paused: !this.paused }),
+      });
+      const d = await r.json();
+      this.paused = d.paused;
+    } catch (e) { alert("Could not toggle: " + e.message); }
+    this.tick();
+  },
+};
+
+// ---- Dispatch (spawn a brand-new session for a task) -------------------------
+//
+// A modal that starts a fresh `claude --session-id <new>` in tmux, rooted at a
+// project dir, and seeds it with the task prompt. Optionally sets the new
+// session's autonomy so it can run hands-off.
+
+const Dispatch = {
+  open() {
+    if (document.getElementById("dispatchModal")) return;
+    const last = localStorage.getItem("dispatchCwd") || "";
+    const el = document.createElement("div");
+    el.id = "dispatchModal";
+    el.className = "modal-backdrop";
+    el.innerHTML = `
+      <div class="modal">
+        <div class="modal-head">✨ Dispatch a new session</div>
+        <label class="modal-label">Project directory</label>
+        <input id="dispCwd" class="modal-input" placeholder="/path/to/project" value="${esc(last)}" />
+        <label class="modal-label">Task</label>
+        <textarea id="dispPrompt" class="modal-input" rows="4" placeholder="What should the new session do?"></textarea>
+        <div class="modal-row">
+          <span>
+            <label class="modal-label">Model</label>
+            <select id="dispModel" class="modal-input">
+              <option value="opus" selected>opus</option>
+              <option value="sonnet">sonnet</option>
+            </select>
+          </span>
+          <span>
+            <label class="modal-label">Autonomy</label>
+            <select id="dispAuto" class="modal-input">
+              <option value="manual" selected>manual</option>
+              <option value="auto-safe">auto-safe</option>
+              <option value="yolo">yolo</option>
+            </select>
+          </span>
+        </div>
+        <div class="modal-status" id="dispStatus"></div>
+        <div class="modal-actions">
+          <button id="dispCancel" class="hdr-btn">Cancel</button>
+          <button id="dispGo" class="hdr-btn primary">Dispatch ▶</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.addEventListener("click", (e) => { if (e.target === el) this.close(); });
+    document.getElementById("dispCancel").addEventListener("click", () => this.close());
+    document.getElementById("dispGo").addEventListener("click", () => this.go());
+  },
+
+  close() {
+    const el = document.getElementById("dispatchModal");
+    if (el) el.remove();
+  },
+
+  async go() {
+    const cwd = document.getElementById("dispCwd").value.trim();
+    const prompt = document.getElementById("dispPrompt").value.trim();
+    const model = document.getElementById("dispModel").value;
+    const autonomy = document.getElementById("dispAuto").value;
+    const status = document.getElementById("dispStatus");
+    if (!cwd || !prompt) { status.textContent = "Project directory and task are required."; return; }
+    localStorage.setItem("dispatchCwd", cwd);
+    const go = document.getElementById("dispGo");
+    go.disabled = true; status.textContent = "Starting session… (waiting for the REPL, ~10s)";
+    try {
+      const r = await fetch("/api/dispatch", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, prompt, model, autonomy }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || ("HTTP " + r.status));
+      status.innerHTML = `✅ Dispatched. <a href="/session.html?id=${encodeURIComponent(d.session_id)}">Open session →</a>`;
+      go.textContent = "Dispatched";
+    } catch (e) {
+      status.textContent = "Dispatch failed: " + e.message;
+      go.disabled = false;
+    }
   },
 };

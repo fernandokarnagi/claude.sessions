@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Optional
 
-from . import overrides, parser, tmuxio
+from . import autonomy, overrides, parser, tmuxio
 
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
@@ -43,12 +44,240 @@ _NEEDS_TEXT_RE = ("tell claude", "differently", "what to do")
 _gates: dict[str, dict] = {}
 # last seen status per session, for WAITING-transition notifications
 _statuses: dict[str, str] = {}
+# one Slack thread per session: sid -> {"channel", "ts"} (ts == thread root)
+_threads: dict[str, dict] = {}
+# transcript byte offset already mirrored to Slack, per session
+_offsets: dict[str, int] = {}
+THREADS_FILE = os.path.join(os.path.dirname(__file__), ".slack_threads.json")
 _started = False
 _bolt = None   # the slack_bolt App, built in start()
 
 
 def enabled() -> bool:
     return bool(BOT_TOKEN and APP_TOKEN and CHANNEL)
+
+
+def _load_threads() -> None:
+    try:
+        with open(THREADS_FILE) as f:
+            data = json.load(f)
+        _threads.update(data.get("threads", {}))
+    except Exception:
+        return
+    # Don't replay history written before this run — start from current EOF.
+    for sid in _threads:
+        p = parser.session_path(sid)
+        try:
+            _offsets[sid] = os.path.getsize(p) if p and os.path.exists(p) else 0
+        except Exception:
+            _offsets[sid] = 0
+
+
+def _save_threads() -> None:
+    try:
+        with open(THREADS_FILE, "w") as f:
+            json.dump({"threads": _threads}, f)
+    except Exception as e:
+        print(f"[slack] save threads failed: {e}")
+
+
+def _sid_for_thread(thread_ts: str) -> Optional[str]:
+    for sid, t in _threads.items():
+        if t.get("ts") == thread_ts:
+            return sid
+    return None
+
+
+def _ensure_thread(sid: str) -> dict:
+    """The Slack thread bound to a session — creating its root post if needed."""
+    t = _threads.get(sid)
+    if t:
+        return t
+    resp = _bolt.client.chat_postMessage(
+        channel=CHANNEL,
+        text=f":thread: *{_title(sid)}* · <{_link(sid)}|open in dashboard>\n"
+             "_Reply in this thread to talk to the session._",
+    )
+    t = {"channel": resp["channel"], "ts": resp["ts"]}
+    _threads[sid] = t
+    p = parser.session_path(sid)
+    try:
+        _offsets[sid] = os.path.getsize(p) if p and os.path.exists(p) else 0
+    except Exception:
+        _offsets[sid] = 0
+    _save_threads()
+    return t
+
+
+_BOT_UID: Optional[str] = None       # our bot's user id (to skip own msgs)
+_chan_seen: Optional[str] = None     # last channel ts processed (mentions)
+_thread_seen: dict[str, str] = {}    # thread root ts -> last reply ts processed
+_inbound_seeded = False              # skip backlog on first poll
+
+
+def _sessions_blocks(limit: int = 12) -> list:
+    """Block Kit: one row per active session with an 'Open' button."""
+    ss = [s for s in parser.list_sessions(limit=limit)["sessions"] if s.get("status") != "ENDED"]
+    if not ss:
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": "No active sessions."}}]
+    blocks: list = [{"type": "section", "text": {"type": "mrkdwn",
+        "text": "*Active sessions* — tap *Open* to see the latest message and continue:"}}]
+    for s in ss:
+        sid = s["session_id"]
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                "text": f"*{_title(sid)}*  ·  `{s.get('status')}`"},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "💬 Open"},
+                "action_id": "open_session",
+                "value": sid,
+            },
+        })
+    return blocks
+
+
+def _latest_assistant(sid: str) -> str:
+    """The session's most recent assistant message text (from the transcript)."""
+    p = parser.session_path(sid)
+    if not p or not os.path.exists(p):
+        return "(no transcript)"
+    try:
+        size = os.path.getsize(p)
+        acts, _ = parser.tail_activities(p, max(0, size - 20000))
+        texts = [a.get("text") for a in acts
+                 if a.get("kind") == "assistant" and a.get("text")]
+        return texts[-1] if texts else "(no recent assistant message)"
+    except Exception:
+        return "(could not read transcript)"
+
+
+def _answer_query(text: str) -> str:
+    """Plain-text reply for a simple query (pending / help)."""
+    low = text.lower().strip()
+    if not low or "pending" in low or "approv" in low:
+        return _gated_text()
+    return ("Try `pending` or `sessions`, or reply inside a session thread to "
+            "talk to that session.")
+
+
+def _poll_inbound() -> None:
+    """Read new human messages via the Web API (no Events API needed).
+
+    - replies inside a bound session thread -> typed into that session
+    - @mentions in the channel -> answered (pending / sessions / help)
+    """
+    global _BOT_UID, _chan_seen, _inbound_seeded
+    if _BOT_UID is None:
+        try:
+            _BOT_UID = _bolt.client.auth_test()["user_id"]
+        except Exception:
+            return
+
+    # First pass: mark everything already in the channel/threads as seen, so we
+    # don't reply to backlog from before the server started.
+    if not _inbound_seeded:
+        try:
+            h = _bolt.client.conversations_history(channel=CHANNEL, limit=1)
+            ms = h.get("messages", [])
+            _chan_seen = ms[0]["ts"] if ms else None
+        except Exception:
+            pass
+        for sid, t in list(_threads.items()):
+            try:
+                r = _bolt.client.conversations_replies(channel=t["channel"], ts=t["ts"], limit=50)
+                ms = r.get("messages", [])
+                _thread_seen[t["ts"]] = ms[-1]["ts"] if ms else t["ts"]
+            except Exception:
+                _thread_seen[t["ts"]] = t["ts"]
+        _inbound_seeded = True
+        return
+
+    # 1. thread replies for each bound session
+    for sid, t in list(_threads.items()):
+        try:
+            root = t["ts"]
+            r = _bolt.client.conversations_replies(channel=t["channel"], ts=root, limit=50)
+            msgs = r.get("messages", [])[1:]   # skip the root
+            last = _thread_seen.get(root, root)
+            newest = last
+            for m in msgs:
+                ts = m.get("ts", "")
+                if ts <= last:
+                    continue
+                newest = max(newest, ts)
+                if m.get("bot_id") or m.get("user") == _BOT_UID or m.get("subtype"):
+                    continue
+                text = re.sub(r"<@[^>]+>", "", m.get("text") or "").strip()
+                if text:
+                    res = tmuxio.say(sid, text)
+                    print(f"[slack] inbound -> {sid[:8]}: {text[:60]!r} ok={res.get('ok')}")
+            _thread_seen[root] = newest
+        except Exception as e:
+            print(f"[slack] poll thread {sid[:8]} failed: {e}")
+
+    # 2. @mentions anywhere (top level OR inside a thread, bound or not)
+    try:
+        kw = {"channel": CHANNEL, "limit": 20}
+        if _chan_seen:
+            kw["oldest"] = _chan_seen
+        h = _bolt.client.conversations_history(**kw)
+        msgs = sorted(h.get("messages", []), key=lambda m: m.get("ts", ""))
+        for m in msgs:
+            ts = m.get("ts", "")
+            if _chan_seen and ts <= _chan_seen:
+                continue
+            _chan_seen = ts if not _chan_seen else max(_chan_seen, ts)
+            if m.get("bot_id") or m.get("user") == _BOT_UID:
+                continue
+            text = m.get("text") or ""
+            tts = m.get("thread_ts")
+            mentioned = _BOT_UID and f"<@{_BOT_UID}>" in text
+            sid = _sid_for_thread(tts) if tts else None
+            clean = re.sub(r"<@[^>]+>", "", text).strip()
+            if sid and clean:
+                # message in a bound session thread -> talk to the session
+                res = tmuxio.say(sid, clean)
+                print(f"[slack] inbound -> {sid[:8]}: {clean[:60]!r} ok={res.get('ok')}")
+            elif mentioned:
+                low = clean.lower()
+                if "session" in low or "list" in low:
+                    _bolt.client.chat_postMessage(
+                        channel=CHANNEL, thread_ts=tts or ts,
+                        text="Active sessions", blocks=_sessions_blocks())
+                else:
+                    _bolt.client.chat_postMessage(
+                        channel=CHANNEL, thread_ts=tts or ts, text=_answer_query(clean))
+                print(f"[slack] mention answered: {clean[:50]!r}")
+    except Exception as e:
+        print(f"[slack] poll mentions failed: {e}")
+
+
+def _flush_replies(sid: str) -> None:
+    """Mirror new assistant replies from the transcript into the Slack thread."""
+    t = _threads.get(sid)
+    if not t:
+        return
+    p = parser.session_path(sid)
+    if not p:
+        return
+    try:
+        acts, new_off = parser.tail_activities(p, _offsets.get(sid, 0))
+    except Exception:
+        return
+    _offsets[sid] = new_off
+    for a in acts:
+        if a.get("kind") != "assistant":
+            continue   # skip user echoes, tool calls, thinking — post replies only
+        txt = (a.get("text") or "").strip()
+        if not txt:
+            continue
+        try:
+            _bolt.client.chat_postMessage(
+                channel=t["channel"], thread_ts=t["ts"], text=txt[:3500])
+        except Exception as e:
+            print(f"[slack] reply post failed: {e}")
 
 
 def _title(sid: str) -> str:
@@ -112,8 +341,9 @@ def gate_blocks(sid: str, prompt: dict, answered: Optional[str] = None) -> list:
 
 def _post_gate(sid: str, prompt: dict) -> None:
     try:
+        t = _ensure_thread(sid)
         resp = _bolt.client.chat_postMessage(
-            channel=CHANNEL,
+            channel=t["channel"], thread_ts=t["ts"],
             text=f"Needs approval: {prompt['question']}",
             blocks=gate_blocks(sid, prompt),
         )
@@ -137,11 +367,29 @@ def _resolve_gate(sid: str, answered: str = "closed") -> None:
         print(f"[slack] resolve_gate failed: {e}")
 
 
+def _auto_answer_note(sid: str, level: str, choice: int, prompt: dict) -> None:
+    """Mirror an autonomy auto-answer into Slack — only for sessions the user
+    has already opened a thread for, so autonomous sessions don't spam new
+    threads into the channel."""
+    if sid not in _threads:
+        return
+    try:
+        t = _threads[sid]
+        q = (prompt.get("question") or "").strip()
+        _bolt.client.chat_postMessage(
+            channel=t["channel"], thread_ts=t["ts"],
+            text=f":robot_face: auto-approved (*{level}*): option {choice}"
+                 + (f" — {q[:200]}" if q else ""))
+    except Exception as e:
+        print(f"[slack] auto_answer_note failed: {e}")
+
+
 def _notify_waiting(sid: str) -> None:
     try:
+        t = _ensure_thread(sid)
         _bolt.client.chat_postMessage(
-            channel=CHANNEL,
-            text=f":bell: <{_link(sid)}|{_title(sid)}> is now *waiting* for your reply.",
+            channel=t["channel"], thread_ts=t["ts"],
+            text=":bell: now *waiting* for your reply — reply in this thread.",
         )
     except Exception as e:
         print(f"[slack] notify_waiting failed: {e}")
@@ -149,8 +397,12 @@ def _notify_waiting(sid: str) -> None:
 
 def _watch() -> None:
     seeded = False
+    beat = 0
     while True:
         try:
+            beat += 1
+            if beat % 15 == 1:
+                print(f"[slack] watch alive (threads={len(_threads)}, seen_chan={_chan_seen})")
             sessions = parser.list_sessions(limit=None)["sessions"]
             for s in sessions:
                 sid, st = s["session_id"], s.get("status")
@@ -161,11 +413,21 @@ def _watch() -> None:
 
             gated = tmuxio.pending_ids()
             for sid in gated - set(_gates):
+                # Sessions on auto-safe/yolo are handled by the autonomy
+                # watcher; only post a manual gate for the human to answer.
+                if autonomy.get(sid) != "manual":
+                    continue
                 p = tmuxio.pending(sid)
                 if p:
                     _post_gate(sid, p)
             for sid in set(_gates) - gated:
                 _resolve_gate(sid, "answered / dismissed in terminal")
+
+            # Mirror new assistant replies for any session bound to a thread.
+            for sid in list(_threads):
+                _flush_replies(sid)
+            # Read inbound human messages via Web API (no Events API needed).
+            _poll_inbound()
             seeded = True
         except Exception as e:
             print(f"[slack] watch loop error: {e}")
@@ -187,12 +449,27 @@ def _ssl_context():
         return ssl.create_default_context()
 
 
+def _gated_text() -> str:
+    gated = tmuxio.pending_ids()
+    items = [(sid, tmuxio.pending(sid)) for sid in gated]
+    items = [(sid, p) for sid, p in items if p]
+    if not items:
+        return ":tada: Nothing pending approval right now."
+    lines = [f"*{len(items)} pending approval:*"]
+    for sid, p in items:
+        lines.append(f"• <{_link(sid)}|{_title(sid)}> — {p['question']}")
+    return "\n".join(lines)
+
+
 def _build_app():
     from slack_bolt import App
     from slack_sdk import WebClient
     client = WebClient(token=BOT_TOKEN, ssl=_ssl_context())
     # Skip the build-time auth.test network call; we connect via Socket Mode.
     app = App(client=client, token_verification_enabled=False)
+    # NOTE: inbound messages/mentions are handled by _poll_inbound (Web API
+    # polling), NOT by Events API handlers — registering @app.event here too
+    # would double-answer when the Events API is also enabled.
 
     def _do_answer(sid: str, choice: int, text: str = "") -> dict:
         return tmuxio.answer(sid, choice, text)
@@ -272,6 +549,29 @@ def _build_app():
             blocks.extend(gate_blocks(sid, p))
         respond(blocks=blocks, text=f"{len(prompts)} session(s) need approval")
 
+    @app.command("/sessions")
+    def sessions_cmd(ack, respond):
+        ack()
+        respond(blocks=_sessions_blocks(), text="Active sessions")
+
+    @app.action("open_session")
+    def open_session(ack, body, action, client):
+        ack()
+        sid = action["value"]
+        t = _ensure_thread(sid)
+        # Resume the session in tmux (best-effort, in background — can take secs).
+        cwd = parser.session_cwd(sid)
+        threading.Thread(target=tmuxio.spawn, args=(sid, cwd), daemon=True,
+                         name=f"spawn-{sid[:8]}").start()
+        latest = _latest_assistant(sid)
+        try:
+            client.chat_postMessage(
+                channel=t["channel"], thread_ts=t["ts"],
+                text=f":speech_balloon: *{_title(sid)}* — latest message:\n\n{latest[:3400]}"
+                     "\n\n_Resuming live session… reply in this thread to continue._")
+        except Exception as e:
+            print(f"[slack] open_session post failed: {e}")
+
     return app
 
 
@@ -292,6 +592,8 @@ def start() -> None:
         os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     except Exception:
         pass
+    _load_threads()
+    autonomy.set_auto_answer_hook(_auto_answer_note)
     try:
         from slack_bolt.adapter.socket_mode import SocketModeHandler
         _bolt = _build_app()

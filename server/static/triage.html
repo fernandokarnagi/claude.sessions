@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Triage · Claude Sessions</title>
+  <link rel="stylesheet" href="/static/style.css?v=15" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>📋 Triage</h1>
+    <a class="navlink" href="/">🪐 Board</a>
+    <a class="navlink" href="/world.html">🗺️ World</a>
+    <a class="navlink" href="/search.html">🔎 Search</a>
+    <span class="spacer"></span>
+    <button class="toggle" id="pauseToggle" title="Pause/resume the auto-approver for all sessions">⏯ Autonomy live</button>
+    <span class="meta" id="meta"></span>
+  </header>
+  <div id="triage" class="triage"></div>
+  <div id="empty" class="empty" style="display:none">🎉 Nothing needs your attention right now.</div>
+  <script src="/static/app.js?v=15"></script>
+  <script>Triage.init();</script>
+</body>
+</html>

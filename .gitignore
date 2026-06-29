@@ -14,6 +14,7 @@ server/.title_overrides.json
 server/.waiting_summaries.json
 server/.archived.json
 server/.adopted.json
+server/.autonomy.json
 server/.*.tmp
 
 # OS / editor
@@ -21,3 +22,7 @@ server/.*.tmp
 *.swp
 .idea/
 .vscode/
+server/.slack_threads.json
+
+# Slack credentials (never commit)
+.env.slack
