@@ -451,6 +451,40 @@ def api_dispatch(body: DispatchBody):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Relay — structured session-to-session messaging over the file bus.
+# ---------------------------------------------------------------------------
+@app.get("/api/relay/sources")
+def api_relay_sources():
+    """Live tmux sessions usable as a relay sender, with best-effort titles."""
+    live = tmuxio.tmux_sessions()
+    titles = overrides.all_titles()
+    data = parser.list_sessions(limit=None)
+    known = {s["session_id"]: s for s in data["sessions"]}
+    out = []
+    for sid in sorted(live):
+        s = known.get(sid, {})
+        out.append({
+            "session_id": sid,
+            "title": titles.get(sid) or s.get("title") or s.get("cwd") or sid[:8],
+        })
+    return {"sources": out}
+
+
+class RelayBody(BaseModel):
+    from_id: str
+    to_id: str
+    message: str
+
+
+@app.post("/api/relay")
+def api_relay(body: RelayBody):
+    result = tmuxio.relay(body.from_id, body.to_id, body.message)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "relay failed"))
+    return result
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))

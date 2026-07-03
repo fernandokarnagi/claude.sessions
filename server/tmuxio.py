@@ -31,6 +31,11 @@ from typing import Optional
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 READY_MARKER = "? for shortcuts"   # REPL idle-input footer (see runclaude_base.sh)
 
+# The file-based message bus used for structured session-to-session relay.
+# Overridable so the path isn't hard-wired to one machine.
+SEND_MESSAGE_SH = os.environ.get(
+    "SEND_MESSAGE_SH", os.path.expanduser("~/App/ccoe/send-message.sh"))
+
 # A numbered menu row, optionally pointed at by the ❯ selector and wrapped in
 # box-drawing borders, e.g. "│ ❯ 1. Yes                     │".
 _OPTION_RE = re.compile(r"^[\s│|>]*?(❯)?\s*(\d+)\.\s+(.*)$")
@@ -323,3 +328,35 @@ def answer(session_id: str, choice: int, text: str = "") -> dict:
         _send_keys(session_id, "--", text)
         _send_keys(session_id, "Enter")
     return {"ok": True}
+
+
+def relay(from_id: str, to_id: str, message: str) -> dict:
+    """Relay `message` from one live session to another via the file message bus.
+
+    Runs ccoe/send-message.sh with TMUX_SESSIONID=from_id, which persists the
+    payload under <to>/<from>/<msg_id>/ and nudges the target's REPL with a
+    `### TMUX_SESSION_QUESTION - <from>/<msg_id> ###` line. The target can then
+    use its tmux-reply skill to read the payload and reply back into from_id's
+    pane. Unlike say() (a raw one-way prompt), this is the structured,
+    reply-routable path; both sessions should be live tmux sessions.
+
+    Returns {ok, message_id, from, to} (ok False with `error` on failure).
+    """
+    if not message or not message.strip():
+        return {"ok": False, "error": "empty message"}
+    if from_id == to_id:
+        return {"ok": False, "error": "cannot relay a session to itself"}
+    if not os.path.isfile(SEND_MESSAGE_SH):
+        return {"ok": False, "error": f"message bus script not found: {SEND_MESSAGE_SH}"}
+    if capture_pane(to_id) is None:
+        return {"ok": False, "error": "target has no live tmux session"}
+    env = dict(os.environ, TMUX_SESSIONID=from_id)
+    try:
+        r = subprocess.run(
+            [SEND_MESSAGE_SH, to_id, message],
+            capture_output=True, text=True, timeout=15, env=env)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "error": str(e)}
+    if r.returncode != 0:
+        return {"ok": False, "error": r.stderr.strip() or "send-message failed"}
+    return {"ok": True, "message_id": r.stdout.strip(), "from": from_id, "to": to_id}
