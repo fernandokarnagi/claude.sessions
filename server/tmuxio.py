@@ -330,6 +330,24 @@ def answer(session_id: str, choice: int, text: str = "") -> dict:
     return {"ok": True}
 
 
+def kill(session_id: str) -> dict:
+    """Terminate the live tmux session (ends its Claude REPL). Irreversible.
+
+    No-op success if nothing is live. Returns {ok} (ok False with `error`).
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": True, "already": True}
+    try:
+        r = subprocess.run(
+            ["tmux", "kill-session", "-t", session_id],
+            capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "error": str(e)}
+    if r.returncode != 0:
+        return {"ok": False, "error": r.stderr.strip() or "kill-session failed"}
+    return {"ok": True}
+
+
 def relay(from_id: str, to_id: str, message: str) -> dict:
     """Relay `message` from one live session to another via the file message bus.
 

@@ -331,6 +331,15 @@ def api_spawn(session_id: str):
     return result
 
 
+@app.post("/api/sessions/{session_id}/kill")
+def api_kill(session_id: str):
+    """Shut down the live tmux session (ends its Claude REPL). Irreversible."""
+    result = tmuxio.kill(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "kill failed"))
+    return result
+
+
 class SayBody(BaseModel):
     text: str
 
