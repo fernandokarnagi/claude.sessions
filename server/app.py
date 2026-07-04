@@ -52,8 +52,14 @@ async def no_store(request, call_next):
 _MTIME_EPS = 1.0
 
 
+# A live tmux REPL that's merely idle must not age past WAITING — it's still
+# alive and waiting on you. Only once its tmux is killed can it decay further.
+_BEYOND_WAITING = {"SITTING", "SLEEPING", "ENDED"}
+
+
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
-              titles: dict | None = None, archived: set | None = None) -> dict:
+              titles: dict | None = None, archived: set | None = None,
+              live_ids: set | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -87,6 +93,13 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
     is_web = summary["origin"] == "web"
     # CLI "live" = actively writing (THINKING) and not driven by us
     summary["live"] = summary["live_web"] or (not is_web and summary.get("status") == "THINKING")
+
+    # Live tmux REPL: flag it, and pin an idle one at WAITING (never Sitting/
+    # Sleeping/Ended) until the tmux is killed.
+    live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    summary["live_tmux"] = sid in live_ids
+    if summary["live_tmux"] and summary.get("status") in _BEYOND_WAITING:
+        summary["status"] = "WAITING"
     return summary
 
 
@@ -116,10 +129,9 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     live_tmux = tmuxio.tmux_sessions()
     levels = autonomy.all()
     for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles, arch_ids)
+        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
-        s["live_tmux"] = sid in live_tmux
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
     return data
 
@@ -127,9 +139,10 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
 @app.get("/api/search")
 def api_search(q: str = Query("")):
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
+    live_tmux = tmuxio.tmux_sessions()
     data = parser.search_sessions(q, extra_titles=titles)
     for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles)
+        _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
     return data
 
 
@@ -387,15 +400,20 @@ def api_triage():
     data = parser.list_sessions(limit=None, archived_ids=arch_ids,
                                 archived_mode="exclude")
     gated = tmuxio.pending_ids()
+    live_tmux = tmuxio.tmux_sessions()
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     levels = autonomy.all()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
         is_gated = sid in gated
+        # A live-but-idle REPL is pinned at WAITING (matches the board), so it
+        # belongs in triage until answered or its tmux is killed.
+        if sid in live_tmux and s.get("status") in _BEYOND_WAITING:
+            s["status"] = "WAITING"
         if not (is_gated or s.get("status") == "WAITING"):
             continue
-        _decorate(s, web_mtimes, running, titles, arch_ids)
+        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         s["pending_approval"] = is_gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
