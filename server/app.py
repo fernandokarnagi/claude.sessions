@@ -407,11 +407,14 @@ def api_triage():
     for s in data["sessions"]:
         sid = s["session_id"]
         is_gated = sid in gated
+        is_live = sid in live_tmux
         # A live-but-idle REPL is pinned at WAITING (matches the board), so it
         # belongs in triage until answered or its tmux is killed.
-        if sid in live_tmux and s.get("status") in _BEYOND_WAITING:
+        if is_live and s.get("status") in _BEYOND_WAITING:
             s["status"] = "WAITING"
-        if not (is_gated or s.get("status") == "WAITING"):
+        # Show every live tmux session in triage (incl. THINKING) plus anything
+        # gated or waiting — the full set of sessions you might act on.
+        if not (is_gated or is_live or s.get("status") == "WAITING"):
             continue
         _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         s["pending_approval"] = is_gated

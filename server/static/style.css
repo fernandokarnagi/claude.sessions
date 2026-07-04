@@ -641,6 +641,7 @@ body.world-page { overflow: hidden; }
 .tri-project { color: var(--muted); font-size: 12px; margin: 2px 0 8px; word-break: break-all; }
 .tri-gate { border-top: 1px solid var(--border); padding-top: 8px; }
 .tri-wait { color: var(--waiting-pill); font-size: 13px; }
+.tri-wait.working { color: var(--thinking); }
 .tri-wait a { color: var(--accent); }
 
 /* ---- dispatch modal --------------------------------------------------------*/
