@@ -113,11 +113,13 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
                                 archived_ids=arch_ids, archived_mode=mode)
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     gated = tmuxio.pending_ids()
+    live_tmux = tmuxio.tmux_sessions()
     levels = autonomy.all()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
+        s["live_tmux"] = sid in live_tmux
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
     return data
 

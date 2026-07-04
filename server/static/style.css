@@ -663,5 +663,6 @@ body.world-page { overflow: hidden; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .hdr-btn.primary { color: #fff; border-color: var(--accent); background: rgba(88,166,255,.22); }
 .hdr-btn.primary:hover { background: rgba(88,166,255,.35); }
+.live-tmux-badge { color: #3fb950; border-color: rgba(63,185,80,.5) !important; font-weight: 600; }
 .hdr-btn.danger { color: #f85149; border-color: rgba(248,81,73,.5); }
 .hdr-btn.danger:hover { color: #fff; border-color: #f85149; background: rgba(248,81,73,.25); }
