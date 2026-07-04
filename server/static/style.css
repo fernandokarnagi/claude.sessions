@@ -349,7 +349,10 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .approval-text { display: flex; gap: 8px; align-items: stretch; }
 .stream:empty { display: none; }
 .result-line { color: var(--muted); font-size: 12px; padding: 6px 0 12px; font-variant-numeric: tabular-nums; }
-.hist-title { color: var(--muted); font-size: 13px; font-weight: 600; margin: 6px 0 12px; }
+.hist-title { color: var(--muted); font-size: 13px; font-weight: 600; margin: 0; }
+.hist-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 6px 0 12px; }
+.hist-toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; }
+.hist-toggle input { accent-color: var(--accent); cursor: pointer; }
 
 /* ---- World (anime-RPG) view ------------------------------------------------ */
 

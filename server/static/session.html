@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=21" />
+  <link rel="stylesheet" href="/static/style.css?v=22" />
 </head>
 <body>
   <header class="topbar">
@@ -17,10 +17,15 @@
     <div id="approval"></div>
     <div id="summary"></div>
     <div id="chat" class="chat"></div>
-    <h3 class="hist-title">History (newest first)</h3>
+    <div class="hist-bar">
+      <h3 class="hist-title">History (newest first)</h3>
+      <label class="hist-toggle" title="Off = only user & assistant messages (faster). On = also tool calls, results, thinking.">
+        <input type="checkbox" id="showAll" /> show tool / thinking
+      </label>
+    </div>
     <div id="events"></div>
   </main>
-  <script src="/static/app.js?v=21"></script>
+  <script src="/static/app.js?v=22"></script>
   <script>Detail.init();</script>
 </body>
 </html>
