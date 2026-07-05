@@ -17,6 +17,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -33,6 +34,17 @@ PROJECTS_DIR = os.path.expanduser(
 # Throwaway summarizer runs use this cwd; sessions created there are internal
 # to the dashboard and excluded from listings/search.
 SUMMARIZER_CWD = os.path.expanduser("~/.claude_dashboard_summarizer")
+
+# `/model` local-command stdout, e.g. "Set model to <b>glm-5.2:cloud</b>" or
+# "Kept model as kimi-2.7:cloud" — captures the full routing name (with any
+# `:cloud`/provider suffix) that assistant messages don't record.
+_MODEL_CMD_RE = re.compile(r"model (?:to|as)\s+(.+?)\s*$", re.IGNORECASE)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    """Remove ANSI SGR escapes (e.g. the bold codes around the model name)."""
+    return _ANSI_RE.sub("", s).replace("</local-command-stdout>", "").strip()
 
 # Status thresholds, in seconds, based on time since the file was last written.
 # Tiers (each is the UPPER bound of that status):
@@ -200,7 +212,8 @@ def _build_summary(path: str) -> dict:
 
     title = None
     cwd = None
-    model = None
+    model = None          # resolved model id from assistant messages (e.g. glm-5.2)
+    model_full = None     # full routing name from /model output (e.g. glm-5.2:cloud)
     entrypoint = None
     created_at = None
     last_ts = None
@@ -217,6 +230,15 @@ def _build_summary(path: str) -> dict:
 
         if evt.get("entrypoint"):
             entrypoint = evt["entrypoint"]
+
+        # `/model` writes a local-command line ("Set model to X" / "Kept model
+        # as X") carrying the *full* routing name incl. suffix like `:cloud` —
+        # the assistant `message.model` only records the provider-resolved id
+        # (e.g. alias `glm-5.2:cloud` resolves to `glm-5.2`). Prefer the former.
+        if evt.get("type") == "system" and evt.get("subtype") == "local_command":
+            mm = _MODEL_CMD_RE.search(evt.get("content") or "")
+            if mm:
+                model_full = _strip_ansi(mm.group(1)).strip()
 
         ts = evt.get("timestamp")
         if ts:
@@ -252,7 +274,7 @@ def _build_summary(path: str) -> dict:
         "title": title or "(untitled session)",
         "project": _project_label(cwd, path),
         "cwd": cwd,
-        "model": model,
+        "model": model_full or model,
         "entrypoint": entrypoint or "cli",
         "status": compute_status(mtime),
         "created_at": created_at,

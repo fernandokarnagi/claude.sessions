@@ -625,19 +625,26 @@ body.world-page { overflow: hidden; }
 #pauseToggle.active { color: var(--tool); border-color: var(--tool); background: rgba(210,153,34,.14); }
 
 /* ---- triage view -----------------------------------------------------------*/
-.triage { padding: 16px; max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
-.tri-card {
-  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-  padding: 12px 14px;
+.triage {
+  padding: 16px; display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  align-items: start;
 }
+/* Attention cards reuse .card; .tri-card only adds the gated highlight + a
+   clickable title (the card itself is a div, not an anchor). */
+.tri-card .title { color: var(--text); text-decoration: none; display: flex;
+  align-items: center; justify-content: space-between; gap: 8px; }
+.tri-card .title:hover { color: var(--accent); }
 .tri-card.gated { border-color: rgba(210,153,34,.55); box-shadow: 0 0 0 1px rgba(210,153,34,.25) inset; }
-.tri-head { display: flex; align-items: center; gap: 10px; justify-content: space-between; flex-wrap: wrap; }
-.tri-title { font-weight: 600; color: var(--text); text-decoration: none; font-size: 15px; }
-.tri-title:hover { color: var(--accent); }
-.tri-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tri-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  border-top: 1px solid var(--border); padding-top: 10px; }
 .tri-auto { font-size: 11px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
 .tri-relay { font-size: 11px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
 .tri-relay:hover { border-color: var(--user); color: var(--user); }
+.tri-attn { font-size: 11px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.tri-attn:hover { border-color: #d29922; color: #d29922; }
+.tri-attn.marked { color: #d29922; border-color: rgba(210,153,34,.5); font-weight: 600; }
+.hdr-btn.marked { color: #d29922; border-color: rgba(210,153,34,.5); }
 .tri-project { color: var(--muted); font-size: 12px; margin: 2px 0 8px; word-break: break-all; }
 .tri-gate { border-top: 1px solid var(--border); padding-top: 8px; }
 .tri-wait { color: var(--waiting-pill); font-size: 13px; }

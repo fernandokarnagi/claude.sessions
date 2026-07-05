@@ -4,11 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=24" />
+  <link rel="stylesheet" href="/static/style.css?v=28" />
 </head>
 <body>
   <header class="topbar">
-    <a class="back" href="/">← Board</a>
+    <a class="back" id="backLink" href="/">← Board</a>
     <span class="spacer"></span>
     <span class="meta" id="meta"></span>
   </header>
@@ -25,7 +25,13 @@
     </div>
     <div id="events"></div>
   </main>
-  <script src="/static/app.js?v=24"></script>
-  <script>Detail.init();</script>
+  <script src="/static/app.js?v=28"></script>
+  <script>
+    if (new URLSearchParams(location.search).get("from") === "attention") {
+      const b = document.getElementById("backLink");
+      b.href = "/triage.html"; b.textContent = "← Attention";
+    }
+    Detail.init();
+  </script>
 </body>
 </html>

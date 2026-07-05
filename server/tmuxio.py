@@ -348,6 +348,24 @@ def kill(session_id: str) -> dict:
     return {"ok": True}
 
 
+def compact(session_id: str, instructions: str = "") -> dict:
+    """Trigger Claude Code's /compact on the live REPL to shrink its context.
+
+    Types the `/compact` slash command (optionally with focus instructions,
+    e.g. "keep the auth refactor details") and submits it. Drives the live
+    tmux session, same as say(). No-op error if nothing is live.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    cmd = "/compact"
+    if instructions.strip():
+        cmd += " " + instructions.strip()
+    # -l = literal so the slash/text aren't taken as tmux keys.
+    _send_keys(session_id, "-l", "--", cmd)
+    _send_keys(session_id, "Enter")
+    return {"ok": True}
+
+
 def relay(from_id: str, to_id: str, message: str) -> dict:
     """Relay `message` from one live session to another via the file message bus.
 

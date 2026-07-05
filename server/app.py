@@ -22,8 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (archives, autonomy, overrides, parser, registry, runner,
-               slackbot, summaries, summarizer, tmuxio)
+from . import (archives, attention, autonomy, overrides, parser, registry,
+               runner, slackbot, summaries, summarizer, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -59,7 +59,7 @@ _BEYOND_WAITING = {"SITTING", "SLEEPING", "ENDED"}
 
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
               titles: dict | None = None, archived: set | None = None,
-              live_ids: set | None = None) -> dict:
+              live_ids: set | None = None, marked: set | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -79,6 +79,9 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
 
     archived = archived if archived is not None else archives.archived_ids()
     summary["archived"] = sid in archived
+
+    marked = marked if marked is not None else attention.marked_ids()
+    summary["attention"] = sid in marked
 
     cur_mtime = summary.get("mtime") or 0
     web_mtime = web_mtimes.get(sid)
@@ -236,6 +239,21 @@ def api_unarchive(session_id: str):
     return {"session_id": session_id, "archived": False}
 
 
+@app.post("/api/sessions/{session_id}/attention")
+def api_mark_attention(session_id: str):
+    """Manually pin this session to the Attention page (persists until unmarked)."""
+    if parser.session_path(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    attention.set_marked(session_id, True)
+    return {"session_id": session_id, "attention": True}
+
+
+@app.delete("/api/sessions/{session_id}/attention")
+def api_unmark_attention(session_id: str):
+    attention.set_marked(session_id, False)
+    return {"session_id": session_id, "attention": False}
+
+
 class TitleBody(BaseModel):
     title: str = ""
 
@@ -390,6 +408,22 @@ def api_answer(session_id: str, body: AnswerBody):
     return result
 
 
+class CompactBody(BaseModel):
+    instructions: str = ""
+
+
+@app.post("/api/sessions/{session_id}/compact")
+def api_compact(session_id: str, body: CompactBody = CompactBody()):
+    """Run /compact on the live tmux REPL to shrink its context window.
+
+    Optional `instructions` focus what the summary keeps.
+    """
+    result = tmuxio.compact(session_id, body.instructions)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "compact failed"))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Triage — the single inbox of sessions that need you (gated or WAITING),
 # longest-waiting first. Includes the live prompt so the view can answer inline.
@@ -401,6 +435,7 @@ def api_triage():
                                 archived_mode="exclude")
     gated = tmuxio.pending_ids()
     live_tmux = tmuxio.tmux_sessions()
+    marked = attention.marked_ids()
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     levels = autonomy.all()
     out = []
@@ -408,20 +443,24 @@ def api_triage():
         sid = s["session_id"]
         is_gated = sid in gated
         is_live = sid in live_tmux
+        is_marked = sid in marked
         # A live-but-idle REPL is pinned at WAITING (matches the board), so it
-        # belongs in triage until answered or its tmux is killed.
+        # belongs here until answered or its tmux is killed.
         if is_live and s.get("status") in _BEYOND_WAITING:
             s["status"] = "WAITING"
-        # Show every live tmux session in triage (incl. THINKING) plus anything
-        # gated or waiting — the full set of sessions you might act on.
-        if not (is_gated or is_live or s.get("status") == "WAITING"):
+        # Attention page = only live tmux sessions plus ones the user manually
+        # pinned. (A gated session always has a live REPL, so it's covered.)
+        if not (is_live or is_marked):
             continue
-        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
+        _decorate(s, web_mtimes, running, titles, arch_ids,
+                  live_ids=live_tmux, marked=marked)
         s["pending_approval"] = is_gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
         out.append(s)
-    out.sort(key=lambda x: x.get("mtime") or 0)   # oldest = longest waiting, on top
+    # Gated (needs-approval) always on top; otherwise newest activity first.
+    out.sort(key=lambda x: (x.get("pending_approval", False), x.get("mtime") or 0),
+             reverse=True)
     return {"sessions": out, "total": len(out),
             "autonomy_paused": autonomy.is_paused()}
 

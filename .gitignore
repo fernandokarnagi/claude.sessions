@@ -13,6 +13,7 @@ server/.web_sessions.json
 server/.title_overrides.json
 server/.waiting_summaries.json
 server/.archived.json
+server/.attention.json
 server/.adopted.json
 server/.autonomy.json
 server/.*.tmp
