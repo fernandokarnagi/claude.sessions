@@ -101,6 +101,9 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
   color: var(--accent); border-color: var(--accent);
   background: rgba(88,166,255,.14); font-weight: 600;
 }
+.toggle.danger { color: #f85149; border-color: rgba(248,81,73,.5); }
+.toggle.danger:hover { color: #fff; border-color: #f85149; background: rgba(248,81,73,.25); }
+.toggle.danger:disabled { opacity: .6; cursor: default; }
 #attentionToggle.active { color: var(--tool); border-color: var(--tool); background: rgba(210,153,34,.14); }
 
 .search-bar { margin-bottom: 20px; }

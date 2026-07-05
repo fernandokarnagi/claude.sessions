@@ -373,6 +373,16 @@ def api_kill(session_id: str):
     return result
 
 
+@app.post("/api/tmux/kill-all")
+def api_kill_all():
+    """Shut down every live tmux session (ends all their REPLs). Irreversible."""
+    live = tmuxio.tmux_sessions()
+    killed, failed = [], []
+    for sid in live:
+        (killed if tmuxio.kill(sid).get("ok") else failed).append(sid)
+    return {"killed": killed, "failed": failed, "count": len(killed)}
+
+
 class SayBody(BaseModel):
     text: str
 
@@ -458,9 +468,9 @@ def api_triage():
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
         out.append(s)
-    # Gated (needs-approval) always on top; otherwise newest activity first.
-    out.sort(key=lambda x: (x.get("pending_approval", False), x.get("mtime") or 0),
-             reverse=True)
+    # Gated (needs-approval) always on top; otherwise A→Z by title.
+    out.sort(key=lambda x: (not x.get("pending_approval", False),
+                            (x.get("title") or "").lower()))
     return {"sessions": out, "total": len(out),
             "autonomy_paused": autonomy.is_paused()}
 
