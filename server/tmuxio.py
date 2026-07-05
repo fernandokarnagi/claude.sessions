@@ -94,58 +94,71 @@ def parse_prompt(screen: str) -> Optional[dict]:
         return None
     lines = screen.splitlines()
 
-    options: list[dict] = []
-    first_opt_idx = None
+    # Collect EVERY run of numbered option lines (a "run" is options with the
+    # same 1..N sequence, separated from other content by a blank line). A pane
+    # often contains a decoy run — e.g. the assistant's own prose enumeration
+    # ("1. …\n2. …") above the real prompt — so we can't just take the first;
+    # we scan them all and pick the true gate near the bottom.
+    runs: list[dict] = []
+    cur: Optional[dict] = None
     for i, ln in enumerate(lines):
         m = _OPTION_RE.match(ln)
-        if not m:
-            # Allow blank/gap lines between options without breaking the run.
-            if options and not _strip(ln):
-                continue
-            if options:
-                # A non-blank, non-option line ends the option block.
+        if m:
+            ptr, num, label = m.group(1), int(m.group(2)), _strip(m.group(3))
+            if cur is None:
+                cur = {"start": i, "options": []}
+            cur["options"].append({"num": num, "label": label, "selected": bool(ptr)})
+            continue
+        if cur is not None:
+            if not _strip(ln):
+                runs.append(cur)          # blank line closes the run
+                cur = None
+            elif cur["options"]:
+                # A wrapped option label spills onto an indented continuation
+                # line; fold it back into the current option rather than break.
+                cur["options"][-1]["label"] += " " + _strip(ln)
+    if cur is not None:
+        runs.append(cur)
+
+    # A real menu has >= 2 options numbered exactly 1..N in order.
+    valid = [r for r in runs
+             if len(r["options"]) >= 2
+             and [o["num"] for o in r["options"]] == list(range(1, len(r["options"]) + 1))]
+    if not valid:
+        return None
+
+    # Pick the bottom-most run that actually looks like a permission gate
+    # (has the ❯ selector, or gate keywords / a Yes+No pair). The live prompt
+    # is always the last such menu on screen.
+    chosen = None
+    for r in valid:
+        opts = r["options"]
+        question, q_idx = "", r["start"]
+        for j in range(r["start"] - 1, -1, -1):
+            cand = _strip(lines[j])
+            if cand:
+                question, q_idx = cand, j
                 break
-            continue
-        ptr, num, label = m.group(1), int(m.group(2)), _strip(m.group(3))
-        if not label:
-            continue
-        if first_opt_idx is None:
-            first_opt_idx = i
-        options.append({"num": num, "label": label, "selected": bool(ptr)})
-
-    # Need a real menu: at least two options, numbered 1..N in order.
-    if len(options) < 2:
-        return None
-    if [o["num"] for o in options] != list(range(1, len(options) + 1)):
+        blob = (question + " " + " ".join(o["label"] for o in opts)).lower()
+        has_pointer = any(o["selected"] for o in opts)
+        looks_like_gate = (
+            any(h in blob for h in _QUESTION_HINTS)
+            or ("yes" in blob and "no" in blob)
+        )
+        if has_pointer or looks_like_gate:
+            chosen = (r, question, q_idx)
+    if chosen is None:
         return None
 
-    # Question = nearest non-empty, non-option line above the block.
-    question = ""
-    q_idx = first_opt_idx
-    for j in range(first_opt_idx - 1, -1, -1):
-        cand = _strip(lines[j])
-        if cand:
-            question, q_idx = cand, j
-            break
-
+    r, question, q_idx = chosen
     # Context = the tool/command preview rendered above the question, e.g. the
     # "Bash command" block + "This command requires approval". Walk up from the
     # question, collecting until a box top-border or a previous REPL message.
     context = _extract_context(lines, q_idx)
-
-    blob = (question + " " + " ".join(o["label"] for o in options)).lower()
-    has_pointer = any(o["selected"] for o in options)
-    looks_like_gate = (
-        any(h in blob for h in _QUESTION_HINTS)
-        or ("yes" in blob and "no" in blob)
-    )
-    if not (has_pointer or looks_like_gate):
-        return None
-
     return {
         "question": question,
         "context": context,
-        "options": options,
+        "options": r["options"],
         "raw": screen,
     }
 
