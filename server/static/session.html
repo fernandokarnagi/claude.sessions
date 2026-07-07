@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=29" />
+  <link rel="stylesheet" href="/static/style.css?v=37" />
 </head>
 <body>
   <header class="topbar">
@@ -12,24 +12,40 @@
     <span class="spacer"></span>
     <span class="meta" id="meta"></span>
   </header>
-  <main>
-    <div id="header"></div>
-    <div id="approval"></div>
-    <div id="summary"></div>
-    <div id="chat" class="chat"></div>
-    <div class="hist-bar">
-      <h3 class="hist-title">History (newest first)</h3>
-      <label class="hist-toggle" title="Off = only user & assistant messages (faster). On = also tool calls, results, thinking.">
-        <input type="checkbox" id="showAll" /> show tool / thinking
-      </label>
-    </div>
-    <div id="events"></div>
-  </main>
-  <script src="/static/app.js?v=29"></script>
+  <div class="detail-layout">
+    <aside id="attnRail" class="attn-rail" hidden></aside>
+    <main>
+      <div id="header"></div>
+      <div id="approval"></div>
+      <div id="summary"></div>
+      <div id="chat" class="chat"></div>
+      <div class="hist-bar">
+        <h3 class="hist-title">History (newest first)</h3>
+        <label class="hist-toggle" title="How many of the latest entries to show.">
+          show
+          <select id="histLimit">
+            <option value="10">10</option>
+            <option value="20">20</option>
+            <option value="30">30</option>
+            <option value="40">40</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="all">all</option>
+          </select>
+        </label>
+        <label class="hist-toggle" title="Off = only user & assistant messages (faster). On = also tool calls, results, thinking.">
+          <input type="checkbox" id="showAll" /> show tool / thinking
+        </label>
+      </div>
+      <div id="events"></div>
+    </main>
+  </div>
+  <script src="/static/app.js?v=37"></script>
   <script>
     if (new URLSearchParams(location.search).get("from") === "attention") {
       const b = document.getElementById("backLink");
       b.href = "/triage.html"; b.textContent = "← Attention";
+      AttnRail.init();
     }
     Detail.init();
   </script>

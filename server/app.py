@@ -22,8 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (archives, attention, autonomy, overrides, parser, registry,
-               runner, slackbot, summaries, summarizer, tmuxio)
+from . import (archives, attention, autonomy, models, overrides, parser,
+               registry, runner, slackbot, summaries, summarizer, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -362,6 +362,13 @@ def api_spawn(session_id: str):
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "spawn failed"))
     return result
+
+
+@app.get("/api/launchers")
+def api_launchers():
+    """List the runclaude_<model>.sh scripts, so the UI can show copy-paste
+    launch commands (cd <project> && runclaude_<model>.sh <session-id>)."""
+    return {"launchers": models.launchers()}
 
 
 @app.post("/api/sessions/{session_id}/kill")

@@ -250,7 +250,11 @@ def spawn(session_id: str, cwd: Optional[str], ready_timeout: int = 60) -> dict:
         if r.returncode != 0:
             return {"ok": False, "error": r.stderr.strip() or "tmux new-session failed"}
         time.sleep(1.0)   # let the shell prompt settle before send-keys
-        _send_keys(session_id, "-l", "--", f"{CLAUDE_BIN} --resume {session_id}")
+        # cd explicitly: `-c cwd` only sets the shell's *initial* dir; a login
+        # profile can cd away before claude launches, which would resume the
+        # session in the wrong project (wrong .claude settings/model default).
+        _send_keys(session_id, "-l", "--",
+                   f"cd {shlex.quote(cwd)} && {shlex.quote(CLAUDE_BIN)} --resume {session_id}")
         _send_keys(session_id, "Enter")
     except (FileNotFoundError, subprocess.SubprocessError) as e:
         return {"ok": False, "error": str(e)}
@@ -290,7 +294,9 @@ def dispatch(cwd: str, prompt: str, model: str = "opus",
         if r.returncode != 0:
             return {"ok": False, "error": r.stderr.strip() or "tmux new-session failed"}
         time.sleep(1.0)   # let the shell prompt settle before send-keys
-        cmd = f"{shlex.quote(CLAUDE_BIN)} --model {shlex.quote(model)} --session-id {sid}"
+        # cd explicitly so a login profile can't drop us in the wrong project.
+        cmd = (f"cd {shlex.quote(cwd)} && {shlex.quote(CLAUDE_BIN)} "
+               f"--model {shlex.quote(model)} --session-id {sid}")
         _send_keys(sid, "-l", "--", cmd)
         _send_keys(sid, "Enter")
     except (FileNotFoundError, subprocess.SubprocessError) as e:

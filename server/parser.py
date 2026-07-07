@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from . import models
+
 # ---- Tunable constants -------------------------------------------------------
 
 # Location of Claude Code session transcripts. Override with the
@@ -38,13 +40,34 @@ SUMMARIZER_CWD = os.path.expanduser("~/.claude_dashboard_summarizer")
 # `/model` local-command stdout, e.g. "Set model to <b>glm-5.2:cloud</b>" or
 # "Kept model as kimi-2.7:cloud" — captures the full routing name (with any
 # `:cloud`/provider suffix) that assistant messages don't record.
-_MODEL_CMD_RE = re.compile(r"model (?:to|as)\s+(.+?)\s*$", re.IGNORECASE)
+_MODEL_CMD_RE = re.compile(r"model (?:to|as)\s+(\S+)", re.IGNORECASE)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _strip_ansi(s: str) -> str:
     """Remove ANSI SGR escapes (e.g. the bold codes around the model name)."""
     return _ANSI_RE.sub("", s).replace("</local-command-stdout>", "").strip()
+
+
+def _resolve_model(model, full_by_base, last_full):
+    """Best display name for the session's model.
+
+    `model` is the resolved id from assistant messages (e.g. `glm-5.2`,
+    `kimi-k2.7-code`, `gemma4:31b`, `claude-opus-4-8`) or None. Priority:
+      1. The exact name the user set via /model this session (full_by_base),
+         which keeps a `:cloud` suffix — e.g. set `glm-5.2:cloud`, messages
+         report `glm-5.2`.
+      2. A known launch name from the runclaude_*.sh registry — recovers the
+         real cloud/local form (e.g. `gemma4:31b` -> `gemma4:31b-cloud`, while
+         local `gemma4:12b` stays as-is).
+      3. The resolved id as-is (no guessed suffix).
+    """
+    if not model:
+        return last_full
+    full = full_by_base.get(model.split(":")[0].lower())
+    if full:
+        return full
+    return models.canonical(model) or model
 
 # Status thresholds, in seconds, based on time since the file was last written.
 # Tiers (each is the UPPER bound of that status):
@@ -213,7 +236,8 @@ def _build_summary(path: str) -> dict:
     title = None
     cwd = None
     model = None          # resolved model id from assistant messages (e.g. glm-5.2)
-    model_full = None     # full routing name from /model output (e.g. glm-5.2:cloud)
+    full_by_base = {}     # base -> full /model name, e.g. "glm-5.2" -> "glm-5.2:cloud"
+    last_full = None      # most recent /model full name (fallback when no messages)
     entrypoint = None
     created_at = None
     last_ts = None
@@ -234,11 +258,17 @@ def _build_summary(path: str) -> dict:
         # `/model` writes a local-command line ("Set model to X" / "Kept model
         # as X") carrying the *full* routing name incl. suffix like `:cloud` —
         # the assistant `message.model` only records the provider-resolved id
-        # (e.g. alias `glm-5.2:cloud` resolves to `glm-5.2`). Prefer the former.
+        # (e.g. alias `glm-5.2:cloud` resolves to `glm-5.2`). We keep the last
+        # one that is a real model id (has a digit and a '-' or ':'), so a
+        # no-arg /model check that prints a display name like "Opus 4.8", or a
+        # trailing "… and saved as your default", doesn't poison it.
         if evt.get("type") == "system" and evt.get("subtype") == "local_command":
             mm = _MODEL_CMD_RE.search(evt.get("content") or "")
             if mm:
-                model_full = _strip_ansi(mm.group(1)).strip()
+                tok = _strip_ansi(mm.group(1)).strip()
+                if re.search(r"\d", tok) and ("-" in tok or ":" in tok):
+                    full_by_base[tok.split(":")[0].lower()] = tok
+                    last_full = tok
 
         ts = evt.get("timestamp")
         if ts:
@@ -248,8 +278,11 @@ def _build_summary(path: str) -> dict:
 
         msg = evt.get("message")
         if isinstance(msg, dict):
-            if msg.get("model"):
-                model = msg["model"]
+            # Track the real running model. Skip "<synthetic>" (subagent/system
+            # synthetic turns) — it isn't a model and would mask the true one.
+            mv = msg.get("model")
+            if mv and mv != "<synthetic>":
+                model = mv
             usage = msg.get("usage")
             if isinstance(usage, dict):
                 tokens.input += usage.get("input_tokens", 0) or 0
@@ -269,12 +302,14 @@ def _build_summary(path: str) -> dict:
             if isinstance(c, str) and c.strip():
                 title = _short(c)
 
+    disp_model = _resolve_model(model, full_by_base, last_full)
+
     return {
         "session_id": session_id,
         "title": title or "(untitled session)",
         "project": _project_label(cwd, path),
         "cwd": cwd,
-        "model": model_full or model,
+        "model": disp_model,
         "entrypoint": entrypoint or "cli",
         "status": compute_status(mtime),
         "created_at": created_at,
