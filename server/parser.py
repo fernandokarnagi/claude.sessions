@@ -226,6 +226,18 @@ def compute_status(mtime: float, now: Optional[float] = None) -> str:
     return "ENDED"
 
 
+def _status_with_turn(mtime: float, turn_pending: bool,
+                      now: Optional[float] = None) -> str:
+    """Age-based status, overlaid with the turn rule: THINKING iff the latest
+    message isn't the assistant's. Mid-turn stays THINKING (unless truly ended);
+    once the assistant has replied it's never THINKING (a fresh reply is WAITING).
+    """
+    base = compute_status(mtime, now)
+    if turn_pending:
+        return base if base == "ENDED" else "THINKING"
+    return "WAITING" if base == "THINKING" else base
+
+
 # ---- Summaries ---------------------------------------------------------------
 
 def _build_summary(path: str) -> dict:
@@ -241,6 +253,7 @@ def _build_summary(path: str) -> dict:
     entrypoint = None
     created_at = None
     last_ts = None
+    last_role = None      # role of the last main-thread message (turn state)
     tokens = Tokens()
     recent: list[dict] = []  # rolling list of rendered activities
 
@@ -283,6 +296,13 @@ def _build_summary(path: str) -> dict:
             mv = msg.get("model")
             if mv and mv != "<synthetic>":
                 model = mv
+
+            # Track the last MAIN-thread message role (ignore subagent
+            # sidechains). THINKING is strictly "the latest message is not from
+            # the assistant" — i.e. the agent still owes a reply.
+            role = msg.get("role")
+            if role in ("user", "assistant") and not evt.get("isSidechain"):
+                last_role = role
             usage = msg.get("usage")
             if isinstance(usage, dict):
                 tokens.input += usage.get("input_tokens", 0) or 0
@@ -304,6 +324,12 @@ def _build_summary(path: str) -> dict:
 
     disp_model = _resolve_model(model, full_by_base, last_full)
 
+    # THINKING strictly means the latest message is NOT from the assistant (the
+    # agent still owes a reply) — this holds even when a long tool run keeps the
+    # transcript quiet. Once the assistant has replied, it's never THINKING.
+    turn_pending = last_role is not None and last_role != "assistant"
+    status = _status_with_turn(mtime, turn_pending)
+
     return {
         "session_id": session_id,
         "title": title or "(untitled session)",
@@ -311,7 +337,8 @@ def _build_summary(path: str) -> dict:
         "cwd": cwd,
         "model": disp_model,
         "entrypoint": entrypoint or "cli",
-        "status": compute_status(mtime),
+        "status": status,
+        "turn_pending": turn_pending,
         "created_at": created_at,
         "updated_at": last_ts or _iso(mtime),
         "tokens": tokens.as_dict(),
@@ -336,7 +363,9 @@ def _summary_for(path: str) -> Optional[dict]:
     else:
         summary = _build_summary(path)
         _summary_cache[path] = (st.st_mtime, st.st_size, summary)
-    summary["status"] = compute_status(st.st_mtime)
+    # Recompute against wall-clock age, applying the turn rule (content-derived
+    # turn_pending survives the recompute): THINKING iff latest msg not assistant.
+    summary["status"] = _status_with_turn(st.st_mtime, summary.get("turn_pending", False))
     summary["mtime"] = st.st_mtime
     return summary
 
