@@ -226,16 +226,6 @@ def compute_status(mtime: float, now: Optional[float] = None) -> str:
     return "ENDED"
 
 
-def _status_with_turn(mtime: float, turn_pending: bool,
-                      now: Optional[float] = None) -> str:
-    """Age-based status, overlaid with the turn rule: THINKING iff the latest
-    message isn't the assistant's. Mid-turn stays THINKING (unless truly ended);
-    once the assistant has replied it's never THINKING (a fresh reply is WAITING).
-    """
-    base = compute_status(mtime, now)
-    if turn_pending:
-        return base if base == "ENDED" else "THINKING"
-    return "WAITING" if base == "THINKING" else base
 
 
 # ---- Summaries ---------------------------------------------------------------
@@ -253,7 +243,9 @@ def _build_summary(path: str) -> dict:
     entrypoint = None
     created_at = None
     last_ts = None
-    last_role = None      # role of the last main-thread message (turn state)
+    last_role = None       # role of the last main-thread message (turn state)
+    last_has_tool = False  # last assistant message holds a tool_use (tool running)
+    last_has_text = False  # last assistant message has real text (a reply)
     tokens = Tokens()
     recent: list[dict] = []  # rolling list of rendered activities
 
@@ -297,12 +289,23 @@ def _build_summary(path: str) -> dict:
             if mv and mv != "<synthetic>":
                 model = mv
 
-            # Track the last MAIN-thread message role (ignore subagent
-            # sidechains). THINKING is strictly "the latest message is not from
-            # the assistant" — i.e. the agent still owes a reply.
+            # Track the last MAIN-thread message (ignore subagent sidechains).
+            # A turn is finished only when the last message is a FINAL assistant
+            # reply: assistant role, has real text, and no pending tool_use.
+            # Still working = a user message (agent owes a reply), an assistant
+            # message holding a tool_use (tool/subagent running), or an assistant
+            # message with only thinking/no text yet (mid-generation).
             role = msg.get("role")
             if role in ("user", "assistant") and not evt.get("isSidechain"):
                 last_role = role
+                content = msg.get("content")
+                blocks = content if isinstance(content, list) else []
+                last_has_tool = role == "assistant" and any(
+                    isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
+                last_has_text = role == "assistant" and (
+                    (isinstance(content, str) and bool(content.strip()))
+                    or any(isinstance(b, dict) and b.get("type") == "text"
+                           and (b.get("text") or "").strip() for b in blocks))
             usage = msg.get("usage")
             if isinstance(usage, dict):
                 tokens.input += usage.get("input_tokens", 0) or 0
@@ -324,11 +327,12 @@ def _build_summary(path: str) -> dict:
 
     disp_model = _resolve_model(model, full_by_base, last_full)
 
-    # THINKING strictly means the latest message is NOT from the assistant (the
-    # agent still owes a reply) — this holds even when a long tool run keeps the
-    # transcript quiet. Once the assistant has replied, it's never THINKING.
-    turn_pending = last_role is not None and last_role != "assistant"
-    status = _status_with_turn(mtime, turn_pending)
+    # turn_pending = the agent still owes work (not a final assistant reply).
+    # It's only turned into THINKING for *live-tmux* sessions, in _decorate — a
+    # session that isn't running in tmux shows plain age-based status.
+    final_assistant = last_role == "assistant" and last_has_text and not last_has_tool
+    turn_pending = last_role is not None and not final_assistant
+    status = compute_status(mtime)
 
     return {
         "session_id": session_id,
@@ -363,9 +367,9 @@ def _summary_for(path: str) -> Optional[dict]:
     else:
         summary = _build_summary(path)
         _summary_cache[path] = (st.st_mtime, st.st_size, summary)
-    # Recompute against wall-clock age, applying the turn rule (content-derived
-    # turn_pending survives the recompute): THINKING iff latest msg not assistant.
-    summary["status"] = _status_with_turn(st.st_mtime, summary.get("turn_pending", False))
+    # Age-based status; the live-tmux turn override (THINKING) is applied in
+    # _decorate, which knows whether the session is live.
+    summary["status"] = compute_status(st.st_mtime)
     summary["mtime"] = st.st_mtime
     return summary
 

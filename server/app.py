@@ -59,7 +59,8 @@ _BEYOND_WAITING = {"SITTING", "SLEEPING", "ENDED"}
 
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
               titles: dict | None = None, archived: set | None = None,
-              live_ids: set | None = None, marked: set | None = None) -> dict:
+              live_ids: set | None = None, marked: set | None = None,
+              working_ids: set | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -97,11 +98,18 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
     # CLI "live" = actively writing (THINKING) and not driven by us
     summary["live"] = summary["live_web"] or (not is_web and summary.get("status") == "THINKING")
 
-    # Live tmux REPL: flag it, and pin an idle one at WAITING (never Sitting/
-    # Sleeping/Ended) until the tmux is killed.
+    # Live tmux REPL drives the status. THINKING means the pane is actually
+    # generating right now (a spinner is up) — ground truth, unlike the
+    # transcript which can end on a queued tool_result / injected "no visible
+    # output" nudge while the REPL has already gone idle. An idle-but-live REPL
+    # is pinned at WAITING (never decays until its tmux is killed). With NO live
+    # tmux the session isn't executing, so it's never THINKING.
     live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    working = working_ids if working_ids is not None else tmuxio.working_ids()
     summary["live_tmux"] = sid in live_ids
-    if summary["live_tmux"] and summary.get("status") in _BEYOND_WAITING:
+    if summary["live_tmux"]:
+        summary["status"] = "THINKING" if sid in working else "WAITING"
+    elif summary.get("status") == "THINKING":
         summary["status"] = "WAITING"
     return summary
 
@@ -461,10 +469,6 @@ def api_triage():
         is_gated = sid in gated
         is_live = sid in live_tmux
         is_marked = sid in marked
-        # A live-but-idle REPL is pinned at WAITING (matches the board), so it
-        # belongs here until answered or its tmux is killed.
-        if is_live and s.get("status") in _BEYOND_WAITING:
-            s["status"] = "WAITING"
         # Attention page = only live tmux sessions plus ones the user manually
         # pinned. (A gated session always has a live REPL, so it's covered.)
         if not (is_live or is_marked):

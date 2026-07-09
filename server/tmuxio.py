@@ -51,6 +51,14 @@ _QUESTION_HINTS = (
 
 _BORDER_CHARS = "╭╮╰╯─│|"
 
+# A horizontal rule line — the REPL frames its input box between two of these.
+_RULE_RE = re.compile(r"─{10,}")
+
+# The active spinner status line, e.g. "✻ Actualizing… (1m 44s · ↓ 5.1k tokens ·
+# esc to interrupt)". The "… (" and the "esc to interrupt)" close-paren only
+# appear while generating — a *completed* marker reads "✻ Baked for 2m 17s".
+_SPINNER_RE = re.compile(r"…\s*\(|esc to interrupt\)")
+
 
 def _strip(s: str) -> str:
     return s.strip().strip(_BORDER_CHARS).strip()
@@ -127,9 +135,12 @@ def parse_prompt(screen: str) -> Optional[dict]:
     if not valid:
         return None
 
-    # Pick the bottom-most run that actually looks like a permission gate
-    # (has the ❯ selector, or gate keywords / a Yes+No pair). The live prompt
-    # is always the last such menu on screen.
+    # Pick the bottom-most run that is actually an interactive menu. A live
+    # permission menu always renders the ❯ selector on one of its options; an
+    # assistant's *prose* enumeration ("Options: 1. … 2. …") never does. We also
+    # accept a gate-keyword question ("do you want", "proceed", …) as a backstop.
+    # (Deliberately NOT a loose yes/no substring test — that mis-fires on prose:
+    # "Yes — misleading" + "Snowflake" would read as a Yes/No menu.)
     chosen = None
     for r in valid:
         opts = r["options"]
@@ -139,13 +150,9 @@ def parse_prompt(screen: str) -> Optional[dict]:
             if cand:
                 question, q_idx = cand, j
                 break
-        blob = (question + " " + " ".join(o["label"] for o in opts)).lower()
         has_pointer = any(o["selected"] for o in opts)
-        looks_like_gate = (
-            any(h in blob for h in _QUESTION_HINTS)
-            or ("yes" in blob and "no" in blob)
-        )
-        if has_pointer or looks_like_gate:
+        has_hint = any(h in question.lower() for h in _QUESTION_HINTS)
+        if has_pointer or has_hint:
             chosen = (r, question, q_idx)
     if chosen is None:
         return None
@@ -197,6 +204,65 @@ def pending(session_id: str) -> Optional[dict]:
     if screen is None:
         return None
     return parse_prompt(screen)
+
+
+def _at_input_box(screen: str) -> bool:
+    """True when the REPL is sitting at its empty/ready input box.
+
+    The live input prompt renders as a `❯` line framed by two horizontal rules:
+        ───────────
+        ❯  (maybe half-typed text)
+        ───────────
+    That box is present when the agent is idle / waiting for input, and is
+    replaced by a spinner while it's actively generating (and by a menu when a
+    permission gate is up). We require the rule frame so a `❯ …` line from
+    scrollback (a past user turn) doesn't count.
+    """
+    lines = screen.splitlines()
+    for i, ln in enumerate(lines):
+        s = _strip(ln)
+        if not s.startswith("❯"):
+            continue
+        if re.match(r"\d+\.", s[1:].strip()):   # "❯ 1. Yes" is a menu option
+            continue
+        above = lines[i - 1] if i > 0 else ""
+        below = lines[i + 1] if i + 1 < len(lines) else ""
+        if _RULE_RE.search(above) and _RULE_RE.search(below):
+            return True
+    return False
+
+
+# Short-TTL cache of which live sessions are actively generating right now.
+_WORK_CACHE: dict[str, object] = {"at": 0.0, "ids": set()}
+
+
+def working_ids(ttl: float = 1.0) -> set[str]:
+    """Live session ids whose REPL is actively generating (THINKING).
+
+    A live session is "working" when its pane is neither at the ready input box
+    (idle) nor at a permission gate — i.e. a spinner is running. Captures every
+    live pane; cached for `ttl`s. This is the ground truth for THINKING, more
+    reliable than the transcript (which can end on a queued tool_result or an
+    injected "no visible output" nudge while the REPL has already gone idle).
+    """
+    now = time.monotonic()
+    if now - float(_WORK_CACHE["at"]) < ttl:
+        return set(_WORK_CACHE["ids"])  # type: ignore[arg-type]
+    working = set()
+    for sid in tmux_sessions():
+        screen = capture_pane(sid)
+        if screen is None:
+            continue
+        if parse_prompt(screen) is not None:
+            continue                     # a permission gate is up → not "working"
+        # An active spinner in the last few lines means it's generating even if
+        # the input box still renders; otherwise the input box means it's idle.
+        tail = "\n".join(l for l in screen.splitlines()[-8:])
+        if _SPINNER_RE.search(tail) or not _at_input_box(screen):
+            working.add(sid)
+    _WORK_CACHE["at"] = now
+    _WORK_CACHE["ids"] = working
+    return working
 
 
 # Short-TTL cache so the sessions list (polled ~every 1.5s) doesn't shell out to
