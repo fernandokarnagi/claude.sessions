@@ -54,10 +54,12 @@ _BORDER_CHARS = "╭╮╰╯─│|"
 # A horizontal rule line — the REPL frames its input box between two of these.
 _RULE_RE = re.compile(r"─{10,}")
 
-# The active spinner status line, e.g. "✻ Actualizing… (1m 44s · ↓ 5.1k tokens ·
-# esc to interrupt)". The "… (" and the "esc to interrupt)" close-paren only
-# appear while generating — a *completed* marker reads "✻ Baked for 2m 17s".
-_SPINNER_RE = re.compile(r"…\s*\(|esc to interrupt\)")
+# The active spinner status LINE, e.g. "✻ Actualizing… (1m 44s · ↓ 5.1k tokens)"
+# or "· Leavening… (1m 13s · esc to interrupt)". Matched by structure, anchored
+# at line start: a spinner glyph, a gerund, then "… (<elapsed>…". A *completed*
+# marker reads "✻ Baked for 2m 17s" (no "… ("), and this deliberately does NOT
+# match ordinary prose containing "… (" mid-line (which isn't glyph-anchored).
+_SPINNER_RE = re.compile(r"^[ \t]*[✻✽✶✳✷✵⚹✢·∴][^\n(]*…[^\n]*\(", re.MULTILINE)
 
 
 def _strip(s: str) -> str:
@@ -206,6 +208,20 @@ def pending(session_id: str) -> Optional[dict]:
     return parse_prompt(screen)
 
 
+def spinner_line(screen: Optional[str]) -> Optional[str]:
+    """The current active spinner status line (e.g. "✽ Extracting all document
+    text… (4m 11s)"), or None if the REPL isn't generating. Tells you what the
+    session is working on."""
+    if not screen:
+        return None
+    m = _SPINNER_RE.search(screen)
+    if not m:
+        return None
+    # Return the whole matched line, tidied.
+    line = screen[m.start():].splitlines()[0]
+    return line.strip() or None
+
+
 def _at_input_box(screen: str) -> bool:
     """True when the REPL is sitting at its empty/ready input box.
 
@@ -255,10 +271,11 @@ def working_ids(ttl: float = 1.0) -> set[str]:
             continue
         if parse_prompt(screen) is not None:
             continue                     # a permission gate is up → not "working"
-        # An active spinner in the last few lines means it's generating even if
-        # the input box still renders; otherwise the input box means it's idle.
-        tail = "\n".join(l for l in screen.splitlines()[-8:])
-        if _SPINNER_RE.search(tail) or not _at_input_box(screen):
+        # The empty input box renders in BOTH idle and generating states, so it
+        # isn't a reliable idle signal. The glyph-anchored active spinner line is
+        # — and a completed turn overwrites it with a "… for Xs" marker, so a
+        # stale one won't linger in scrollback.
+        if _SPINNER_RE.search(screen):
             working.add(sid)
     _WORK_CACHE["at"] = now
     _WORK_CACHE["ids"] = working

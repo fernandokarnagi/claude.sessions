@@ -319,6 +319,7 @@ def api_tmux(session_id: str):
         "session_id": session_id,
         "has_tmux": True,
         "prompt": tmuxio.parse_prompt(screen),
+        "spinner": tmuxio.spinner_line(screen),
         "screen": screen,
     }
 

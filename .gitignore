@@ -27,3 +27,4 @@ server/.slack_threads.json
 
 # Slack credentials (never commit)
 .env.slack
+nohup.out
