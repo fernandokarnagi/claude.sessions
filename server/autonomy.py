@@ -28,7 +28,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from . import tmuxio
+from . import agyparser, tmuxio
 
 _PATH = os.path.join(os.path.dirname(__file__), ".autonomy.json")
 _lock = threading.Lock()
@@ -171,6 +171,13 @@ def _sig(prompt: dict) -> str:
 
 # --- watcher ----------------------------------------------------------------
 
+def _agy_pending_ids() -> set:
+    """Live agy conversations currently sitting at an approval gate."""
+    return {sid for sid in tmuxio.tmux_sessions()
+            if agyparser.has_conversation(sid)
+            and agyparser.parse_gate(tmuxio.capture_pane(sid)) is not None}
+
+
 def _watch() -> None:
     while True:
         try:
@@ -197,9 +204,34 @@ def _watch() -> None:
                             _hook(sid, level, choice, p)
                         except Exception as e:
                             print(f"[autonomy] hook failed: {e}")
+                # Antigravity (agy) gates use a key chord (ctrl+k approve), not a
+                # numbered menu, so they aren't in pending_ids — handle separately.
+                agy_gated = _agy_pending_ids()
+                for sid in agy_gated:
+                    level = get(sid)
+                    if level == "manual":
+                        continue
+                    p = agyparser.parse_gate(tmuxio.capture_pane(sid))
+                    if not p:
+                        continue
+                    sig = _sig(p)
+                    if _answered.get(sid) == sig:
+                        continue
+                    choice = decide(level, p)
+                    if choice is None:
+                        continue             # auto-safe escalation — human handles
+                    tmuxio.agy_answer(sid, "approve")
+                    _answered[sid] = sig
+                    print(f"[autonomy] {sid[:8]} {level} → auto-approved agy gate")
+                    if _hook:
+                        try:
+                            _hook(sid, level, choice, p)
+                        except Exception as e:
+                            print(f"[autonomy] hook failed: {e}")
                 # Forget gates that have cleared, so a re-gate is acted on afresh.
+                cleared = gated | agy_gated
                 for sid in list(_answered):
-                    if sid not in gated:
+                    if sid not in cleared:
                         _answered.pop(sid, None)
         except Exception as e:
             print(f"[autonomy] watch error: {e}")

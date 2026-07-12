@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=42" />
+  <link rel="stylesheet" href="/static/style.css?v=59" />
 </head>
 <body>
   <header class="topbar">
@@ -17,7 +17,6 @@
     <main>
       <div id="header"></div>
       <div id="approval"></div>
-      <div id="summary"></div>
       <div id="chat" class="chat"></div>
       <div class="hist-bar">
         <h3 class="hist-title">History (newest first)</h3>
@@ -40,7 +39,7 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=42"></script>
+  <script src="/static/app.js?v=59"></script>
   <script>
     if (new URLSearchParams(location.search).get("from") === "attention") {
       const b = document.getElementById("backLink");

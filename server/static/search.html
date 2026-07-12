@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Search sessions</title>
-  <link rel="stylesheet" href="/static/style.css?v=42" />
+  <link rel="stylesheet" href="/static/style.css?v=59" />
 </head>
 <body>
   <header class="topbar">
@@ -18,10 +18,13 @@
       <input id="q" type="text" autofocus
              placeholder="Search by title, session ID, or path — wildcards ok (e.g. *docker*, build*, df8c1588) …" />
     </div>
+    <label class="hist-toggle" style="margin:8px 2px 12px">
+      <input type="checkbox" id="incArchived" /> include archived
+    </label>
     <div class="grid" id="grid"></div>
     <div class="empty" id="empty">Type to search by title, session ID, or project path. Wildcards * and ? supported.</div>
   </main>
-  <script src="/static/app.js?v=42"></script>
+  <script src="/static/app.js?v=59"></script>
   <script>Search.init();</script>
 </body>
 </html>

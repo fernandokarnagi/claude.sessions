@@ -22,8 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (archives, attention, autonomy, models, overrides, parser,
-               registry, runner, slackbot, summaries, summarizer, tmuxio)
+from . import (agyparser, archives, attention, autonomy, models, overrides,
+               parser, registry, runner, slackbot, summaries, summarizer, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -144,16 +144,103 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
+
+    # Merge in Antigravity (agy) conversations — read-only, already summary-shaped.
+    marked = attention.marked_ids()
+    for s in _agy_summaries(titles, arch_ids, marked, mode, live_tmux):
+        if statuses and s["status"] not in statuses:
+            continue
+        data["sessions"].append(s)
+    data["sessions"].sort(key=lambda x: x.get("mtime") or 0, reverse=True)
+    data["total"] = len(data["sessions"])
     return data
 
 
+def _agy_live_status(session_id: str, visible: str | None) -> tuple[str, bool]:
+    """(status, pending_approval) for a live agy pane: gate → WAITING+gate,
+    generating → THINKING, idle input box → WAITING."""
+    if agyparser.parse_gate(visible) is not None or tmuxio.parse_prompt(visible) is not None:
+        return "WAITING", True
+    if agyparser.is_generating(visible):
+        return "THINKING", False
+    if agyparser.at_input_box(visible):
+        return "WAITING", False
+    return ("THINKING" if visible is not None else "WAITING"), False
+
+
+def _agy_decorate_live(s: dict, session_id: str) -> dict:
+    """Overlay a live agy session's summary/detail with pane-derived fields:
+    status, pending_approval, model, and token totals. Single source so the
+    board, status poll, and detail all agree."""
+    s["live_tmux"] = s["live"] = True
+    visible = tmuxio.capture_pane(session_id)
+    s["status"], s["pending_approval"] = _agy_live_status(session_id, visible)
+    s["model"] = agyparser.model_from_screen(visible) or s.get("model")
+    tok = agyparser.tokens_from_screen(tmuxio.capture_pane(session_id, history=5000))
+    if tok:
+        s["tokens"] = {"input": 0, "output": tok, "cache_read": 0,
+                       "cache_creation": 0, "total": tok}
+    return s
+
+
+def _agy_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
+    """agy conversations decorated for the board (title override, archived,
+    attention, live-tmux), honoring the archived visibility mode. A conversation
+    is Live when a tmux session is named after its id (see runagy_default.sh)."""
+    # Auto-link freshly-launched agy sessions whose tmux still has a temp name.
+    if agyparser.reconcile_tmux_names():
+        live_ids = None                       # refresh after any rename
+    live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    out = []
+    for s in agyparser.list_conversations():
+        sid = s["session_id"]
+        s["archived"] = sid in arch_ids
+        if mode == "exclude" and s["archived"]:
+            continue
+        if mode == "only" and not s["archived"]:
+            continue
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        if sid in live_ids:
+            _agy_decorate_live(s, sid)       # pane is the truth (status/model/tokens)
+        elif s["status"] == "THINKING":
+            s["live_tmux"] = False
+            s["status"] = "WAITING"          # not live → never THINKING
+        else:
+            s["live_tmux"] = False
+        out.append(s)
+    return out
+
+
 @app.get("/api/search")
-def api_search(q: str = Query("")):
+def api_search(q: str = Query(""), archived: str | None = Query(None)):
+    """Search by id/title/project. Archived sessions are excluded unless
+    `archived=include`."""
+    include_archived = (archived or "").lower() in ("1", "true", "include", "yes")
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     live_tmux = tmuxio.tmux_sessions()
+    arch_ids = archives.archived_ids()
     data = parser.search_sessions(q, extra_titles=titles)
+    kept = []
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
+        if include_archived or not s.get("archived"):
+            kept.append(s)
+    data["sessions"] = kept
+    # Include matching agy conversations (by id / title / project).
+    ql = q.lower().strip()
+    if ql:
+        marked = attention.marked_ids()
+        for s in _agy_summaries(titles, arch_ids, marked, mode="all"):
+            if not include_archived and s.get("archived"):
+                continue
+            if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
+                    or ql in (s["project"] or "").lower() or ql in (s["cwd"] or "").lower()):
+                data["sessions"].append(s)
+    data["total"] = len(data["sessions"])
     return data
 
 
@@ -161,7 +248,27 @@ def api_search(q: str = Query("")):
 def api_session(session_id: str):
     detail = parser.get_session(session_id)
     if detail is None:
-        raise HTTPException(status_code=404, detail="session not found")
+        # Fall back to an Antigravity (agy) conversation (read-only).
+        detail = agyparser.get_conversation(session_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        titles = overrides.all_titles()
+        if session_id in titles:
+            detail["title"], detail["renamed"] = titles[session_id], True
+        detail["archived"] = archives.is_archived(session_id)
+        detail["attention"] = attention.is_marked(session_id)
+        # Live agy: the console pane is the in-sync truth (its .db store is
+        # lossy). Parse the pane into Claude-style events for the History, and
+        # derive the live status from it.
+        if session_id in tmuxio.tmux_sessions():
+            events = agyparser.parse_console(tmuxio.capture_pane(session_id, history=5000))
+            if events:
+                detail["activities"] = events
+            _agy_decorate_live(detail, session_id)
+        elif detail.get("status") == "THINKING":
+            detail["status"] = "WAITING"
+        detail["autonomy"] = autonomy.get(session_id)
+        return detail
     _decorate(detail, registry.web_mtimes(), runner.running_ids())
     detail["autonomy"] = autonomy.get(session_id)
     return detail
@@ -178,7 +285,21 @@ def api_status(session_id: str):
     detail page without re-parsing the full transcript each poll."""
     s = parser.get_summary(session_id)
     if s is None:
-        raise HTTPException(status_code=404, detail="session not found")
+        s = agyparser._summarize(os.path.join(agyparser.CONV_DIR, f"{session_id}.db")) \
+            if agyparser.has_conversation(session_id) else None
+        if s is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        # Live-aware: derive status from the pane so the header + poll cadence
+        # (active → fast) track generation, not the stale db mtime.
+        if session_id in tmuxio.tmux_sessions():
+            _agy_decorate_live(s, session_id)
+        elif s.get("status") == "THINKING":
+            s["status"] = "WAITING"
+        s["autonomy"] = autonomy.get(session_id)
+        t = overrides.get_title(session_id)   # keep the custom title on poll
+        if t:
+            s["title"], s["renamed"] = t, True
+        return s
     _decorate(s, registry.web_mtimes(), runner.running_ids())
     s["autonomy"] = autonomy.get(session_id)
     return s
@@ -204,6 +325,9 @@ async def api_summary(session_id: str):
     """
     detail = parser.get_session(session_id)
     if detail is None:
+        # agy conversations are read-only — no LLM "what's expected" summary.
+        if agyparser.has_conversation(session_id):
+            return {"status": None, "summary": None, "reason": "agy (read-only)"}
         raise HTTPException(status_code=404, detail="session not found")
 
     status = detail.get("status")
@@ -233,9 +357,15 @@ async def api_summary(session_id: str):
     return {"status": status, "summary": text, "cached": False}
 
 
+def _session_exists(session_id: str) -> bool:
+    """A claude transcript or an agy conversation exists for this id."""
+    return (parser.session_path(session_id) is not None
+            or agyparser.has_conversation(session_id))
+
+
 @app.post("/api/sessions/{session_id}/archive")
 def api_archive(session_id: str):
-    if parser.session_path(session_id) is None:
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="session not found")
     archives.set_archived(session_id, True)
     return {"session_id": session_id, "archived": True}
@@ -250,7 +380,7 @@ def api_unarchive(session_id: str):
 @app.post("/api/sessions/{session_id}/attention")
 def api_mark_attention(session_id: str):
     """Manually pin this session to the Attention page (persists until unmarked)."""
-    if parser.session_path(session_id) is None:
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="session not found")
     attention.set_marked(session_id, True)
     return {"session_id": session_id, "attention": True}
@@ -269,7 +399,7 @@ class TitleBody(BaseModel):
 @app.put("/api/sessions/{session_id}/title")
 def api_set_title(session_id: str, body: TitleBody):
     """Set a custom title override (empty title reverts to the original)."""
-    if parser.get_session(session_id) is None:
+    if not _session_exists(session_id):
         raise HTTPException(status_code=404, detail="session not found")
     overrides.set_title(session_id, body.title)
     return {"session_id": session_id, "title": overrides.get_title(session_id)}
@@ -315,12 +445,22 @@ def api_tmux(session_id: str):
     screen = tmuxio.capture_pane(session_id)
     if screen is None:
         return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
+    # For agy, the console pane IS the conversation view (its .db store is lossy),
+    # so return the full scrollback — not just the visible frame. gate/spinner
+    # are still parsed from the visible screen.
+    is_agy = agyparser.has_conversation(session_id)
+    full = tmuxio.capture_pane(session_id, history=5000) if is_agy else screen
+    # agy gates aren't numbered menus — use the agy gate parser for them.
+    prompt = agyparser.parse_gate(screen) if is_agy else None
+    if prompt is None:
+        prompt = tmuxio.parse_prompt(screen)
+    spinner = agyparser.spinner_line(screen) if is_agy else tmuxio.spinner_line(screen)
     return {
         "session_id": session_id,
         "has_tmux": True,
-        "prompt": tmuxio.parse_prompt(screen),
-        "spinner": tmuxio.spinner_line(screen),
-        "screen": screen,
+        "prompt": prompt,
+        "spinner": spinner,
+        "screen": full or screen,
     }
 
 
@@ -375,9 +515,64 @@ def api_spawn(session_id: str):
 
 @app.get("/api/launchers")
 def api_launchers():
-    """List the runclaude_<model>.sh scripts, so the UI can show copy-paste
-    launch commands (cd <project> && runclaude_<model>.sh <session-id>)."""
-    return {"launchers": models.launchers()}
+    """Tmux launch scripts for the copy-paste popup. `claude` = runclaude_*.sh
+    (per model); `agy` = runagy_*.sh (Antigravity, agy --conversation <id>)."""
+    return {"launchers": models.launchers(), "agy": models.agy_launchers()}
+
+
+@app.post("/api/sessions/{session_id}/usage")
+def api_usage(session_id: str):
+    """Run /usage in the live REPL and return its cost/limits panel. Routes to
+    agy's Models & Quota screen or Claude Code's usage panel by session type."""
+    if agyparser.has_conversation(session_id):
+        result = tmuxio.agy_usage(session_id)
+    else:
+        result = tmuxio.usage(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "usage failed"))
+    return result
+
+
+@app.get("/api/agy/models")
+def api_agy_models():
+    """The models the agy CLI offers (for the switch-model picker)."""
+    return {"models": agyparser.model_options()}
+
+
+class AgyModelBody(BaseModel):
+    model: str
+
+
+@app.post("/api/sessions/{session_id}/agy-model")
+def api_agy_set_model(session_id: str, body: AgyModelBody):
+    """Switch a live agy session's model via its /model picker (saved by agy)."""
+    result = tmuxio.agy_set_model(session_id, body.model)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "set model failed"))
+    return result
+
+
+class AgyAnswerBody(BaseModel):
+    action: str          # approve | manage | reject
+
+
+@app.post("/api/sessions/{session_id}/agy-answer")
+def api_agy_answer(session_id: str, body: AgyAnswerBody):
+    """Answer an agy approval gate via its key chord (approve=C-k, manage=M-j,
+    reject=Esc)."""
+    result = tmuxio.agy_answer(session_id, body.action)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "agy answer failed"))
+    return result
+
+
+@app.post("/api/sessions/{session_id}/interrupt")
+def api_interrupt(session_id: str):
+    """Stop the current turn on the live REPL (sends Esc)."""
+    result = tmuxio.interrupt(session_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "interrupt failed"))
+    return result
 
 
 @app.post("/api/sessions/{session_id}/kill")
@@ -480,6 +675,15 @@ def api_triage():
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
         out.append(s)
+
+    # Include agy conversations that are live or manually pinned.
+    for s in _agy_summaries(titles, arch_ids, marked, "exclude", live_tmux):
+        if not (s["live_tmux"] or s["attention"]):
+            continue
+        if s.get("pending_approval"):
+            s["prompt"] = tmuxio.pending(s["session_id"])
+        out.append(s)
+
     # Gated (needs-approval) always on top; otherwise A→Z by title.
     out.sort(key=lambda x: (not x.get("pending_approval", False),
                             (x.get("title") or "").lower()))

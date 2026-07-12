@@ -98,3 +98,16 @@ def launchers() -> list[dict]:
         model = sorted(names)[0] if names else ""
         out.append({"key": key, "script": path, "model": model})
     return out
+
+
+def agy_launchers() -> list[dict]:
+    """The runagy_<x>.sh scripts — Antigravity (agy) tmux launchers.
+
+    agy resumes a session with `agy --conversation <id>`; the script wraps that
+    (tmux name == conversation id). Returns [{key, script}] sorted by key.
+    """
+    out = []
+    for path in sorted(glob.glob(os.path.join(SCRIPTS_DIR, "runagy_*.sh"))):
+        key = os.path.basename(path)[len("runagy_"):-len(".sh")]
+        out.append({"key": key, "script": path, "model": "agy"})
+    return out

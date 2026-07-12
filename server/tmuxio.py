@@ -80,13 +80,41 @@ def tmux_sessions() -> set[str]:
     return {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
 
 
-def capture_pane(session_id: str) -> Optional[str]:
-    """Current screen of the session's tmux pane, or None if no such session."""
+def pane_cwd(session_id: str) -> Optional[str]:
+    """Current working directory of the session's (first) pane, or None."""
     try:
         out = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", session_id],
-            capture_output=True, text=True, timeout=5,
-        )
+            ["tmux", "display-message", "-p", "-t", session_id, "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    cwd = out.stdout.strip()
+    return cwd or None
+
+
+def rename_session(old: str, new: str) -> bool:
+    """Rename a tmux session. True on success."""
+    try:
+        r = subprocess.run(["tmux", "rename-session", "-t", old, new],
+                           capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def capture_pane(session_id: str, history: int = 0) -> Optional[str]:
+    """Current screen of the session's tmux pane, or None if no such session.
+
+    history > 0 also captures that many lines of scrollback above the visible
+    screen (`-S -<n>`), so callers can show the full conversation, not just the
+    last frame. history=0 (default) is the visible screen only — what the
+    gate/spinner/status detectors want.
+    """
+    cmd = ["tmux", "capture-pane", "-p", "-t", session_id]
+    if history:
+        cmd[2:2] = ["-S", f"-{int(history)}"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -410,6 +438,118 @@ def say(session_id: str, text: str) -> dict:
     # -l = literal, so a word like "Enter" inside the text isn't taken as a key.
     _send_keys(session_id, "-l", "--", text)
     _send_keys(session_id, "Enter")
+    return {"ok": True}
+
+
+def agy_set_model(session_id: str, model: str, timeout: float = 6.0) -> dict:
+    """Switch a live agy session's model via its "/model" picker (↑/↓ + Enter).
+
+    Opens the picker, moves the cursor to `model` (exact list label), selects it.
+    Returns {ok, model} or {ok False, error}. Saved by agy as the session default.
+    """
+    from . import agyparser
+    model = (model or "").strip()
+    if not model:
+        return {"ok": False, "error": "empty model"}
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+
+    _send_keys(session_id, "-l", "--", "/model")
+    _send_keys(session_id, "Enter")
+
+    picker, waited = None, 0.0
+    while waited < timeout:
+        time.sleep(0.4)
+        waited += 0.4
+        picker = agyparser.parse_model_picker(capture_pane(session_id))
+        if picker:
+            break
+    else:
+        _send_keys(session_id, "Escape")
+        return {"ok": False, "error": "model picker did not open"}
+
+    try:
+        target = picker["options"].index(model)
+    except ValueError:
+        _send_keys(session_id, "Escape")
+        return {"ok": False, "error": f"'{model}' not in agy model picker"}
+
+    delta = target - picker["cursor_idx"]
+    key = "Down" if delta > 0 else "Up"
+    for _ in range(abs(delta)):
+        _send_keys(session_id, key)
+        time.sleep(0.08)
+    _send_keys(session_id, "Enter")
+    return {"ok": True, "model": model}
+
+
+# A rendered progress-bar block glyph — appears ONLY in the /usage panels, never
+# in normal chat/prose, so it's a reliable "the panel actually opened" signal.
+_BAR_RE = re.compile(r"[█▉▊▋▌▍▎▏░]")
+# Footer/close-hint line that ends the panel region.
+_USAGE_FOOTER_RE = re.compile(r"Esc to cancel|esc\s+Close|↑/↓ Scroll")
+
+
+def _capture_usage(session_id: str, header_re, timeout: float) -> dict:
+    """Open /usage, wait for the panel (a rendered progress bar), capture from
+    its header to the footer, and close it (Esc)."""
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    _send_keys(session_id, "-l", "--", "/usage")
+    _send_keys(session_id, "Enter")
+    screen, waited = "", 0.0
+    while waited < timeout:
+        time.sleep(0.4)
+        waited += 0.4
+        screen = capture_pane(session_id, history=250) or ""
+        if _BAR_RE.search(screen) and _USAGE_FOOTER_RE.search(screen):
+            break
+    else:
+        _send_keys(session_id, "Escape")
+        return {"ok": False, "error": "/usage didn't open — is the session idle?"}
+
+    lines = screen.splitlines()
+    heads = [i for i, l in enumerate(lines) if header_re.search(l)]
+    start = heads[-1] if heads else 0        # top of the most recent panel
+    # Footer = first close-hint AFTER the header (not a stale one in scrollback).
+    footer = min((i for i, l in enumerate(lines)
+                  if i > start and _USAGE_FOOTER_RE.search(l)), default=len(lines))
+    if not heads:
+        start = max(0, footer - 44)
+    out = [l.rstrip().lstrip("│ ").rstrip() for l in lines[start:footer] if l.strip()]
+    _send_keys(session_id, "Escape")
+    return {"ok": True, "text": "\n".join(out).strip()}
+
+
+def usage(session_id: str, timeout: float = 6.0) -> dict:
+    """Claude Code's /usage cost & limits panel."""
+    return _capture_usage(session_id, re.compile(
+        r"Total cost|Current session|Usage by model|Manage subscription"), timeout)
+
+
+def agy_usage(session_id: str, timeout: float = 6.0) -> dict:
+    """agy's /usage Models & Quota panel."""
+    return _capture_usage(session_id, re.compile(r"Models & Quota"), timeout)
+
+
+def agy_answer(session_id: str, action: str) -> dict:
+    """Answer an agy approval gate: 'approve' → C-k, 'manage' → M-j (Alt+j),
+    'reject' → Escape. (agy gates use key chords, not a numbered menu.)"""
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    key = {"approve": "C-k", "manage": "M-j", "reject": "Escape"}.get(action)
+    if not key:
+        return {"ok": False, "error": f"unknown action: {action}"}
+    _send_keys(session_id, key)
+    return {"ok": True, "action": action}
+
+
+def interrupt(session_id: str) -> dict:
+    """Stop the current turn by sending Escape to the live REPL (Claude Code
+    interrupts generation / a running tool on Esc). No-op error if nothing live."""
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    _send_keys(session_id, "Escape")
     return {"ok": True}
 
 
