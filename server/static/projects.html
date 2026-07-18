@@ -3,20 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Archived · Claude Sessions</title>
+  <title>Projects · Claude Sessions</title>
   <link rel="stylesheet" href="/static/style.css?v=84" />
 </head>
 <body>
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
+    <button class="toggle" id="newProjectBtn" title="Create a new project">✨ New project</button>
     <span class="meta" id="meta"></span>
   </header>
-  <main>
-    <div class="grid" id="grid"></div>
-    <div class="empty" id="empty" style="display:none">No archived sessions.</div>
-  </main>
+  <div id="view"></div>
   <script src="/static/app.js?v=84"></script>
-  <script>renderTopNav("archived"); Archived.init();</script>
+  <script>renderTopNav("projects"); Projects.init();</script>
 </body>
 </html>

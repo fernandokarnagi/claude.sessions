@@ -40,6 +40,14 @@ SEND_MESSAGE_SH = os.environ.get(
 # box-drawing borders, e.g. "│ ❯ 1. Yes                     │".
 _OPTION_RE = re.compile(r"^[\s│|>]*?(❯)?\s*(\d+)\.\s+(.*)$")
 
+# A multiSelect option renders its state as a checkbox: "1. [ ] Apple" /
+# "1. [✔] Apple". Two or more of these mean the gate is a checkbox widget, which
+# is driven by toggles + Submit rather than a single numbered pick.
+_CHECKBOX_RE = re.compile(r"^\[([ xX✔✓])\]\s*(.*)$")
+# The widget's free-text row — it opens an input we can't fill from here, so it
+# is not offered as a checkbox.
+_TYPE_SOMETHING_RE = re.compile(r"^type something\b", re.I)
+
 # Phrases Claude uses to open a permission prompt. Used to disambiguate a real
 # gate from numbered text that happens to appear in output.
 _QUESTION_HINTS = (
@@ -145,7 +153,10 @@ def parse_prompt(screen: str) -> Optional[dict]:
             ptr, num, label = m.group(1), int(m.group(2)), _strip(m.group(3))
             if cur is None:
                 cur = {"start": i, "options": []}
-            cur["options"].append({"num": num, "label": label, "selected": bool(ptr)})
+            # `first` keeps the option's own line before any wrapped
+            # continuation is folded into `label` (a checkbox lives there).
+            cur["options"].append({"num": num, "label": label,
+                                   "first": label, "selected": bool(ptr)})
             continue
         if cur is not None:
             if not _strip(ln):
@@ -192,12 +203,32 @@ def parse_prompt(screen: str) -> Optional[dict]:
     # "Bash command" block + "This command requires approval". Walk up from the
     # question, collecting until a box top-border or a previous REPL message.
     context = _extract_context(lines, q_idx)
-    return {
+    out = {
         "question": question,
         "context": context,
         "options": r["options"],
         "raw": screen,
     }
+
+    # A checkbox (multiSelect) widget: tick any number, then Submit. Split the
+    # checkbox state off each label and keep the wrapped remainder as its
+    # description, so the UI can render real checkboxes instead of pick-one
+    # buttons (a digit here toggles — it does not answer).
+    boxed = [o for o in r["options"] if _CHECKBOX_RE.match(o.get("first", ""))]
+    if len(boxed) >= 2:
+        opts = []
+        for o in boxed:
+            m = _CHECKBOX_RE.match(o["first"])
+            label = _strip(m.group(2))
+            if _TYPE_SOMETHING_RE.match(label):
+                continue          # free-text row — can't be driven from here
+            desc = o["label"][len(o["first"]):].strip()
+            opts.append({"num": o["num"], "label": label, "desc": desc,
+                         "checked": m.group(1) != " ", "selected": o["selected"]})
+        if opts:
+            out["multi"] = True
+            out["options"] = opts
+    return out
 
 
 # Glyphs that mark the start of a *previous* REPL message (not part of the box).
@@ -487,31 +518,52 @@ def agy_set_model(session_id: str, model: str, timeout: float = 6.0) -> dict:
 # in normal chat/prose, so it's a reliable "the panel actually opened" signal.
 _BAR_RE = re.compile(r"[█▉▊▋▌▍▎▏░]")
 # Footer/close-hint line that ends the panel region.
-_USAGE_FOOTER_RE = re.compile(r"Esc to cancel|esc\s+Close|↑/↓ Scroll")
+_USAGE_FOOTER_RE = re.compile(r"Esc to cancel|esc\s+Close|↑/↓ Scroll|d to day · w to week")
+# While Claude's /usage is settling it shows its own CACHED numbers and a
+# "Refreshing…" line, then updates to the live figures. Capturing before this
+# clears returns the stale cached values — so we wait it out.
+_USAGE_REFRESH_RE = re.compile(r"Refreshing")
 
 
 def _capture_usage(session_id: str, header_re, timeout: float) -> dict:
-    """Open /usage, wait for the panel (a rendered progress bar), capture from
-    its header to the footer, and close it (Esc)."""
+    """Open /usage, wait for the panel to render AND settle (its header is up, a
+    progress bar is drawn, and "Refreshing…" has cleared), then capture from its
+    header to the footer, and close it (Esc)."""
     if capture_pane(session_id) is None:
         return {"ok": False, "error": "no live tmux session"}
     _send_keys(session_id, "-l", "--", "/usage")
     _send_keys(session_id, "Enter")
-    screen, waited = "", 0.0
+    screen, waited, settled = "", 0.0, False
     while waited < timeout:
         time.sleep(0.4)
         waited += 0.4
-        screen = capture_pane(session_id, history=250) or ""
-        if _BAR_RE.search(screen) and _USAGE_FOOTER_RE.search(screen):
-            break
-    else:
-        _send_keys(session_id, "Escape")
-        return {"ok": False, "error": "/usage didn't open — is the session idle?"}
+        # Visible pane only (no scrollback): the /usage panel is an in-place
+        # overlay, so the current screen holds exactly one panel — avoids
+        # latching onto a stale panel left in scrollback.
+        screen = capture_pane(session_id, history=0) or ""
+        # The right panel is up once its header + a bar are present.
+        if not (header_re.search(screen) and _BAR_RE.search(screen)):
+            continue
+        # Panel is up: hold until Claude's own refresh finishes so we read the
+        # live numbers, not the cached ones it paints first.
+        if _USAGE_REFRESH_RE.search(screen):
+            continue
+        settled = True
+        break
+    if not settled:
+        # Timed out. If a panel is at least up, fall through and capture what we
+        # have (may still be refreshing); otherwise report it never opened.
+        if not (header_re.search(screen) and _BAR_RE.search(screen)):
+            _send_keys(session_id, "Escape")
+            return {"ok": False, "error": "/usage didn't open — is the session idle?"}
 
     lines = screen.splitlines()
     heads = [i for i, l in enumerate(lines) if header_re.search(l)]
-    start = heads[-1] if heads else 0        # top of the most recent panel
-    # Footer = first close-hint AFTER the header (not a stale one in scrollback).
+    # Visible-only capture holds a single panel, so its top is the FIRST header
+    # (e.g. "Total cost"/"Current session") — not the last, which would drop the
+    # panel's upper sections when it has several headers.
+    start = heads[0] if heads else 0
+    # Footer = first close-hint AFTER the header.
     footer = min((i for i, l in enumerate(lines)
                   if i > start and _USAGE_FOOTER_RE.search(l)), default=len(lines))
     if not heads:
@@ -521,10 +573,10 @@ def _capture_usage(session_id: str, header_re, timeout: float) -> dict:
     return {"ok": True, "text": "\n".join(out).strip()}
 
 
-def usage(session_id: str, timeout: float = 6.0) -> dict:
+def usage(session_id: str, timeout: float = 10.0) -> dict:
     """Claude Code's /usage cost & limits panel."""
     return _capture_usage(session_id, re.compile(
-        r"Total cost|Current session|Usage by model|Manage subscription"), timeout)
+        r"Total cost|Current session|Current week|Usage by model|Manage subscription"), timeout)
 
 
 def agy_usage(session_id: str, timeout: float = 6.0) -> dict:
@@ -570,6 +622,76 @@ def answer(session_id: str, choice: int, text: str = "") -> dict:
         _send_keys(session_id, "--", text)
         _send_keys(session_id, "Enter")
     return {"ok": True}
+
+
+# A multi-select answer widget's Submit button (its own line inside the box).
+_SUBMIT_LINE_RE = re.compile(r"^[\s│|>❯]*Submit\s*$")
+# The confirm menu shown after Submit ("Ready to submit your answers?").
+_REVIEW_RE = re.compile(r"Submit answers|Ready to submit")
+
+
+def _pointer_and_submit(screen: str) -> tuple[int, int]:
+    """(pointer_line, submit_line) for a multi-select widget, or (-1, -1).
+
+    The REPL's own input line also renders a ❯, so the pointer is taken as the
+    ❯ line nearest the Submit line — the widget's, not the prompt's.
+    """
+    lines = screen.splitlines()
+    subs = [i for i, l in enumerate(lines) if _SUBMIT_LINE_RE.match(l)]
+    if not subs:
+        return -1, -1
+    submit = subs[-1]
+    ptrs = [i for i, l in enumerate(lines) if "❯" in l]
+    if not ptrs:
+        return -1, submit
+    return min(ptrs, key=lambda i: abs(i - submit)), submit
+
+
+def answer_multi(session_id: str, nums: list[int], timeout: float = 8.0) -> dict:
+    """Answer a multi-select (checkbox) question by ticking `nums` then Submit.
+
+    Claude Code's multiSelect widget: a digit toggles that checkbox and leaves
+    the cursor put; ↑/↓ move the cursor (clamped at the ends); Enter on the
+    Submit line opens a "Ready to submit your answers?" confirm menu whose
+    option 1 commits. Verified against a live widget.
+    """
+    screen = capture_pane(session_id, history=0)
+    if screen is None:
+        return {"ok": False, "error": "no live tmux session"}
+    if _pointer_and_submit(screen)[1] < 0:
+        return {"ok": False, "error": "no multi-select prompt on screen"}
+
+    # 1) Toggle each requested checkbox (digits are pure toggles).
+    for n in nums:
+        _send_keys(session_id, "-l", "--", str(n))
+        time.sleep(0.35)
+
+    # 2) Walk the cursor onto Submit. Capture-guided so it self-corrects rather
+    #    than relying on a fixed number of arrow presses.
+    moved = False
+    for _ in range(14):
+        screen = capture_pane(session_id, history=0) or ""
+        ptr, submit = _pointer_and_submit(screen)
+        if submit < 0:
+            return {"ok": False, "error": "multi-select prompt disappeared"}
+        if ptr == submit:
+            moved = True
+            break
+        _send_keys(session_id, "Down" if ptr < submit else "Up")
+        time.sleep(0.3)
+    if not moved:
+        return {"ok": False, "error": "could not reach Submit"}
+
+    # 3) Enter on Submit → review step, then confirm with option 1.
+    _send_keys(session_id, "Enter")
+    waited = 0.0
+    while waited < timeout:
+        time.sleep(0.4)
+        waited += 0.4
+        if _REVIEW_RE.search(capture_pane(session_id, history=0) or ""):
+            _send_keys(session_id, "-l", "--", "1")
+            return {"ok": True}
+    return {"ok": False, "error": "submit confirm never appeared"}
 
 
 def kill(session_id: str) -> dict:

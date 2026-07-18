@@ -4,13 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Claude Sessions — World</title>
-  <link rel="stylesheet" href="/static/style.css?v=59" />
+  <link rel="stylesheet" href="/static/style.css?v=84" />
 </head>
 <body class="world-page">
   <header class="topbar">
-    <a class="back" href="/">← Board</a>
-    <h1 style="font-size:15px;margin:0 0 0 8px">🗺️ World</h1>
-    <a class="navlink" href="/search.html">🔎 Search</a>
+    <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
     <span class="meta" id="meta"></span>
   </header>
@@ -18,7 +16,7 @@
     <div class="world-zones" id="zones"></div>
     <div class="world-actors" id="actors"></div>
   </div>
-  <script src="/static/app.js?v=59"></script>
-  <script>World.init();</script>
+  <script src="/static/app.js?v=84"></script>
+  <script>renderTopNav("world"); World.init();</script>
 </body>
 </html>

@@ -23,7 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (agyparser, archives, attention, autonomy, models, overrides,
-               parser, registry, runner, slackbot, summaries, summarizer, tmuxio)
+               parser, projects, registry, runner, slackbot, summaries,
+               summarizer, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -117,6 +118,11 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
 # Sessions that are idle and waiting on the user (the "needs attention" set).
 ATTENTION_STATUSES = {"WAITING", "SITTING", "SLEEPING"}
 
+# Max activities shipped in a detail response (newest first). The UI's history
+# selector tops out at 100; older history stays in the transcript. Big sessions
+# would otherwise ship megabytes of activities the page never renders.
+_DETAIL_ACT_CAP = 400
+
 
 @app.get("/api/sessions")
 def api_sessions(limit: str = Query("10"), offset: int = Query(0),
@@ -139,17 +145,20 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     gated = tmuxio.pending_ids()
     live_tmux = tmuxio.tmux_sessions()
     levels = autonomy.all()
+    proj_map = projects.tags_by_session()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
+        s["projects"] = proj_map.get(sid, [])
 
     # Merge in Antigravity (agy) conversations — read-only, already summary-shaped.
     marked = attention.marked_ids()
     for s in _agy_summaries(titles, arch_ids, marked, mode, live_tmux):
         if statuses and s["status"] not in statuses:
             continue
+        s["projects"] = proj_map.get(s["session_id"], [])
         data["sessions"].append(s)
     data["sessions"].sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     data["total"] = len(data["sessions"])
@@ -168,15 +177,24 @@ def _agy_live_status(session_id: str, visible: str | None) -> tuple[str, bool]:
     return ("THINKING" if visible is not None else "WAITING"), False
 
 
-def _agy_decorate_live(s: dict, session_id: str) -> dict:
+def _agy_decorate_live(s: dict, session_id: str, full: str | None = "__cap__") -> dict:
     """Overlay a live agy session's summary/detail with pane-derived fields:
     status, pending_approval, model, and token totals. Single source so the
-    board, status poll, and detail all agree."""
+    board, status poll, and detail all agree.
+
+    Pass `full` (a full-scrollback capture) to reuse one capture across
+    status/model/tokens/events instead of shelling out to tmux several times —
+    the agy detail poll is capture-bound, so this is the main latency win. The
+    visible frame is sliced from the tail of `full` (gate/spinner/input live at
+    the bottom), avoiding a second capture too.
+    """
+    if full == "__cap__":
+        full = tmuxio.capture_pane(session_id, history=5000)
+    visible = "\n".join((full or "").splitlines()[-60:]) or None
     s["live_tmux"] = s["live"] = True
-    visible = tmuxio.capture_pane(session_id)
     s["status"], s["pending_approval"] = _agy_live_status(session_id, visible)
     s["model"] = agyparser.model_from_screen(visible) or s.get("model")
-    tok = agyparser.tokens_from_screen(tmuxio.capture_pane(session_id, history=5000))
+    tok = agyparser.tokens_from_screen(full)
     if tok:
         s["tokens"] = {"input": 0, "output": tok, "cache_read": 0,
                        "cache_creation": 0, "total": tok}
@@ -224,10 +242,12 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
     live_tmux = tmuxio.tmux_sessions()
     arch_ids = archives.archived_ids()
     data = parser.search_sessions(q, extra_titles=titles)
+    proj_map = projects.tags_by_session()
     kept = []
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
         if include_archived or not s.get("archived"):
+            s["projects"] = proj_map.get(s["session_id"], [])
             kept.append(s)
     data["sessions"] = kept
     # Include matching agy conversations (by id / title / project).
@@ -239,6 +259,7 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
                 continue
             if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
                     or ql in (s["project"] or "").lower() or ql in (s["cwd"] or "").lower()):
+                s["projects"] = proj_map.get(s["session_id"], [])
                 data["sessions"].append(s)
     data["total"] = len(data["sessions"])
     return data
@@ -248,29 +269,42 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
 def api_session(session_id: str):
     detail = parser.get_session(session_id)
     if detail is None:
-        # Fall back to an Antigravity (agy) conversation (read-only).
-        detail = agyparser.get_conversation(session_id)
-        if detail is None:
+        if not agyparser.has_conversation(session_id):
             raise HTTPException(status_code=404, detail="session not found")
+        live = session_id in tmuxio.tmux_sessions()
+        if live:
+            # Live agy: the pane is the in-sync truth and the .db history parse
+            # (~1.4s of protobuf extraction over every step) would be thrown
+            # away — so use the cheap cached summary for the header and parse
+            # the pane for activities. One capture reused for events + status.
+            detail = agyparser.get_summary(session_id) or {}
+            full = tmuxio.capture_pane(session_id, history=5000)
+            detail["activities"] = agyparser.parse_console(full)
+            _agy_decorate_live(detail, session_id, full=full)
+        else:
+            detail = agyparser.get_conversation(session_id)   # full .db history
+            if detail is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            if detail.get("status") == "THINKING":
+                detail["status"] = "WAITING"
         titles = overrides.all_titles()
         if session_id in titles:
             detail["title"], detail["renamed"] = titles[session_id], True
         detail["archived"] = archives.is_archived(session_id)
         detail["attention"] = attention.is_marked(session_id)
-        # Live agy: the console pane is the in-sync truth (its .db store is
-        # lossy). Parse the pane into Claude-style events for the History, and
-        # derive the live status from it.
-        if session_id in tmuxio.tmux_sessions():
-            events = agyparser.parse_console(tmuxio.capture_pane(session_id, history=5000))
-            if events:
-                detail["activities"] = events
-            _agy_decorate_live(detail, session_id)
-        elif detail.get("status") == "THINKING":
-            detail["status"] = "WAITING"
         detail["autonomy"] = autonomy.get(session_id)
+        detail["projects"] = projects.projects_for(session_id)
         return detail
     _decorate(detail, registry.web_mtimes(), runner.running_ids())
     detail["autonomy"] = autonomy.get(session_id)
+    detail["projects"] = projects.projects_for(session_id)
+    # Cap the activity payload to the most recent slice — a long transcript can
+    # ship megabytes of history the UI never shows (the history-limit selector
+    # tops out at 100; new events stream in via /tail). Keeps page load fast.
+    acts = detail.get("activities") or []
+    if len(acts) > _DETAIL_ACT_CAP:
+        detail["activities"] = acts[:_DETAIL_ACT_CAP]   # newest-first → keep head
+        detail["activities_total"] = len(acts)
     return detail
 
 
@@ -392,6 +426,105 @@ def api_unmark_attention(session_id: str):
     return {"session_id": session_id, "attention": False}
 
 
+def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
+                   live_ids: set) -> dict | None:
+    """Board-shaped, decorated summary for one session (claude or agy), or None
+    if it no longer exists. Used to render a project's member widgets."""
+    summary = parser.get_summary(session_id)
+    if summary is not None:
+        _decorate(summary, registry.web_mtimes(), runner.running_ids(),
+                  titles=titles, archived=arch_ids, live_ids=live_ids, marked=marked)
+        summary["pending_approval"] = session_id in tmuxio.pending_ids()
+        summary["autonomy"] = autonomy.get(session_id)
+        return summary
+    if agyparser.has_conversation(session_id):
+        s = agyparser.get_summary(session_id)
+        if s is None:
+            return None
+        sid = s["session_id"]
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["archived"] = sid in arch_ids
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        if sid in live_ids:
+            _agy_decorate_live(s, sid)
+        else:
+            s["live_tmux"] = False
+            if s.get("status") == "THINKING":
+                s["status"] = "WAITING"
+        return s
+    return None
+
+
+class ProjectBody(BaseModel):
+    title: str = ""
+    description: str = ""
+
+
+@app.get("/api/projects")
+def api_projects():
+    """All projects with member counts (for the Projects page + tag picker)."""
+    return {"projects": projects.list_projects()}
+
+
+@app.post("/api/projects")
+def api_create_project(body: ProjectBody):
+    if not body.title.strip():
+        raise HTTPException(status_code=400, detail="title is required")
+    return projects.create_project(body.title, body.description)
+
+
+@app.get("/api/projects/{pid}")
+def api_project(pid: str):
+    """Project header + its member sessions decorated as board widgets."""
+    proj = projects.get_project(pid)
+    if proj is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    titles = overrides.all_titles()
+    arch_ids = archives.archived_ids()
+    marked = attention.marked_ids()
+    live_ids = tmuxio.tmux_sessions()
+    sessions = []
+    for sid in projects.sessions_for(pid):
+        s = _summary_by_id(sid, titles, arch_ids, marked, live_ids)
+        if s is not None:
+            sessions.append(s)
+    sessions.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
+    proj["sessions"] = sessions
+    return proj
+
+
+@app.patch("/api/projects/{pid}")
+def api_update_project(pid: str, body: ProjectBody):
+    if not projects.update_project(pid, title=body.title, description=body.description):
+        raise HTTPException(status_code=404, detail="project not found")
+    return projects.get_project(pid)
+
+
+@app.delete("/api/projects/{pid}")
+def api_delete_project(pid: str):
+    if not projects.delete_project(pid):
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"id": pid, "deleted": True}
+
+
+@app.post("/api/projects/{pid}/sessions/{session_id}")
+def api_tag_session(pid: str, session_id: str):
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    if not projects.tag(session_id, pid):
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"project_id": pid, "session_id": session_id, "tagged": True}
+
+
+@app.delete("/api/projects/{pid}/sessions/{session_id}")
+def api_untag_session(pid: str, session_id: str):
+    projects.untag(session_id, pid)
+    return {"project_id": pid, "session_id": session_id, "tagged": False}
+
+
 class TitleBody(BaseModel):
     title: str = ""
 
@@ -442,14 +575,20 @@ def api_tmux(session_id: str):
 
     `prompt` is non-null only when the live REPL is sitting at a Yes/No/... gate.
     """
-    screen = tmuxio.capture_pane(session_id)
-    if screen is None:
-        return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
-    # For agy, the console pane IS the conversation view (its .db store is lossy),
-    # so return the full scrollback — not just the visible frame. gate/spinner
-    # are still parsed from the visible screen.
     is_agy = agyparser.has_conversation(session_id)
-    full = tmuxio.capture_pane(session_id, history=5000) if is_agy else screen
+    # For agy, the console pane IS the conversation view (its .db store is lossy),
+    # so capture full scrollback once and slice the visible frame from its tail
+    # (gate/spinner/input live at the bottom) — one capture, not two.
+    if is_agy:
+        full = tmuxio.capture_pane(session_id, history=5000)
+        if full is None:
+            return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
+        screen = "\n".join(full.splitlines()[-60:])
+    else:
+        screen = tmuxio.capture_pane(session_id)
+        if screen is None:
+            return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
+        full = screen
     # agy gates aren't numbered menus — use the agy gate parser for them.
     prompt = agyparser.parse_gate(screen) if is_agy else None
     if prompt is None:
@@ -629,6 +768,23 @@ def api_answer(session_id: str, body: AnswerBody):
     return result
 
 
+class AnswerMultiBody(BaseModel):
+    nums: list[int] = []
+
+
+@app.post("/api/sessions/{session_id}/answer-multi")
+def api_answer_multi(session_id: str, body: AnswerMultiBody):
+    """Answer a live multiSelect (checkbox) question: tick `nums`, then Submit.
+
+    A digit only toggles a checkbox in that widget, so this can't go through
+    /answer — it ticks each option, walks the cursor to Submit, and confirms.
+    """
+    result = tmuxio.answer_multi(session_id, body.nums)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "answer failed"))
+    return result
+
+
 class CompactBody(BaseModel):
     instructions: str = ""
 
@@ -659,6 +815,7 @@ def api_triage():
     marked = attention.marked_ids()
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     levels = autonomy.all()
+    proj_map = projects.tags_by_session()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
@@ -674,6 +831,7 @@ def api_triage():
         s["pending_approval"] = is_gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
+        s["projects"] = proj_map.get(sid, [])
         out.append(s)
 
     # Include agy conversations that are live or manually pinned.
@@ -682,6 +840,7 @@ def api_triage():
             continue
         if s.get("pending_approval"):
             s["prompt"] = tmuxio.pending(s["session_id"])
+        s["projects"] = proj_map.get(s["session_id"], [])
         out.append(s)
 
     # Gated (needs-approval) always on top; otherwise A→Z by title.
@@ -810,6 +969,11 @@ def world_page():
 @app.get("/triage.html")
 def triage_page():
     return FileResponse(os.path.join(STATIC_DIR, "triage.html"))
+
+
+@app.get("/projects.html")
+def projects_page():
+    return FileResponse(os.path.join(STATIC_DIR, "projects.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

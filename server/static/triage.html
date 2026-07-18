@@ -2,24 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Attention · Claude Sessions</title>
-  <link rel="stylesheet" href="/static/style.css?v=59" />
+  <meta http-equiv="refresh" content="0; url=/session.html?from=attention" />
+  <title>To-do · Claude Sessions</title>
 </head>
 <body>
-  <header class="topbar">
-    <h1>🔔 Attention</h1>
-    <a class="navlink" href="/">🪐 Board</a>
-    <a class="navlink" href="/world.html">🗺️ World</a>
-    <a class="navlink" href="/search.html">🔎 Search</a>
-    <span class="spacer"></span>
-    <button class="toggle" id="pauseToggle" title="Pause/resume the auto-approver for all sessions">⏯ Autonomy live</button>
-    <button class="toggle danger" id="killAllBtn" title="Shut down every live tmux session (ends all their REPLs)">⏻ Kill all tmux</button>
-    <span class="meta" id="meta"></span>
-  </header>
-  <div id="triage" class="triage"></div>
-  <div id="empty" class="empty" style="display:none">🎉 Nothing needs your attention right now.</div>
-  <script src="/static/app.js?v=59"></script>
-  <script>Triage.init();</script>
+  <script>location.replace("/session.html?from=attention");</script>
+  <p>Redirecting to <a href="/session.html?from=attention">To-do</a>…</p>
 </body>
 </html>

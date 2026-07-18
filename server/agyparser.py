@@ -609,6 +609,13 @@ def has_conversation(cid: str) -> bool:
     return os.path.isfile(os.path.join(CONV_DIR, f"{cid}.db"))
 
 
+def get_summary(cid: str) -> dict | None:
+    """Cheap cached summary (header fields, no full activity parse) for one
+    conversation. Use for a live agy session whose History comes from the pane."""
+    path = os.path.join(CONV_DIR, f"{cid}.db")
+    return _summarize(path) if os.path.isfile(path) else None
+
+
 def list_conversations() -> list[dict]:
     """All agy conversations as dashboard summaries, newest activity first."""
     out = []

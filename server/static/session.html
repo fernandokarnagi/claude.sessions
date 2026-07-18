@@ -4,11 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=59" />
+  <link rel="stylesheet" href="/static/style.css?v=84" />
 </head>
 <body>
   <header class="topbar">
-    <a class="back" id="backLink" href="/">← Board</a>
+    <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
     <span class="meta" id="meta"></span>
   </header>
@@ -39,14 +39,36 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=59"></script>
+  <script src="/static/app.js?v=84"></script>
   <script>
-    if (new URLSearchParams(location.search).get("from") === "attention") {
-      const b = document.getElementById("backLink");
-      b.href = "/triage.html"; b.textContent = "← Attention";
-      AttnRail.init();
-    }
-    Detail.init();
+    (async function () {
+      const q = new URLSearchParams(location.search);
+      const fromTodo = q.get("from") === "attention";
+      const id = q.get("id");
+      // To-do landing with no explicit session: jump to the top to-do session so
+      // the rail highlights it and refresh/bookmark keeps working.
+      if (fromTodo && !id) {
+        try {
+          const d = await getJSON("/api/triage");
+          if (d.sessions && d.sessions.length) {
+            location.replace(`/session.html?id=${encodeURIComponent(d.sessions[0].session_id)}&from=attention`);
+            return;
+          }
+        } catch (e) { /* fall through to empty state */ }
+      }
+      renderTopNav(fromTodo ? "todo" : null);
+      if (fromTodo) AttnRail.init();
+      if (id) {
+        Detail.init();
+      } else if (fromTodo) {
+        document.getElementById("header").innerHTML =
+          '<div class="empty">🎉 Nothing on your to-do list. Add a session with “➕ Add to To-do”, or it appears here while it has a live session.</div>';
+        document.getElementById("meta").textContent = "To-do";
+        document.querySelector(".hist-bar").style.display = "none";
+      } else {
+        Detail.init();   // no id, not from to-do → Detail shows the missing-id notice
+      }
+    })();
   </script>
 </body>
 </html>
