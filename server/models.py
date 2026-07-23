@@ -111,3 +111,17 @@ def agy_launchers() -> list[dict]:
         key = os.path.basename(path)[len("runagy_"):-len(".sh")]
         out.append({"key": key, "script": path, "model": "agy"})
     return out
+
+
+def grok_launchers() -> list[dict]:
+    """The rungrok_<x>.sh scripts — xAI grok tmux launchers.
+
+    grok resumes a session with `grok --resume <id>` / pins a new one with
+    `grok --session-id <uuid>`; the script wraps that (tmux name == session id).
+    Returns [{key, script}] sorted by key.
+    """
+    out = []
+    for path in sorted(glob.glob(os.path.join(SCRIPTS_DIR, "rungrok_*.sh"))):
+        key = os.path.basename(path)[len("rungrok_"):-len(".sh")]
+        out.append({"key": key, "script": path, "model": "grok"})
+    return out

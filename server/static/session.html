@@ -4,12 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=85" />
+  <link rel="stylesheet" href="/static/style.css?v=102" />
 </head>
 <body>
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
+    <button class="toggle danger" id="killAllBtn" title="Shut down every live tmux session (ends all their REPLs)">⏻ Kill all tmux</button>
     <span class="meta" id="meta"></span>
   </header>
   <div class="detail-layout">
@@ -39,7 +40,7 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=85"></script>
+  <script src="/static/app.js?v=102"></script>
   <script>
     (async function () {
       const q = new URLSearchParams(location.search);
@@ -57,6 +58,10 @@
         } catch (e) { /* fall through to empty state */ }
       }
       renderTopNav(fromTodo ? "todo" : null);
+      document.getElementById("killAllBtn").addEventListener("click", () => killAllTmux(() => {
+        if (fromTodo) AttnRail.tick();     // rail live flags
+        if (id) Detail.load();             // status pill + button states
+      }));
       if (fromTodo) AttnRail.init();
       if (id) {
         Detail.init();

@@ -17,6 +17,7 @@ server/.attention.json
 server/.adopted.json
 server/.autonomy.json
 server/.projects.json
+server/.tasks.json
 server/.*.tmp
 
 # OS / editor

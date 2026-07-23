@@ -22,9 +22,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (agyparser, archives, attention, autonomy, models, overrides,
-               parser, projects, registry, runner, slackbot, summaries,
-               summarizer, tmuxio)
+from . import (agyparser, archives, attention, autonomy, grokparser, models,
+               overrides, parser, projects, registry, runner, slackbot,
+               summaries, summarizer, tasks, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -146,19 +146,28 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     live_tmux = tmuxio.tmux_sessions()
     levels = autonomy.all()
     proj_map = projects.tags_by_session()
+    task_counts = tasks.counts_by_session()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["projects"] = proj_map.get(sid, [])
+        s["task_count"] = task_counts.get(sid, 0)
 
-    # Merge in Antigravity (agy) conversations — read-only, already summary-shaped.
+    # Merge in Antigravity (agy) + grok sessions — read-only, already summary-shaped.
     marked = attention.marked_ids()
     for s in _agy_summaries(titles, arch_ids, marked, mode, live_tmux):
         if statuses and s["status"] not in statuses:
             continue
         s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        data["sessions"].append(s)
+    for s in _grok_summaries(titles, arch_ids, marked, mode, live_tmux):
+        if statuses and s["status"] not in statuses:
+            continue
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
         data["sessions"].append(s)
     data["sessions"].sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     data["total"] = len(data["sessions"])
@@ -233,6 +242,38 @@ def _agy_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
     return out
 
 
+def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
+    """grok sessions decorated for the board (title override, archived, attention,
+    live-tmux), honoring the archived visibility mode. Read-only: no pane parsing,
+    so a live tmux (named after the id) just pins the status at WAITING."""
+    live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    out = []
+    for s in grokparser.list_sessions():
+        sid = s["session_id"]
+        s["archived"] = sid in arch_ids
+        if mode == "exclude" and s["archived"]:
+            continue
+        if mode == "only" and not s["archived"]:
+            continue
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        # grok is read-only (no send/gate/kill), but a tmux named after its id
+        # means a live REPL is running — flag it live so the board shows it.
+        if sid in live_ids:
+            s["live_tmux"] = s["live"] = True
+            # mid-turn (grok pane shows "Esc to stop") → THINKING, else WAITING.
+            s["status"] = "THINKING" if tmuxio.grok_working(sid) else "WAITING"
+        else:
+            s["live_tmux"] = s["live"] = False
+            if s["status"] == "THINKING":
+                s["status"] = "WAITING"      # not live → never surface THINKING
+        out.append(s)
+    return out
+
+
 @app.get("/api/search")
 def api_search(q: str = Query(""), archived: str | None = Query(None)):
     """Search by id/title/project. Archived sessions are excluded unless
@@ -243,23 +284,27 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
     arch_ids = archives.archived_ids()
     data = parser.search_sessions(q, extra_titles=titles)
     proj_map = projects.tags_by_session()
+    task_counts = tasks.counts_by_session()
     kept = []
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
         if include_archived or not s.get("archived"):
             s["projects"] = proj_map.get(s["session_id"], [])
+            s["task_count"] = task_counts.get(s["session_id"], 0)
             kept.append(s)
     data["sessions"] = kept
     # Include matching agy conversations (by id / title / project).
     ql = q.lower().strip()
     if ql:
         marked = attention.marked_ids()
-        for s in _agy_summaries(titles, arch_ids, marked, mode="all"):
+        for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
+                  + _grok_summaries(titles, arch_ids, marked, mode="all")):
             if not include_archived and s.get("archived"):
                 continue
             if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
                     or ql in (s["project"] or "").lower() or ql in (s["cwd"] or "").lower()):
                 s["projects"] = proj_map.get(s["session_id"], [])
+                s["task_count"] = task_counts.get(s["session_id"], 0)
                 data["sessions"].append(s)
     data["total"] = len(data["sessions"])
     return data
@@ -269,6 +314,28 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
 def api_session(session_id: str):
     detail = parser.get_session(session_id)
     if detail is None:
+        if grokparser.has_session(session_id):
+            detail = grokparser.get_session(session_id)   # read-only, JSON store
+            if detail is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            # read-only, but a tmux named after its id = a live REPL is running.
+            if session_id in tmuxio.tmux_sessions():
+                detail["live_tmux"] = detail["live"] = True
+                detail["status"] = ("THINKING" if tmuxio.grok_working(session_id)
+                                    else "WAITING")
+            else:
+                detail["live_tmux"] = detail["live"] = False
+                if detail.get("status") == "THINKING":
+                    detail["status"] = "WAITING"
+            titles = overrides.all_titles()
+            if session_id in titles:
+                detail["title"], detail["renamed"] = titles[session_id], True
+            detail["archived"] = archives.is_archived(session_id)
+            detail["attention"] = attention.is_marked(session_id)
+            detail["autonomy"] = autonomy.get(session_id)
+            detail["projects"] = projects.projects_for(session_id)
+            detail["task_count"] = len(tasks.list_tasks(session_id))
+            return detail
         if not agyparser.has_conversation(session_id):
             raise HTTPException(status_code=404, detail="session not found")
         live = session_id in tmuxio.tmux_sessions()
@@ -319,6 +386,22 @@ def api_status(session_id: str):
     detail page without re-parsing the full transcript each poll."""
     s = parser.get_summary(session_id)
     if s is None:
+        if grokparser.has_session(session_id):
+            s = grokparser.get_summary(session_id)
+            if s is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            if session_id in tmuxio.tmux_sessions():
+                s["live_tmux"] = s["live"] = True
+                s["status"] = ("THINKING" if tmuxio.grok_working(session_id)
+                               else "WAITING")
+            elif s.get("status") == "THINKING":
+                s["status"] = "WAITING"
+            s["autonomy"] = autonomy.get(session_id)
+            s["projects"] = projects.projects_for(session_id)
+            t = overrides.get_title(session_id)
+            if t:
+                s["title"], s["renamed"] = t, True
+            return s
         s = agyparser._summarize(os.path.join(agyparser.CONV_DIR, f"{session_id}.db")) \
             if agyparser.has_conversation(session_id) else None
         if s is None:
@@ -330,12 +413,16 @@ def api_status(session_id: str):
         elif s.get("status") == "THINKING":
             s["status"] = "WAITING"
         s["autonomy"] = autonomy.get(session_id)
+        # The poll merges this over the loaded detail — send the real project
+        # tags, otherwise an empty list wipes the header chips every tick.
+        s["projects"] = projects.projects_for(session_id)
         t = overrides.get_title(session_id)   # keep the custom title on poll
         if t:
             s["title"], s["renamed"] = t, True
         return s
     _decorate(s, registry.web_mtimes(), runner.running_ids())
     s["autonomy"] = autonomy.get(session_id)
+    s["projects"] = projects.projects_for(session_id)
     return s
 
 
@@ -359,9 +446,11 @@ async def api_summary(session_id: str):
     """
     detail = parser.get_session(session_id)
     if detail is None:
-        # agy conversations are read-only — no LLM "what's expected" summary.
+        # agy + grok conversations are read-only — no LLM "what's expected" summary.
         if agyparser.has_conversation(session_id):
             return {"status": None, "summary": None, "reason": "agy (read-only)"}
+        if grokparser.has_session(session_id):
+            return {"status": None, "summary": None, "reason": "grok (read-only)"}
         raise HTTPException(status_code=404, detail="session not found")
 
     status = detail.get("status")
@@ -392,9 +481,10 @@ async def api_summary(session_id: str):
 
 
 def _session_exists(session_id: str) -> bool:
-    """A claude transcript or an agy conversation exists for this id."""
+    """A claude transcript, agy conversation, or grok session exists for this id."""
     return (parser.session_path(session_id) is not None
-            or agyparser.has_conversation(session_id))
+            or agyparser.has_conversation(session_id)
+            or grokparser.has_session(session_id))
 
 
 @app.post("/api/sessions/{session_id}/archive")
@@ -436,6 +526,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
                   titles=titles, archived=arch_ids, live_ids=live_ids, marked=marked)
         summary["pending_approval"] = session_id in tmuxio.pending_ids()
         summary["autonomy"] = autonomy.get(session_id)
+        summary["task_count"] = len(tasks.list_tasks(session_id))
         return summary
     if agyparser.has_conversation(session_id):
         s = agyparser.get_summary(session_id)
@@ -454,6 +545,27 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             s["live_tmux"] = False
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
+        s["task_count"] = len(tasks.list_tasks(sid))
+        return s
+    if grokparser.has_session(session_id):
+        s = grokparser.get_summary(session_id)
+        if s is None:
+            return None
+        sid = s["session_id"]
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["archived"] = sid in arch_ids
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        if sid in live_ids:
+            s["live_tmux"] = True
+            s["status"] = "WAITING"
+        else:
+            s["live_tmux"] = False
+            if s.get("status") == "THINKING":
+                s["status"] = "WAITING"
+        s["task_count"] = len(tasks.list_tasks(sid))
         return s
     return None
 
@@ -523,6 +635,42 @@ def api_tag_session(pid: str, session_id: str):
 def api_untag_session(pid: str, session_id: str):
     projects.untag(session_id, pid)
     return {"project_id": pid, "session_id": session_id, "tagged": False}
+
+
+class TaskBody(BaseModel):
+    text: str = ""
+    asked: bool = False
+
+
+@app.get("/api/sessions/{session_id}/tasks")
+def api_tasks(session_id: str):
+    """Canned messages queued up for this session (nothing is sent yet)."""
+    return {"tasks": tasks.list_tasks(session_id)}
+
+
+@app.post("/api/sessions/{session_id}/tasks")
+def api_add_task(session_id: str, body: TaskBody):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    return tasks.add_task(session_id, body.text)
+
+
+@app.patch("/api/sessions/{session_id}/tasks/{tid}")
+def api_update_task(session_id: str, tid: str, body: TaskBody):
+    text = body.text if body.text.strip() else None
+    if text is None and not body.asked:
+        raise HTTPException(status_code=400, detail="text is required")
+    rec = tasks.update_task(session_id, tid, text=text, asked=body.asked)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return rec
+
+
+@app.delete("/api/sessions/{session_id}/tasks/{tid}")
+def api_delete_task(session_id: str, tid: str):
+    if not tasks.delete_task(session_id, tid):
+        raise HTTPException(status_code=404, detail="task not found")
+    return {"id": tid, "deleted": True}
 
 
 class TitleBody(BaseModel):
@@ -656,14 +804,22 @@ def api_spawn(session_id: str):
 def api_launchers():
     """Tmux launch scripts for the copy-paste popup. `claude` = runclaude_*.sh
     (per model); `agy` = runagy_*.sh (Antigravity, agy --conversation <id>)."""
-    return {"launchers": models.launchers(), "agy": models.agy_launchers()}
+    return {"launchers": models.launchers(), "agy": models.agy_launchers(),
+            "grok": models.grok_launchers()}
 
 
 @app.post("/api/sessions/{session_id}/usage")
 def api_usage(session_id: str):
     """Run /usage in the live REPL and return its cost/limits panel. Routes to
     agy's Models & Quota screen or Claude Code's usage panel by session type."""
-    if agyparser.has_conversation(session_id):
+    if grokparser.has_session(session_id):
+        # Live → run /usage in the grok REPL and capture it; offline → the
+        # on-disk signals.json snapshot.
+        if session_id in tmuxio.tmux_sessions():
+            result = tmuxio.grok_usage(session_id)
+        else:
+            result = grokparser.usage_text(session_id)
+    elif agyparser.has_conversation(session_id):
         result = tmuxio.agy_usage(session_id)
     else:
         result = tmuxio.usage(session_id)
@@ -816,6 +972,7 @@ def api_triage():
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     levels = autonomy.all()
     proj_map = projects.tags_by_session()
+    task_counts = tasks.counts_by_session()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
@@ -832,6 +989,7 @@ def api_triage():
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
         s["projects"] = proj_map.get(sid, [])
+        s["task_count"] = task_counts.get(sid, 0)
         out.append(s)
 
     # Include agy conversations that are live or manually pinned.
@@ -841,6 +999,15 @@ def api_triage():
         if s.get("pending_approval"):
             s["prompt"] = tmuxio.pending(s["session_id"])
         s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        out.append(s)
+
+    # Include grok sessions that are live (tmux running) or manually pinned.
+    for s in _grok_summaries(titles, arch_ids, marked, "exclude", live_tmux):
+        if not (s["live_tmux"] or s["attention"]):
+            continue
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
         out.append(s)
 
     # Gated (needs-approval) always on top; otherwise A→Z by title.

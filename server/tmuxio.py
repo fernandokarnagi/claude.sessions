@@ -584,6 +584,58 @@ def agy_usage(session_id: str, timeout: float = 6.0) -> dict:
     return _capture_usage(session_id, re.compile(r"Models & Quota"), timeout)
 
 
+_GROK_USAGE_HEAD = re.compile(r"Session usage \(since start or last resume\)")
+_GROK_USAGE_FOOT = re.compile(r"Next reset:")
+
+# While a turn generates, grok's frame shows a braille spinner + a status line
+# ("Waiting for response…" / "Thinking…" / "Worked for Ns"), a "[stop]" hint,
+# and an "Esc:cancel" footer. At idle the footer is just "…Ctrl+x:shortcuts".
+_GROK_BUSY_RE = re.compile(
+    r"Esc:cancel|\[stop\]|Waiting for response|Cancelling|[⠀-⣿]\s*(Thinking|Worked for|Waiting)",
+    re.I)
+
+
+def grok_working(session_id: str) -> bool:
+    """True when the live grok REPL is mid-turn (generating), read from its
+    pane's visible frame. Used to surface THINKING for grok sessions."""
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    tail = "\n".join(screen.splitlines()[-8:])
+    return bool(_GROK_BUSY_RE.search(tail))
+
+
+def grok_usage(session_id: str, timeout: float = 8.0) -> dict:
+    """grok's /usage output — an inline block (not an overlay), so send /usage
+    and slice the LAST "Session usage … / … Next reset" block from scrollback."""
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    _send_keys(session_id, "-l", "--", "/usage")
+    _send_keys(session_id, "Enter")
+    screen, waited = "", 0.0
+    while waited < timeout:
+        time.sleep(0.4)
+        waited += 0.4
+        screen = capture_pane(session_id, history=2000) or ""
+        if _GROK_USAGE_HEAD.search(screen) and _GROK_USAGE_FOOT.search(screen):
+            break
+    lines = screen.splitlines()
+    heads = [i for i, l in enumerate(lines) if _GROK_USAGE_HEAD.search(l)]
+    if not heads:
+        return {"ok": False, "error": "/usage didn't render — is the session idle?"}
+    start = heads[-1]                       # last (freshest) block
+    foot = next((i for i, l in enumerate(lines)
+                 if i > start and _GROK_USAGE_FOOT.search(l)), len(lines) - 1)
+    # Strip the TUI's left gutter (box-drawing) and the right scrollbar column
+    # ("█") so the captured block is clean text.
+    cleaned = []
+    for l in lines[start:foot + 1]:
+        l = l.rstrip("█ ").lstrip("│┃ ").rstrip()
+        if l:
+            cleaned.append(l)
+    return {"ok": True, "text": "\n".join(cleaned).strip()}
+
+
 def agy_answer(session_id: str, action: str) -> dict:
     """Answer an agy approval gate: 'approve' → C-k, 'manage' → M-j (Alt+j),
     'reject' → Escape. (agy gates use key chords, not a numbered menu.)"""
