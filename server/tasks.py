@@ -138,6 +138,25 @@ def set_archived(session_id: str, tid: str, archived: bool) -> dict | None:
     return None
 
 
+def delete_archived(session_id: str) -> int:
+    """Empty one session's task archive. Returns how many were deleted.
+
+    Active tasks are untouched — only records carrying an archived_at go.
+    """
+    with _lock:
+        data = _load()
+        items = data["tasks"].get(session_id, [])
+        kept = [r for r in items if not r.get("archived_at")]
+        removed = len(items) - len(kept)
+        if removed:
+            if kept:
+                data["tasks"][session_id] = kept
+            else:
+                data["tasks"].pop(session_id, None)
+            _save(data)
+        return removed
+
+
 def delete_task(session_id: str, tid: str) -> bool:
     with _lock:
         data = _load()

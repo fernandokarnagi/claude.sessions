@@ -18,6 +18,7 @@ server/.adopted.json
 server/.autonomy.json
 server/.projects.json
 server/.tasks.json
+server/.ollama_usage.json
 server/.*.tmp
 
 # OS / editor

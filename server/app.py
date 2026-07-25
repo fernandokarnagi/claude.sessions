@@ -696,6 +696,14 @@ def api_archive_task(session_id: str, tid: str, body: TaskArchiveBody):
     return rec
 
 
+# Declared before /tasks/{tid} — routes match in order, so the other way round
+# "archived" would be swallowed as a task id.
+@app.delete("/api/sessions/{session_id}/tasks/archived")
+def api_delete_archived(session_id: str):
+    """Empty this session's task archive; active tasks are left alone."""
+    return {"deleted": tasks.delete_archived(session_id)}
+
+
 @app.delete("/api/sessions/{session_id}/tasks/{tid}")
 def api_delete_task(session_id: str, tid: str):
     if not tasks.delete_task(session_id, tid):
