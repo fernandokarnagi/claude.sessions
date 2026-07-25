@@ -256,7 +256,11 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
   border: 1px solid var(--accent); border-radius: 6px; padding: 5px 10px;
 }
 .title-input:focus { outline: none; }
-.detail-header .stats { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+.last-question { color: var(--text); font-size: 13px; margin: 0 0 10px; opacity: .82;
+  max-width: 100%; word-break: break-word; }
+.detail-header .stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+/* Tasks / Usage / Tokens sit together at the far right of the stats row. */
+.stats-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .detail-header .stats b { color: var(--text); }
 .hdr-btn {
   margin-left: auto; cursor: pointer; font-size: 12px;
@@ -374,7 +378,10 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
   background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4);
   color: var(--tool); border-radius: 8px; padding: 8px 12px; font-size: 13px; margin-bottom: 10px;
 }
-.chat-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.chat-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+/* Action buttons group at the far right; selects and indicators stay left. */
+.chat-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-left: auto; justify-content: flex-end; }
 .chat-row select {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 5px 8px; font-size: 12px;
@@ -409,8 +416,16 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 }
 
 /* per-session task list (canned messages, sent only when you press Ask) */
-.tasks-modal { width: min(820px, 94vw); }
-.tokens-modal { width: min(560px, 94vw); }
+/* `.modal` caps at max-width 520px and is declared later in this file, so a
+   size variant needs both the lifted cap and the higher `.modal.x` specificity
+   to win. Plain `.tasks-modal { width: … }` is silently ignored. */
+.modal.tasks-modal { width: min(1280px, 77vw); max-width: none; }
+.modal.tokens-modal { width: min(560px, 94vw); max-width: none; }
+.modal.question-modal { width: min(680px, 94vw); max-width: none; }
+.question-body { white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+  font-size: 14px; max-height: 60vh; overflow-y: auto; color: var(--text); }
+.link-btn { background: none; border: none; color: var(--accent, #4a9eff); cursor: pointer;
+  font-size: 12px; padding: 0 2px; text-decoration: underline; }
 .tasks-box { max-height: 60vh; overflow-y: auto; }
 .hdr-btn.slim { padding: 2px 8px; font-size: 12px; }
 .tasks-count {
@@ -424,6 +439,20 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 }
 .task-row:first-child { border-top: none; }
 .task-text { flex: 1; min-width: 0; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.task-row.asked .task-text { opacity: .6; }
+.task-seq { flex-shrink: 0; width: 22px; text-align: right; color: var(--muted);
+  font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 4px; }
+.task-move { display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
+.task-btn.move { padding: 0 5px; font-size: 10px; line-height: 14px; }
+.task-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* Sits tight under the task text; the breathing room goes below it, before the
+   next row's separator. */
+.task-when { display: block; color: var(--muted); font-size: 11px; margin: 0 0 8px; }
+.task-btn:disabled { opacity: .3; cursor: default; }
+.task-btn:disabled:hover { color: var(--muted); border-color: var(--border); }
+.task-asked { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 9px;
+  background: #2e7d32; color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  vertical-align: middle; }
 .task-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
 .task-acts { display: flex; gap: 6px; flex-shrink: 0; }
 .task-btn {

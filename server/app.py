@@ -23,8 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (agyparser, archives, attention, autonomy, grokparser, models,
-               overrides, parser, projects, registry, runner, slackbot,
-               summaries, summarizer, tasks, tmuxio)
+               ollamausage, overrides, parser, projects, registry, runner,
+               slackbot, summaries, summarizer, tasks, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -643,16 +643,18 @@ class TaskBody(BaseModel):
 
 
 @app.get("/api/sessions/{session_id}/tasks")
-def api_tasks(session_id: str):
-    """Canned messages queued up for this session (nothing is sent yet)."""
-    return {"tasks": tasks.list_tasks(session_id)}
+def api_tasks(session_id: str, archived: bool = False):
+    """Canned messages queued up for this session (nothing is sent yet).
+
+    archived=true returns the archive instead of the active list."""
+    return {"tasks": tasks.list_tasks(session_id, archived=archived)}
 
 
 @app.post("/api/sessions/{session_id}/tasks")
 def api_add_task(session_id: str, body: TaskBody):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="text is required")
-    return tasks.add_task(session_id, body.text)
+    return tasks.add_task(session_id, body.text, asked=body.asked)
 
 
 @app.patch("/api/sessions/{session_id}/tasks/{tid}")
@@ -661,6 +663,34 @@ def api_update_task(session_id: str, tid: str, body: TaskBody):
     if text is None and not body.asked:
         raise HTTPException(status_code=400, detail="text is required")
     rec = tasks.update_task(session_id, tid, text=text, asked=body.asked)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return rec
+
+
+class TaskMoveBody(BaseModel):
+    delta: int = 0          # -1 = one place earlier, +1 = one place later
+
+
+@app.post("/api/sessions/{session_id}/tasks/{tid}/move")
+def api_move_task(session_id: str, tid: str, body: TaskMoveBody):
+    """Reorder a task — its position is the sequence you'll ask them in."""
+    if not body.delta:
+        raise HTTPException(status_code=400, detail="delta must be non-zero")
+    items = tasks.move_task(session_id, tid, body.delta)
+    if items is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return {"tasks": items}
+
+
+class TaskArchiveBody(BaseModel):
+    archived: bool = True
+
+
+@app.post("/api/sessions/{session_id}/tasks/{tid}/archive")
+def api_archive_task(session_id: str, tid: str, body: TaskArchiveBody):
+    """Move a task to the archive, or restore it to the active list."""
+    rec = tasks.set_archived(session_id, tid, body.archived)
     if rec is None:
         raise HTTPException(status_code=404, detail="task not found")
     return rec
@@ -811,8 +841,15 @@ def api_launchers():
 @app.post("/api/sessions/{session_id}/usage")
 def api_usage(session_id: str):
     """Run /usage in the live REPL and return its cost/limits panel. Routes to
-    agy's Models & Quota screen or Claude Code's usage panel by session type."""
-    if grokparser.has_session(session_id):
+    agy's Models & Quota screen or Claude Code's usage panel by session type.
+
+    A session running an Ollama-hosted model (`…:cloud`) is the exception: the
+    quota that matters is the ollama.com account's, not Claude Code's, so it
+    comes from ollama.com and needs no live REPL."""
+    summary = parser.get_summary(session_id)
+    if summary and ollamausage.is_cloud_model(summary.get("model")):
+        result = ollamausage.usage()
+    elif grokparser.has_session(session_id):
         # Live → run /usage in the grok REPL and capture it; offline → the
         # on-disk signals.json snapshot.
         if session_id in tmuxio.tmux_sessions():
@@ -900,7 +937,12 @@ def api_say(session_id: str, body: SayBody):
     Use this for sessions running in tmux instead of /send (which forks a
     separate headless `claude --resume`).
     """
-    result = tmuxio.say(session_id, body.text)
+    # grok's editor debounces keystrokes — a plain type+Enter often lands the
+    # Enter as a newline instead of a submit. grok_say settles + verifies.
+    if grokparser.has_session(session_id):
+        result = tmuxio.grok_say(session_id, body.text)
+    else:
+        result = tmuxio.say(session_id, body.text)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "say failed"))
     return result

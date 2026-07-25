@@ -605,6 +605,47 @@ def grok_working(session_id: str) -> bool:
     return bool(_GROK_BUSY_RE.search(tail))
 
 
+def _grok_input_pending(session_id: str, snippet: str) -> bool:
+    """True if `snippet` still sits on grok's composer line (not yet submitted).
+
+    grok's editor (Ink) keeps typed text after the `❯` prompt until Enter
+    submits it; on submit the composer clears and the text moves into history.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    tail = screen.splitlines()[-6:]
+    key = snippet.strip()[:24]
+    if not key:
+        return False
+    return any(key in l for l in tail if l.lstrip().startswith(("❯", ">", "│")))
+
+
+def grok_say(session_id: str, text: str, tries: int = 4) -> dict:
+    """Type `text` into a live grok REPL and *reliably* submit it.
+
+    grok's Ink editor debounces keystrokes: an Enter fired immediately after a
+    literal paste lands mid-render and is swallowed as a newline (the reported
+    "sometimes just makes a line break, doesn't send"). Fix: let the paste
+    settle, send Enter, then verify the composer actually cleared / the turn
+    started — resending Enter until it takes.
+    """
+    if not text.strip():
+        return {"ok": False, "error": "empty message"}
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    _send_keys(session_id, "-l", "--", text)
+    time.sleep(0.5)                       # let the editor ingest the paste
+    for attempt in range(1, tries + 1):
+        _send_keys(session_id, "Enter")
+        time.sleep(0.6)
+        # Submitted if the turn started OR the composer no longer holds the text.
+        if grok_working(session_id) or not _grok_input_pending(session_id, text):
+            return {"ok": True, "attempts": attempt}
+        time.sleep(0.4)                   # editor still settling — retry Enter
+    return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
+
+
 def grok_usage(session_id: str, timeout: float = 8.0) -> dict:
     """grok's /usage output — an inline block (not an overlay), so send /usage
     and slice the LAST "Session usage … / … Next reset" block from scrollback."""
