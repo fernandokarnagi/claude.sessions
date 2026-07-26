@@ -259,8 +259,13 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .last-question { color: var(--text); font-size: 13px; margin: 0 0 10px; opacity: .82;
   max-width: 100%; word-break: break-word; }
 .detail-header .stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
-/* Tasks / Usage / Tokens sit together at the far right of the stats row. */
+/* Autonomy + live-tmux + Tasks / Usage / Tokens sit together at the far right
+   of the stats row. */
 .stats-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.stats-actions select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px;
+}
 .detail-header .stats b { color: var(--text); }
 .hdr-btn {
   margin-left: auto; cursor: pointer; font-size: 12px;
@@ -374,10 +379,6 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 
 /* ---- chat box on detail page ---- */
 .chat { margin-bottom: 22px; }
-.chat-warn {
-  background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4);
-  color: var(--tool); border-radius: 8px; padding: 8px 12px; font-size: 13px; margin-bottom: 10px;
-}
 .chat-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
 /* Action buttons group at the far right; selects and indicators stay left. */
 .chat-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -390,6 +391,7 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .now-model b { color: var(--assistant); }
 .detail-project { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 6px; }
 .thinking-line {
+  max-width: 46%;
   color: var(--thinking-pill, #d29922); font-size: 14px; font-weight: 700;
   margin: 8px 0 6px; padding: 8px 12px; border-radius: 8px;
   background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.4);
@@ -444,7 +446,10 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
   font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 4px; }
 .task-move { display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
 .task-btn.move { padding: 0 5px; font-size: 10px; line-height: 14px; }
-.task-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* Archived (view) sits left; the two bulk actions group together on the right so
+   they read as a pair and neither is next to a per-row button. */
+.task-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 8px; }
+.task-foot-bulk { display: flex; gap: 6px; }
 /* Sits tight under the task text; the breathing room goes below it, before the
    next row's separator. */
 .task-when { display: block; color: var(--muted); font-size: 11px; margin: 0 0 8px; }

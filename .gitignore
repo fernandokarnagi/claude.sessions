@@ -31,3 +31,9 @@ server/.slack_threads.json
 # Slack credentials (never commit)
 .env.slack
 nohup.out
+
+# graphify knowledge graph — regenerable build output (graphify update .)
+graphify-out/
+
+# Claude Code local config (embeds absolute machine paths)
+.claude/
