@@ -4,13 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail</title>
-  <link rel="stylesheet" href="/static/style.css?v=131" />
+  <link rel="stylesheet" href="/static/style.css?v=139" />
 </head>
 <body>
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
-    <button class="toggle danger" id="killAllBtn" title="Shut down every live tmux session (ends all their REPLs)">⏻ Kill all tmux</button>
+    <button class="toggle danger" id="killAllBtn" title="Shut down every live session (ends all their REPLs)">⏻ Kill All</button>
     <span class="meta" id="meta"></span>
   </header>
   <div class="detail-layout">
@@ -40,7 +40,7 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=131"></script>
+  <script src="/static/app.js?v=139"></script>
   <script>
     (async function () {
       const q = new URLSearchParams(location.search);

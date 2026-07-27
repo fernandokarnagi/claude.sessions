@@ -334,7 +334,7 @@ def api_session(session_id: str):
             detail["attention"] = attention.is_marked(session_id)
             detail["autonomy"] = autonomy.get(session_id)
             detail["projects"] = projects.projects_for(session_id)
-            detail["task_count"] = len(tasks.list_tasks(session_id))
+            detail["task_count"] = tasks.pending_count(session_id)
             return detail
         if not agyparser.has_conversation(session_id):
             raise HTTPException(status_code=404, detail="session not found")
@@ -526,7 +526,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
                   titles=titles, archived=arch_ids, live_ids=live_ids, marked=marked)
         summary["pending_approval"] = session_id in tmuxio.pending_ids()
         summary["autonomy"] = autonomy.get(session_id)
-        summary["task_count"] = len(tasks.list_tasks(session_id))
+        summary["task_count"] = tasks.pending_count(session_id)
         return summary
     if agyparser.has_conversation(session_id):
         s = agyparser.get_summary(session_id)
@@ -545,7 +545,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             s["live_tmux"] = False
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
-        s["task_count"] = len(tasks.list_tasks(sid))
+        s["task_count"] = tasks.pending_count(sid)
         return s
     if grokparser.has_session(session_id):
         s = grokparser.get_summary(session_id)
@@ -565,7 +565,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             s["live_tmux"] = False
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
-        s["task_count"] = len(tasks.list_tasks(sid))
+        s["task_count"] = tasks.pending_count(sid)
         return s
     return None
 

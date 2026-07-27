@@ -238,10 +238,15 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 
 /* ---- Detail page ---- */
 .detail-header {
+  position: relative;   /* anchors the live indicator to the panel corner */
   background: var(--panel); border: 1px solid var(--border);
   border-radius: 10px; padding: 18px; margin-bottom: 18px;
 }
-.detail-header h2 { margin: 0 0 10px; font-size: 18px; }
+/* Live state is glanceable status, not an action — it sits in the panel's top
+   right corner rather than in the button row. The title reserves room for it so
+   a long name wraps instead of running underneath. */
+.detail-header .live-tmux { position: absolute; top: 16px; right: 18px; }
+.detail-header h2 { margin: 0 0 10px; font-size: 18px; padding-right: 64px; }
 .sess-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .icon-btn {
   background: var(--panel-2); color: var(--muted);
@@ -259,8 +264,8 @@ main { padding: 22px; max-width: 1500px; margin: 0 auto; }
 .last-question { color: var(--text); font-size: 13px; margin: 0 0 10px; opacity: .82;
   max-width: 100%; word-break: break-word; }
 .detail-header .stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
-/* Autonomy + live-tmux + Tasks / Usage / Tokens sit together at the far right
-   of the stats row. */
+/* Autonomy + Tasks / Usage / Tokens sit together at the far right of the stats
+   row. The live indicator used to live here; it's in the panel corner now. */
 .stats-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .stats-actions select {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -851,6 +856,16 @@ body.world-page { overflow: hidden; }
 .usage-out { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
   line-height: 1.5; white-space: pre; overflow: auto; max-height: 65vh;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text); }
+/* "Log sent" toggle: muted when off, so an armed recorder is the state that
+   stands out rather than the quiet default. */
+.log-sent.on { color: var(--assistant); border-color: rgba(63,185,80,.5); background: rgba(63,185,80,.14); }
+
+/* The account page for whichever provider this session bills. Sits left in the
+   modal footer (margin-right:auto) so it never crowds Close. */
+.usage-link { margin-right: auto; align-self: center; font-size: 12.5px; text-decoration: none;
+  color: var(--accent, #4a9eff); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px; background: var(--panel-2); }
+.usage-link:hover { border-color: var(--accent, #4a9eff); text-decoration: underline; }
 .launch-known { font-size: 12.5px; color: var(--muted); margin: 4px 0 8px; }
 .launch-known code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 .launch-row { display: flex; align-items: center; gap: 10px;

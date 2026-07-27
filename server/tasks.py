@@ -49,6 +49,21 @@ def _save(data: dict) -> None:
     os.replace(tmp, _PATH)
 
 
+def is_pending(rec: dict) -> bool:
+    """Still waiting to be sent: not archived, and not already asked.
+
+    This is what the 📋 badge counts. An asked task stays in the active list so
+    you can see what you sent, but it's no longer queued work — counting it made
+    the rail read as if there were things left to do when there weren't."""
+    return not rec.get("archived_at") and not rec.get("asked_at")
+
+
+def pending_count(session_id: str) -> int:
+    """Badge count for one session (see is_pending)."""
+    with _lock:
+        return sum(1 for r in _load()["tasks"].get(session_id, []) if is_pending(r))
+
+
 def list_tasks(session_id: str, archived: bool = False) -> list[dict]:
     """One session's tasks in list order (the sequence you plan to ask them in).
 
@@ -173,13 +188,14 @@ def delete_task(session_id: str, tid: str) -> bool:
 
 
 def counts_by_session() -> dict[str, int]:
-    """{session_id: active task count} in one file read (board/rail badges).
+    """{session_id: pending task count} in one file read (board/rail badges).
 
-    Archived tasks are out of the way, so they don't inflate the badge."""
+    Asked and archived tasks are both out of the queue, so neither inflates the
+    badge — see is_pending."""
     with _lock:
         out = {}
         for sid, items in _load()["tasks"].items():
-            n = sum(1 for r in items if not r.get("archived_at"))
+            n = sum(1 for r in items if is_pending(r))
             if n:
                 out[sid] = n
         return out
