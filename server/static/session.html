@@ -4,18 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail · Agent OS</title>
-  <link rel="stylesheet" href="/static/style.css?v=150" />
+  <link rel="stylesheet" href="/static/style.css?v=157" />
 </head>
 <body>
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
+    <button class="toggle" id="wcAdd" hidden title="Add a watch column">＋ Column</button>
+    <button class="toggle" id="wcRemove" hidden title="Remove the right-hand watch column">－ Column</button>
     <button class="toggle danger" id="killAllBtn" title="Shut down every live session (ends all their REPLs)">⏻ Kill All</button>
     <span class="meta" id="meta"></span>
   </header>
   <div class="detail-layout">
     <aside id="attnRail" class="attn-rail" hidden></aside>
-    <main>
+    <div id="watchCols" class="watch-cols" hidden></div>
+    <main id="detailMain">
       <div id="header"></div>
       <div id="approval"></div>
       <div id="chat" class="chat"></div>
@@ -40,39 +43,50 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=150"></script>
+  <script src="/static/app.js?v=157"></script>
   <script>
     (async function () {
       const q = new URLSearchParams(location.search);
       const fromTodo = q.get("from") === "attention";
       const id = q.get("id");
-      // To-do landing with no explicit session: jump to the top to-do session so
-      // the rail highlights it and refresh/bookmark keeps working.
-      if (fromTodo && !id) {
-        try {
-          const d = await getJSON("/api/triage");
-          if (d.sessions && d.sessions.length) {
-            location.replace(`/session.html?id=${encodeURIComponent(d.sessions[0].session_id)}&from=attention`);
-            return;
-          }
-        } catch (e) { /* fall through to empty state */ }
+
+      // embed=1 — this page is running inside a To-do watch column. Same detail
+      // view, same buttons; only the chrome the parent already provides (topbar,
+      // rail) is dropped so it doesn't nest.
+      if (q.get("embed") === "1") {
+        document.body.classList.add("embed");
+        Detail.init();
+        return;
       }
+
       renderTopNav(fromTodo ? "todo" : null);
+
+      // To-do view = rail + watch columns. The single-session detail view stays
+      // at /session.html?id=<id> (no `from=attention`), which is where a column
+      // title and a ⌘/Ctrl-clicked rail item link to.
+      if (fromTodo) {
+        document.getElementById("detailMain").hidden = true;
+        document.getElementById("meta").textContent = "To-do";
+        document.getElementById("killAllBtn").addEventListener("click",
+          () => killAllTmux(() => AttnRail.tick()));
+        // Seed column 1 from ?id= when present, otherwise from the top to-do
+        // session, so landing on /To-do always shows something live.
+        let seed = id;
+        if (!seed) {
+          try {
+            const d = await getJSON("/api/triage");
+            if (d.sessions && d.sessions.length) seed = d.sessions[0].session_id;
+          } catch (e) { /* empty state is fine */ }
+        }
+        WatchCols.init(seed);
+        AttnRail.init();
+        return;
+      }
+
       document.getElementById("killAllBtn").addEventListener("click", () => killAllTmux(() => {
-        if (fromTodo) AttnRail.tick();     // rail live flags
         if (id) Detail.load();             // status pill + button states
       }));
-      if (fromTodo) AttnRail.init();
-      if (id) {
-        Detail.init();
-      } else if (fromTodo) {
-        document.getElementById("header").innerHTML =
-          '<div class="empty">🎉 Nothing on your to-do list. Add a session with “➕ Add to To-do”, or it appears here while it has a live session.</div>';
-        document.getElementById("meta").textContent = "To-do";
-        document.querySelector(".hist-bar").style.display = "none";
-      } else {
-        Detail.init();   // no id, not from to-do → Detail shows the missing-id notice
-      }
+      Detail.init();   // no id → Detail shows the missing-id notice
     })();
   </script>
 </body>
