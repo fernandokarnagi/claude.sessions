@@ -256,6 +256,15 @@ def has_session(sid: str) -> bool:
     return _dir_for(sid) is not None
 
 
+def session_dir(sid: str) -> str | None:
+    """Where grok stores this session — .../sessions/<enc-cwd>/<id>/.
+
+    The parent of it is the project's folder, which is what a reset watches for
+    the new session /new creates (see tmuxio.grok_reset).
+    """
+    return _dir_for(sid)
+
+
 def get_summary(sid: str) -> dict | None:
     """Cheap cached board summary (no full activity list) for one session."""
     d = _dir_for(sid)

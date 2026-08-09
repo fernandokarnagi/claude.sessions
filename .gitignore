@@ -19,6 +19,7 @@ server/.autonomy.json
 server/.projects.json
 server/.tasks.json
 server/.ollama_usage.json
+server/.descriptions.json
 server/.*.tmp
 
 # OS / editor
@@ -31,6 +32,7 @@ server/.slack_threads.json
 # Slack credentials (never commit)
 .env.slack
 nohup.out
+nohup.out.*
 
 # graphify knowledge graph — regenerable build output (graphify update .)
 graphify-out/

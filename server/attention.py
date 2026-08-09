@@ -50,3 +50,22 @@ def set_marked(session_id: str, marked: bool) -> None:
         else:
             ids.discard(session_id)
         _save(ids)
+
+
+def rekey(old_id: str, new_id: str) -> None:
+    """Move a pin onto a new id (see tmuxio.reset).
+
+    Pinning a session to the To-do inbox is a statement about the work, not the
+    conversation, so a /clear shouldn't quietly drop it out of the list you
+    triage from. Unpinning the old id is half the point: it's a frozen stub
+    afterwards and has no business sitting in an inbox of things that need you.
+    """
+    if old_id == new_id:
+        return
+    with _lock:
+        ids = _load()
+        if old_id not in ids:
+            return
+        ids.discard(old_id)
+        ids.add(new_id)
+        _save(ids)

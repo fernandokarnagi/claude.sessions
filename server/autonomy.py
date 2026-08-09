@@ -43,9 +43,25 @@ _started = False
 # Hook(sid, level, choice, prompt) called best-effort after an auto-answer.
 _hook: Optional[Callable[[str, str, int, dict], None]] = None
 
-# Last gate signature we auto-answered per session, so we don't re-answer the
-# same prompt while it lingers on screen for a poll or two.
-_answered: dict[str, str] = {}
+# {sid: (gate signature, when)} for the last gate we answered, so we don't press
+# twice while it lingers on screen for a poll or two.
+#
+# It expires. Two identical commands in a row produce two gates with the same
+# signature, and a permanent entry would mean the second one never gets
+# answered — the session parks on it forever with autonomy switched on. Holding
+# the memory only long enough to cover the repaint is the safe way round: press
+# again a moment later at worst, versus never pressing at all.
+_answered: dict[str, tuple[str, float]] = {}
+ANSWERED_TTL = 15.0
+
+# {sid: (gate signature, attempts)} for answers that didn't take. A keypress
+# into a TUI can be swallowed mid-repaint; before tmuxio.answer verified its
+# own work this went unnoticed and the gate was marked handled anyway, so a
+# yolo session could sit on an unanswered gate indefinitely. Now we retry —
+# but only so many times, because a gate that won't budge after several tries
+# is telling us something a louder keypress won't fix.
+_fails: dict[str, tuple[str, int]] = {}
+MAX_ATTEMPTS = 3
 
 POLL_SECS = float(os.environ.get("AUTONOMY_POLL_SECS", "2"))
 
@@ -91,6 +107,24 @@ def set(session_id: str, level: str) -> str:
     # A level change means the next gate should be reconsidered.
     _answered.pop(session_id, None)
     return level
+
+
+def rekey(old_id: str, new_id: str) -> None:
+    """Move a session's autonomy level onto a new id (see tmuxio.reset).
+
+    How much you trust this session to answer its own gates is a standing
+    decision about the work; a /clear shouldn't silently drop it back to
+    manual. The de-dupe memory is dropped, though — the new conversation's
+    first gate deserves a fresh look.
+    """
+    if old_id == new_id:
+        return
+    with _lock:
+        d = _load()
+        if old_id in d:
+            d[new_id] = d.pop(old_id)
+            _save(d)
+    _answered.pop(old_id, None)
 
 
 # --- global pause -----------------------------------------------------------
@@ -165,8 +199,35 @@ def decide(level: str, prompt: dict) -> Optional[int]:
 
 
 def _sig(prompt: dict) -> str:
-    return prompt.get("question", "") + "|" + "|".join(
-        f"{o.get('num')}{o.get('label')}" for o in (prompt.get("options") or []))
+    # Same fingerprint tmuxio.answer uses to check its own keypress landed, so
+    # "we answered this gate" and "this gate went away" mean the same thing.
+    return tmuxio.prompt_sig(prompt)
+
+
+def _just_answered(sid: str, sig: str) -> bool:
+    """True if we pressed this exact gate moments ago and it may still be up."""
+    prev, at = _answered.get(sid, ("", 0.0))
+    return prev == sig and (time.time() - at) < ANSWERED_TTL
+
+
+def _mark_answered(sid: str, sig: str) -> None:
+    _answered[sid] = (sig, time.time())
+
+
+def _too_many_tries(sid: str, sig: str) -> bool:
+    """True once this exact gate has swallowed MAX_ATTEMPTS answers."""
+    fsig, n = _fails.get(sid, ("", 0))
+    return fsig == sig and n >= MAX_ATTEMPTS
+
+
+def _note_failure(sid: str, sig: str, level: str, choice: int, err: str) -> None:
+    fsig, n = _fails.get(sid, ("", 0))
+    n = n + 1 if fsig == sig else 1
+    _fails[sid] = (sig, n)
+    print(f"[autonomy] {sid[:8]} {level} → option {choice} DIDN'T TAKE "
+          f"(attempt {n}/{MAX_ATTEMPTS}): {err}")
+    if n >= MAX_ATTEMPTS:
+        print(f"[autonomy] {sid[:8]} giving up on this gate — needs a human")
 
 
 # --- watcher ----------------------------------------------------------------
@@ -191,13 +252,18 @@ def _watch() -> None:
                     if not p:
                         continue
                     sig = _sig(p)
-                    if _answered.get(sid) == sig:
+                    if _just_answered(sid, sig) or _too_many_tries(sid, sig):
                         continue
                     choice = decide(level, p)
                     if choice is None:
                         continue             # auto-safe escalation — human handles
-                    tmuxio.answer(sid, choice)
-                    _answered[sid] = sig
+                    res = tmuxio.answer(sid, choice)
+                    if not res.get("ok"):
+                        # Leave it un-recorded so the next poll tries again.
+                        _note_failure(sid, sig, level, choice, res.get("error", ""))
+                        continue
+                    _fails.pop(sid, None)
+                    _mark_answered(sid, sig)
                     print(f"[autonomy] {sid[:8]} {level} → auto-answered option {choice}")
                     if _hook:
                         try:
@@ -215,13 +281,17 @@ def _watch() -> None:
                     if not p:
                         continue
                     sig = _sig(p)
-                    if _answered.get(sid) == sig:
+                    if _just_answered(sid, sig) or _too_many_tries(sid, sig):
                         continue
                     choice = decide(level, p)
                     if choice is None:
                         continue             # auto-safe escalation — human handles
-                    tmuxio.agy_answer(sid, "approve")
-                    _answered[sid] = sig
+                    res = tmuxio.agy_answer(sid, "approve")
+                    if not res.get("ok"):
+                        _note_failure(sid, sig, level, choice, res.get("error", ""))
+                        continue
+                    _fails.pop(sid, None)
+                    _mark_answered(sid, sig)
                     print(f"[autonomy] {sid[:8]} {level} → auto-approved agy gate")
                     if _hook:
                         try:
@@ -233,6 +303,11 @@ def _watch() -> None:
                 for sid in list(_answered):
                     if sid not in cleared:
                         _answered.pop(sid, None)
+                # Same for the retry counters — a session that isn't gated any
+                # more gets its full allowance back on the next gate.
+                for sid in list(_fails):
+                    if sid not in cleared:
+                        _fails.pop(sid, None)
         except Exception as e:
             print(f"[autonomy] watch error: {e}")
         time.sleep(POLL_SECS)

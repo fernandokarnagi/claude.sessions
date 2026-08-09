@@ -22,13 +22,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (agyparser, archives, attention, autonomy, grokparser, models,
-               ollamausage, overrides, parser, projects, registry, runner,
-               slackbot, summaries, summarizer, tasks, tmuxio)
+from . import (agyparser, archives, attention, autonomy, descriptions,
+               grokparser, models, ollamausage, overrides, parser, projects,
+               registry, runner, slackbot, summaries, summarizer, tasks, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-app = FastAPI(title="Claude Sessions Dashboard")
+app = FastAPI(title="Agent OS")
 
 
 @app.on_event("startup")
@@ -61,7 +61,8 @@ _BEYOND_WAITING = {"SITTING", "SLEEPING", "ENDED"}
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
               titles: dict | None = None, archived: set | None = None,
               live_ids: set | None = None, marked: set | None = None,
-              working_ids: set | None = None) -> dict:
+              working_ids: set | None = None, errors: dict | None = None,
+              descs: dict | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -78,6 +79,11 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["renamed"] = True
     else:
         summary["renamed"] = False
+
+    # Your own note about what this session is for. Dashboard-only, like the
+    # title override — absent means you haven't written one.
+    descs = descs if descs is not None else descriptions.all_descriptions()
+    summary["description"] = descs.get(sid)
 
     archived = archived if archived is not None else archives.archived_ids()
     summary["archived"] = sid in archived
@@ -112,6 +118,16 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["status"] = "THINKING" if sid in working else "WAITING"
     elif summary.get("status") == "THINKING":
         summary["status"] = "WAITING"
+
+    # The REPL's current error / retry banner, if it's showing one. Deliberately
+    # a field of its own rather than a status value: the session may still be
+    # THINKING (retrying) or WAITING, and it clears the moment the pane stops
+    # showing the banner — nothing to reset by hand.
+    if summary["live_tmux"]:
+        errs = errors if errors is not None else tmuxio.error_lines()
+        summary["error"] = errs.get(sid)
+    else:
+        summary["error"] = None
     return summary
 
 
@@ -202,6 +218,7 @@ def _agy_decorate_live(s: dict, session_id: str, full: str | None = "__cap__") -
     visible = "\n".join((full or "").splitlines()[-60:]) or None
     s["live_tmux"] = s["live"] = True
     s["status"], s["pending_approval"] = _agy_live_status(session_id, visible)
+    s["error"] = tmuxio.error_line(visible)
     s["model"] = agyparser.model_from_screen(visible) or s.get("model")
     tok = agyparser.tokens_from_screen(full)
     if tok:
@@ -218,6 +235,7 @@ def _agy_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
     if agyparser.reconcile_tmux_names():
         live_ids = None                       # refresh after any rename
     live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    descs = descriptions.all_descriptions()
     out = []
     for s in agyparser.list_conversations():
         sid = s["session_id"]
@@ -229,6 +247,7 @@ def _agy_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
         s["default_title"] = s["title"]
         if sid in titles:
             s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descs.get(sid)
         s["attention"] = sid in marked
         s["autonomy"] = autonomy.get(sid)
         if sid in live_ids:
@@ -247,6 +266,8 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
     live-tmux), honoring the archived visibility mode. Read-only: no pane parsing,
     so a live tmux (named after the id) just pins the status at WAITING."""
     live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    errs = tmuxio.error_lines()      # cached sweep — no extra tmux calls here
+    descs = descriptions.all_descriptions()
     out = []
     for s in grokparser.list_sessions():
         sid = s["session_id"]
@@ -258,6 +279,7 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
         s["default_title"] = s["title"]
         if sid in titles:
             s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descs.get(sid)
         s["attention"] = sid in marked
         s["autonomy"] = autonomy.get(sid)
         # grok is read-only (no send/gate/kill), but a tmux named after its id
@@ -266,8 +288,10 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
             s["live_tmux"] = s["live"] = True
             # mid-turn (grok pane shows "Esc to stop") → THINKING, else WAITING.
             s["status"] = "THINKING" if tmuxio.grok_working(sid) else "WAITING"
+            s["error"] = errs.get(sid)
         else:
             s["live_tmux"] = s["live"] = False
+            s["error"] = None
             if s["status"] == "THINKING":
                 s["status"] = "WAITING"      # not live → never surface THINKING
         out.append(s)
@@ -323,13 +347,16 @@ def api_session(session_id: str):
                 detail["live_tmux"] = detail["live"] = True
                 detail["status"] = ("THINKING" if tmuxio.grok_working(session_id)
                                     else "WAITING")
+                detail["error"] = tmuxio.error_lines().get(session_id)
             else:
                 detail["live_tmux"] = detail["live"] = False
+                detail["error"] = None
                 if detail.get("status") == "THINKING":
                     detail["status"] = "WAITING"
             titles = overrides.all_titles()
             if session_id in titles:
                 detail["title"], detail["renamed"] = titles[session_id], True
+            detail["description"] = descriptions.get(session_id)
             detail["archived"] = archives.is_archived(session_id)
             detail["attention"] = attention.is_marked(session_id)
             detail["autonomy"] = autonomy.get(session_id)
@@ -357,6 +384,7 @@ def api_session(session_id: str):
         titles = overrides.all_titles()
         if session_id in titles:
             detail["title"], detail["renamed"] = titles[session_id], True
+        detail["description"] = descriptions.get(session_id)
         detail["archived"] = archives.is_archived(session_id)
         detail["attention"] = attention.is_marked(session_id)
         detail["autonomy"] = autonomy.get(session_id)
@@ -394,6 +422,7 @@ def api_status(session_id: str):
                 s["live_tmux"] = s["live"] = True
                 s["status"] = ("THINKING" if tmuxio.grok_working(session_id)
                                else "WAITING")
+                s["error"] = tmuxio.error_lines().get(session_id)
             elif s.get("status") == "THINKING":
                 s["status"] = "WAITING"
             s["autonomy"] = autonomy.get(session_id)
@@ -401,6 +430,7 @@ def api_status(session_id: str):
             t = overrides.get_title(session_id)
             if t:
                 s["title"], s["renamed"] = t, True
+            s["description"] = descriptions.get(session_id)
             return s
         s = agyparser._summarize(os.path.join(agyparser.CONV_DIR, f"{session_id}.db")) \
             if agyparser.has_conversation(session_id) else None
@@ -419,6 +449,7 @@ def api_status(session_id: str):
         t = overrides.get_title(session_id)   # keep the custom title on poll
         if t:
             s["title"], s["renamed"] = t, True
+        s["description"] = descriptions.get(session_id)
         return s
     _decorate(s, registry.web_mtimes(), runner.running_ids())
     s["autonomy"] = autonomy.get(session_id)
@@ -536,6 +567,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
         s["default_title"] = s["title"]
         if sid in titles:
             s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descriptions.get(sid)
         s["archived"] = sid in arch_ids
         s["attention"] = sid in marked
         s["autonomy"] = autonomy.get(sid)
@@ -555,14 +587,17 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
         s["default_title"] = s["title"]
         if sid in titles:
             s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descriptions.get(sid)
         s["archived"] = sid in arch_ids
         s["attention"] = sid in marked
         s["autonomy"] = autonomy.get(sid)
         if sid in live_ids:
             s["live_tmux"] = True
             s["status"] = "WAITING"
+            s["error"] = tmuxio.error_lines().get(sid)
         else:
             s["live_tmux"] = False
+            s["error"] = None
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
         s["task_count"] = tasks.pending_count(sid)
@@ -731,6 +766,25 @@ def api_clear_title(session_id: str):
     return {"session_id": session_id, "title": None}
 
 
+class DescriptionBody(BaseModel):
+    description: str = ""
+
+
+@app.put("/api/sessions/{session_id}/description")
+def api_set_description(session_id: str, body: DescriptionBody):
+    """Set your note about what this session is for (empty text clears it)."""
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    descriptions.set_description(session_id, body.description)
+    return {"session_id": session_id, "description": descriptions.get(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}/description")
+def api_clear_description(session_id: str):
+    descriptions.clear(session_id)
+    return {"session_id": session_id, "description": None}
+
+
 class SendBody(BaseModel):
     text: str
     permission_mode: str = "acceptEdits"
@@ -780,11 +834,14 @@ def api_tmux(session_id: str):
     if prompt is None:
         prompt = tmuxio.parse_prompt(screen)
     spinner = agyparser.spinner_line(screen) if is_agy else tmuxio.spinner_line(screen)
+    # Error/retry banner off the *visible* frame only, so it disappears from the
+    # response as soon as the REPL recovers (see tmuxio.error_line).
     return {
         "session_id": session_id,
         "has_tmux": True,
         "prompt": prompt,
         "spinner": spinner,
+        "error": tmuxio.error_line(screen),
         "screen": full or screen,
     }
 
@@ -1000,10 +1057,75 @@ def api_compact(session_id: str, body: CompactBody = CompactBody()):
     """Run /compact on the live tmux REPL to shrink its context window.
 
     Optional `instructions` focus what the summary keeps.
+
+    grok has its own /compact and the same command shape, so it only needs the
+    grok submit path — its editor debounces keystrokes and swallows an Enter
+    sent too soon after the text (see tmuxio.grok_say).
     """
-    result = tmuxio.compact(session_id, body.instructions)
+    if grokparser.has_session(session_id):
+        cmd = "/compact"
+        if body.instructions.strip():
+            cmd += " " + body.instructions.strip()
+        result = tmuxio.grok_say(session_id, cmd)
+    else:
+        result = tmuxio.compact(session_id, body.instructions)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "compact failed"))
+    return result
+
+
+@app.post("/api/sessions/{session_id}/reset")
+def api_reset(session_id: str):
+    """Start a fresh conversation on the live REPL, following it to its new id.
+
+    /clear (Claude Code) and /new (grok) start that conversation under a *new*
+    session id while the tmux session keeps the old name — which is what
+    silently strands the dashboard (see tmuxio.reset / tmuxio.grok_reset). Here
+    we run it, learn the new id, rename the tmux onto
+    it, then carry the things that describe the *work* rather than the
+    conversation — your title, your note, your still-pending to-dos, project
+    tags, autonomy level, and its place in the To-do inbox — across to it.
+
+    Then we retire the old id: unpinned by the same migration, any tmux still
+    answering to that name killed, and archived. It's a frozen stub transcript
+    from here on, and leaving it in the inbox and on the board alongside its own
+    continuation is how you end up driving the dead half of a session. The
+    caller gets the new id and should navigate there.
+
+    Not available for agy: its conversations aren't identified by anything it
+    creates on reset, so there'd be no new id to follow.
+    """
+    if agyparser.has_conversation(session_id):
+        raise HTTPException(status_code=400,
+                            detail="reset is Claude Code and grok only")
+    if grokparser.has_session(session_id):
+        # grok keys sessions by directory, so the thing to watch is the
+        # project's folder — the parent of this session's own.
+        sdir = grokparser.session_dir(session_id)
+        if not sdir:
+            raise HTTPException(status_code=404, detail="session not found")
+        result = tmuxio.grok_reset(session_id, os.path.dirname(sdir))
+    else:
+        path = parser.session_path(session_id)
+        if not path:
+            raise HTTPException(status_code=404, detail="session not found")
+        result = tmuxio.reset(session_id, os.path.dirname(path))
+    new_id = result.get("session_id")
+    # Migrate on any run that produced a new id, even a failed rename — the
+    # conversation moved regardless, and leaving the state on the dead id is
+    # the exact loss this endpoint exists to prevent.
+    if new_id and new_id != session_id:
+        for store in (overrides, descriptions, tasks, projects, autonomy, attention):
+            store.rekey(session_id, new_id)
+    if not result.get("ok"):
+        # Retiring the old id is deliberately *not* done here. A failed rename
+        # means the live REPL still answers to the old name, and archiving or
+        # killing that would take a working session out from under you.
+        raise HTTPException(status_code=409, detail=result.get("error", "reset failed"))
+    # The rename landed, so the REPL is under new_id and anything still called
+    # old_id is a stale leftover — kill is a no-op in the normal case.
+    tmuxio.kill(session_id)
+    archives.set_archived(session_id, True)
     return result
 
 

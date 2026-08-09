@@ -181,3 +181,20 @@ def untag(session_id: str, pid: str) -> None:
             if not data["tags"][session_id]:
                 del data["tags"][session_id]
         _save(data)
+
+
+def rekey(old_id: str, new_id: str) -> None:
+    """Move a session's project tags onto a new id (see tmuxio.reset).
+
+    Which project a session belongs to is about the work, not the conversation,
+    so a /clear shouldn't drop it out of its project.
+    """
+    with _lock:
+        data = _load()
+        if old_id == new_id:
+            return
+        pids = data["tags"].pop(old_id, None)
+        if pids:
+            keep = data["tags"].setdefault(new_id, [])
+            keep.extend(p for p in pids if p not in keep)
+            _save(data)

@@ -69,6 +69,42 @@ _RULE_RE = re.compile(r"─{10,}")
 # match ordinary prose containing "… (" mid-line (which isn't glyph-anchored).
 _SPINNER_RE = re.compile(r"^[ \t]*[✻✽✶✳✷✵⚹✢·∴][^\n(]*…[^\n]*\(", re.MULTILINE)
 
+# --- error / retry banners -------------------------------------------------
+# When the REPL can't reach the API it replaces the spinner with a banner like
+#   "✻ Unable to connect to API (ConnectionRefused) · Retrying in 0s · attempt 5/10"
+# It carries a spinner glyph but no "… (", so _SPINNER_RE never matched it —
+# which is why the dashboard showed nothing at all while a session sat stuck
+# retrying. This detects it separately.
+#
+# The structural tell of a retry banner. "attempt 5/10" is specific enough to
+# stand alone; "Retrying in 5s" is not (it reads fine in prose), so that half
+# only counts on a glyph-anchored line — see error_line.
+_RETRY_RE = re.compile(r"retrying in \d+\s*s|attempt \d+\s*/\s*\d+", re.I)
+_ATTEMPT_RE = re.compile(r"attempt \d+\s*/\s*\d+", re.I)
+
+# Failure phrases. On their own these are too weak (an assistant reply can
+# discuss "rate limit"), so they only count on a glyph-anchored status line.
+_ERROR_PHRASES = (
+    "unable to connect to api",
+    "connection error",
+    "api error",
+    "request timed out",
+    "stream error",
+    "overloaded",
+    "internal server error",
+    "service unavailable",
+    "oauth token expired",
+    "invalid api key",
+    "credit balance is too low",
+    "usage limit reached",
+)
+
+# Glyphs the REPL puts at the head of a status/error line.
+_ERR_GLYPHS = "✻✽✶✳✷✵⚹✢·∴⧉✗✘⚠!"
+
+# Longest banner we keep — enough for the message plus its retry tail.
+_ERR_MAX = 240
+
 
 def _strip(s: str) -> str:
     return s.strip().strip(_BORDER_CHARS).strip()
@@ -281,6 +317,35 @@ def spinner_line(screen: Optional[str]) -> Optional[str]:
     return line.strip() or None
 
 
+def error_line(screen: Optional[str]) -> Optional[str]:
+    """The REPL's current error / retry banner, or None if it looks healthy.
+
+    Read off the *visible* pane, never scrollback — so once the session
+    reconnects and the banner scrolls away, the next capture returns None and
+    the alert clears itself. That's the whole self-healing story: there is no
+    error state stored anywhere, only what's on screen right now.
+
+    A line qualifies if it carries "attempt 5/10", or if it's a glyph-anchored
+    status line with either the retry structure or a known failure phrase.
+    Prompt lines are skipped outright so text you typed ("why is it retrying in
+    5s?") can never raise a false alarm. Scanned bottom-up: newest banner sits
+    lowest.
+    """
+    if not screen:
+        return None
+    for raw in reversed(screen.splitlines()):
+        line = _strip(raw)
+        if not line or line[0] in "❯>":
+            continue                     # user input, not REPL status
+        if _ATTEMPT_RE.search(line):
+            return line[:_ERR_MAX]
+        if line[0] in _ERR_GLYPHS:
+            low = line.lower()
+            if _RETRY_RE.search(low) or any(p in low for p in _ERROR_PHRASES):
+                return line[:_ERR_MAX]
+    return None
+
+
 def _at_input_box(screen: str) -> bool:
     """True when the REPL is sitting at its empty/ready input box.
 
@@ -307,27 +372,28 @@ def _at_input_box(screen: str) -> bool:
     return False
 
 
-# Short-TTL cache of which live sessions are actively generating right now.
-_WORK_CACHE: dict[str, object] = {"at": 0.0, "ids": set()}
+# Short-TTL cache of what one sweep of the live panes found.
+_WORK_CACHE: dict[str, object] = {"at": 0.0, "ids": set(), "errors": {}}
 
 
-def working_ids(ttl: float = 1.0) -> set[str]:
-    """Live session ids whose REPL is actively generating (THINKING).
+def _scan_live_panes(ttl: float = 1.0) -> tuple[set[str], dict[str, str]]:
+    """One sweep of every live pane → (working ids, {sid: error banner}).
 
-    A live session is "working" when its pane is neither at the ready input box
-    (idle) nor at a permission gate — i.e. a spinner is running. Captures every
-    live pane; cached for `ttl`s. This is the ground truth for THINKING, more
-    reliable than the transcript (which can end on a queued tool_result or an
-    injected "no visible output" nudge while the REPL has already gone idle).
+    Both answers come out of the same capture so the sessions list — polled
+    every ~1.5s — shells out to tmux once per session, not twice. Cached `ttl`s.
     """
     now = time.monotonic()
     if now - float(_WORK_CACHE["at"]) < ttl:
-        return set(_WORK_CACHE["ids"])  # type: ignore[arg-type]
-    working = set()
+        return set(_WORK_CACHE["ids"]), dict(_WORK_CACHE["errors"])  # type: ignore[arg-type]
+    working: set[str] = set()
+    errors: dict[str, str] = {}
     for sid in tmux_sessions():
         screen = capture_pane(sid)
         if screen is None:
             continue
+        err = error_line(screen)
+        if err:
+            errors[sid] = err
         if parse_prompt(screen) is not None:
             continue                     # a permission gate is up → not "working"
         # The empty input box renders in BOTH idle and generating states, so it
@@ -338,7 +404,30 @@ def working_ids(ttl: float = 1.0) -> set[str]:
             working.add(sid)
     _WORK_CACHE["at"] = now
     _WORK_CACHE["ids"] = working
-    return working
+    _WORK_CACHE["errors"] = errors
+    return set(working), dict(errors)
+
+
+def working_ids(ttl: float = 1.0) -> set[str]:
+    """Live session ids whose REPL is actively generating (THINKING).
+
+    A live session is "working" when its pane is neither at the ready input box
+    (idle) nor at a permission gate — i.e. a spinner is running. This is the
+    ground truth for THINKING, more reliable than the transcript (which can end
+    on a queued tool_result or an injected "no visible output" nudge while the
+    REPL has already gone idle).
+    """
+    return _scan_live_panes(ttl)[0]
+
+
+def error_lines(ttl: float = 1.0) -> dict[str, str]:
+    """{live session id: its current error / retry banner} for every live pane.
+
+    Only sessions currently showing a banner appear. Nothing is remembered
+    between sweeps, so a session that reconnects drops out on its own (see
+    error_line).
+    """
+    return _scan_live_panes(ttl)[1]
 
 
 # Short-TTL cache so the sessions list (polled ~every 1.5s) doesn't shell out to
@@ -698,23 +787,80 @@ def interrupt(session_id: str) -> dict:
     return {"ok": True}
 
 
-def answer(session_id: str, choice: int, text: str = "") -> dict:
+def prompt_sig(prompt: Optional[dict]) -> str:
+    """A stable fingerprint of one gate — what it asks, offers, and is about.
+
+    Used to tell "the same gate is still up" from "a new gate replaced it",
+    which is how both answer() and the autonomy watcher know whether a keypress
+    actually did anything.
+
+    The context — the command/tool preview above the question — has to be in
+    here. Without it every Bash gate in a session fingerprints identically:
+    they all ask "Do you want to proceed?" over "1. Yes / 2. No". A session
+    running one curl after another then produced a run of gates this function
+    could not tell apart, and both callers broke on it. answer() watched the
+    signature after pressing 1, saw the *next* gate's identical signature and
+    reported "the keypress didn't take"; the watcher meanwhile had recorded
+    that signature as already-answered, so it skipped the real gate underneath.
+    Three of those and it gave up — a yolo session parked on an unanswered
+    prompt with the auto-approver working exactly as written.
+
+    Whitespace is collapsed, because a repaint may rewrap the preview without
+    the gate having changed at all.
+    """
+    if not prompt:
+        return ""
+    context = " ".join((prompt.get("context") or "").split())
+    return prompt.get("question", "") + "|" + "|".join(
+        f"{o.get('num')}{o.get('label')}" for o in (prompt.get("options") or [])
+    ) + "|" + context
+
+
+def answer(session_id: str, choice: int, text: str = "",
+           verify: float = 4.0) -> dict:
     """Answer a live permission prompt by selecting option `choice`.
 
     Sends the digit then Enter into the live pane (matches Claude Code's menu).
     For a "No, and tell Claude what to do differently" style option, pass `text`
     to type the follow-up message after selecting it.
+
+    Then it *checks*, because a keypress into a TUI is not a promise. If the
+    digit lands while the menu is mid-repaint the REPL swallows it, and for a
+    long time this function reported success anyway — which is what let a yolo
+    session sit on an unanswered gate forever: the watcher recorded the gate as
+    handled and never tried again. So wait for the gate to actually go (or be
+    replaced) and report honestly if it doesn't. `verify=0` skips the wait.
     """
-    if capture_pane(session_id) is None:
+    screen = capture_pane(session_id)
+    if screen is None:
         return {"ok": False, "error": "no live tmux session"}
-    # Select the numbered option and confirm.
+    before = prompt_sig(parse_prompt(screen))
+
+    # Select the numbered option and confirm. The pause matters: the digit sets
+    # the selection and the menu redraws around it, and an Enter in the same
+    # flush can arrive before that has happened.
     _send_keys(session_id, "--", str(choice))
+    time.sleep(0.25)
     _send_keys(session_id, "Enter")
     if text:
         # The option opened a free-text field; type the guidance and submit.
+        time.sleep(0.25)
         _send_keys(session_id, "--", text)
         _send_keys(session_id, "Enter")
-    return {"ok": True}
+        return {"ok": True}      # the follow-up box isn't a gate — nothing to verify
+
+    if not before or verify <= 0:
+        return {"ok": True}      # nothing was up, or the caller doesn't care
+
+    waited = 0.0
+    while waited < verify:
+        time.sleep(0.4)
+        waited += 0.4
+        now = prompt_sig(parse_prompt(capture_pane(session_id, history=0) or ""))
+        if now != before:
+            return {"ok": True}
+    return {"ok": False,
+            "error": "the gate is still on screen — the keypress didn't take"}
 
 
 # A multi-select answer widget's Submit button (its own line inside the box).
@@ -821,6 +967,147 @@ def compact(session_id: str, instructions: str = "") -> dict:
     _send_keys(session_id, "-l", "--", cmd)
     _send_keys(session_id, "Enter")
     return {"ok": True}
+
+
+def _jsonl_ids(dirpath: str) -> set[str]:
+    """Session ids with a transcript in `dirpath` (i.e. its *.jsonl basenames)."""
+    try:
+        return {n[:-6] for n in os.listdir(dirpath) if n.endswith(".jsonl")}
+    except OSError:
+        return set()
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def reset(session_id: str, transcript_dir: Optional[str],
+          timeout: float = 25.0) -> dict:
+    """Run /clear on the live REPL, then follow the session to its new id.
+
+    /clear doesn't restart anything — the process, the pane and the tmux name
+    all stay put. What changes is underneath: Claude drops the conversation and
+    starts writing a *new* transcript under a fresh uuid. That breaks this
+    module's one invariant, tmux name == Claude session id, and it's why a
+    hand-typed /clear leaves the dashboard driving a session that no longer
+    exists: every send goes to a pane named after the dead id, and the new
+    transcript shows up as a stranger with no tmux of its own.
+
+    So watch the project's transcript directory for the file that appears — the
+    SessionStart:clear hook writes into it within a second or so — and
+    `tmux rename-session` onto it. Same pane, same REPL, name corrected.
+
+    Returns {ok, session_id (the new one), old_id}. ok False with the clear
+    already sent means we lost track of the new id; say so plainly, because the
+    old conversation is gone either way and nothing will bring it back.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    if not transcript_dir or not os.path.isdir(transcript_dir):
+        return {"ok": False, "error": "transcript directory not found"}
+
+    before = _jsonl_ids(transcript_dir)
+    _send_keys(session_id, "-l", "--", "/clear")
+    # A beat before Enter. Typing a slash pops the command menu, and submitting
+    # into it mid-render can select the wrong entry.
+    time.sleep(0.5)
+    _send_keys(session_id, "Enter")
+
+    waited = 0.0
+    while waited < timeout:
+        time.sleep(0.5)
+        waited += 0.5
+        fresh = _jsonl_ids(transcript_dir) - before
+        fresh.discard(session_id)
+        if not fresh:
+            continue
+        # Newest wins, in case another session in the same project started at
+        # the same moment.
+        new_id = max(fresh, key=lambda i: _mtime(os.path.join(transcript_dir, i + ".jsonl")))
+        return _rename_onto(session_id, new_id)
+
+    return {"ok": False, "old_id": session_id,
+            "error": "context cleared, but the new session id never appeared — "
+                     "the tmux session is still named after the old one"}
+
+
+def _rename_onto(old_id: str, new_id: str) -> dict:
+    """Point the tmux name at the id the REPL now writes under.
+
+    The rename *is* the reset, as far as this module is concerned: until it
+    lands, name == session id is broken and every send goes to a pane named
+    after a conversation that no longer exists.
+    """
+    try:
+        r = subprocess.run(["tmux", "rename-session", "-t", old_id, new_id],
+                           capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "old_id": old_id, "session_id": new_id, "error": str(e)}
+    if r.returncode != 0:
+        return {"ok": False, "old_id": old_id, "session_id": new_id,
+                "error": r.stderr.strip() or "tmux rename-session failed"}
+    return {"ok": True, "old_id": old_id, "session_id": new_id}
+
+
+def _grok_session_ids(parent_dir: str) -> set[str]:
+    """Session ids grok has stored under one project directory."""
+    try:
+        return {n for n in os.listdir(parent_dir)
+                if os.path.isfile(os.path.join(parent_dir, n, "summary.json"))}
+    except OSError:
+        return set()
+
+
+def grok_reset(session_id: str, parent_dir: Optional[str],
+               timeout: float = 25.0) -> dict:
+    """Run /new on a live grok REPL, then follow it to the session id it gets.
+
+    Same problem as reset(), different store. /new restarts nothing — same
+    process, same pane, same tmux name — but grok begins writing to a *new*
+    session directory, so the tmux name stops matching the session it drives.
+    Watch the project's session folder for the directory that appears and
+    rename the tmux onto it.
+
+    grok's own store is the source of truth: each session is
+    ~/.grok/sessions/<enc-cwd>/<id>/ and gets a summary.json as soon as it
+    exists, so a new id is visible without parsing anything.
+
+    Submits through grok_say because grok's editor debounces keystrokes — an
+    Enter fired straight after the text lands as a newline often enough that a
+    plain send would leave "/new" sitting unsent in the composer.
+
+    Returns {ok, session_id (the new one), old_id}.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    if not parent_dir or not os.path.isdir(parent_dir):
+        return {"ok": False, "error": "grok session directory not found"}
+
+    before = _grok_session_ids(parent_dir)
+    sent = grok_say(session_id, "/new")
+    if not sent.get("ok"):
+        return {"ok": False, "old_id": session_id,
+                "error": sent.get("error", "/new was not sent")}
+
+    waited = 0.0
+    while waited < timeout:
+        time.sleep(0.5)
+        waited += 0.5
+        fresh = _grok_session_ids(parent_dir) - before
+        fresh.discard(session_id)
+        if not fresh:
+            continue
+        # Newest wins, in case another grok session in the same project started
+        # at the same moment.
+        new_id = max(fresh, key=lambda i: _mtime(os.path.join(parent_dir, i)))
+        return _rename_onto(session_id, new_id)
+
+    return {"ok": False, "old_id": session_id,
+            "error": "/new was sent, but no new grok session appeared — "
+                     "the tmux session is still named after the old one"}
 
 
 def relay(from_id: str, to_id: str, message: str) -> dict:

@@ -199,3 +199,33 @@ def counts_by_session() -> dict[str, int]:
             if n:
                 out[sid] = n
         return out
+
+
+def rekey(old_id: str, new_id: str) -> None:
+    """Move a session's *live* to-do list onto a new id (see tmuxio.reset).
+
+    A /clear wipes the conversation, not the work — the queue of things you
+    still meant to ask is exactly what you want to survive it.
+
+    Only the pending ones travel. A task that was already asked, or archived,
+    belongs to the conversation that dealt with it; carrying it over would put
+    finished work back in the new session's queue and re-ask it. Those stay on
+    the old id, which reset archives, so the record follows its own transcript.
+
+    Appends, so a list already sitting on the new id isn't clobbered.
+    """
+    if old_id == new_id:
+        return
+    with _lock:
+        data = _load()
+        items = data["tasks"].get(old_id) or []
+        moving = [r for r in items if is_pending(r)]
+        if not moving:
+            return
+        staying = [r for r in items if not is_pending(r)]
+        if staying:
+            data["tasks"][old_id] = staying
+        else:
+            data["tasks"].pop(old_id, None)
+        data["tasks"].setdefault(new_id, []).extend(moving)
+        _save(data)

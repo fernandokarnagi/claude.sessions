@@ -1,9 +1,11 @@
 """
-overrides.py — user-defined title overrides for sessions.
+descriptions.py — user-written notes attached to a session.
 
-Renaming in the dashboard never touches Claude Code's transcripts. Instead we
-keep a session_id -> custom title map here, persisted to JSON. The app layer
-applies the override on top of the transcript-derived title.
+A description is dashboard-only: what this session is *for*, in your words. The
+transcript-derived title tells you what was said first; this tells you why the
+session exists. Same shape and rules as overrides.py (session_id -> text, empty
+text deletes the entry), kept in its own file so a note never risks the title
+map.
 """
 
 from __future__ import annotations
@@ -12,8 +14,12 @@ import json
 import os
 import threading
 
-_PATH = os.path.join(os.path.dirname(__file__), ".title_overrides.json")
+_PATH = os.path.join(os.path.dirname(__file__), ".descriptions.json")
 _lock = threading.Lock()
+
+# Long enough for a paragraph of context, short enough that the store stays a
+# quick read on every board request.
+MAX_LEN = 2000
 
 
 def _load() -> dict[str, str]:
@@ -31,28 +37,29 @@ def _save(data: dict[str, str]) -> None:
     os.replace(tmp, _PATH)
 
 
-def all_titles() -> dict[str, str]:
+def all_descriptions() -> dict[str, str]:
     with _lock:
         return _load()
 
 
-def get_title(session_id: str):
+def get(session_id: str):
     with _lock:
         return _load().get(session_id)
 
 
-def set_title(session_id: str, title: str) -> None:
-    title = (title or "").strip()
+def set_description(session_id: str, text: str) -> None:
+    """Write one session's note. Empty text removes it."""
+    text = (text or "").strip()[:MAX_LEN]
     with _lock:
         data = _load()
-        if title:
-            data[session_id] = title
+        if text:
+            data[session_id] = text
         else:
-            data.pop(session_id, None)  # empty title -> revert to original
+            data.pop(session_id, None)
         _save(data)
 
 
-def clear_title(session_id: str) -> None:
+def clear(session_id: str) -> None:
     with _lock:
         data = _load()
         if data.pop(session_id, None) is not None:
@@ -64,7 +71,7 @@ def rekey(old_id: str, new_id: str) -> None:
 
     A /clear gives the same live REPL a new session id. Moving rather than
     copying is deliberate: the old id is a frozen stub transcript, and leaving
-    the entry behind would show it on the board wearing the same name.
+    the entry behind would show it on the board wearing the same note.
     """
     with _lock:
         data = _load()
