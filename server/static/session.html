@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Session detail · Agent OS</title>
-  <link rel="stylesheet" href="/static/style.css?v=157" />
+  <link rel="stylesheet" href="/static/style.css?v=159" />
 </head>
 <body>
   <header class="topbar">
@@ -43,7 +43,7 @@
       <div id="events"></div>
     </main>
   </div>
-  <script src="/static/app.js?v=157"></script>
+  <script src="/static/app.js?v=159"></script>
   <script>
     (async function () {
       const q = new URLSearchParams(location.search);
@@ -71,8 +71,17 @@
           () => killAllTmux(() => AttnRail.tick()));
         // Seed column 1 from ?id= when present, otherwise from the top to-do
         // session, so landing on /To-do always shows something live.
-        let seed = id;
-        if (!seed) {
+        //
+        // Two cases must NOT seed, or the pins you chose get overwritten:
+        //   - a reload (⌘R) — it has to come back exactly as you left it, even
+        //     though the ?id= that first brought you here is still in the URL;
+        //   - arriving with no ?id= while columns are already pinned.
+        const nav = performance.getEntriesByType("navigation")[0];
+        const isReload = nav
+          ? nav.type === "reload"
+          : (performance.navigation && performance.navigation.type === 1);
+        let seed = isReload ? null : id;
+        if (!seed && !isReload && !WatchCols.hasSavedPins()) {
           try {
             const d = await getJSON("/api/triage");
             if (d.sessions && d.sessions.length) seed = d.sessions[0].session_id;
