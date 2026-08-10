@@ -146,6 +146,9 @@ body.embed .attn-rail { display: none; }
   border-radius: 4px; padding: 0 4px;
 }
 .rail-row1 { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+/* The rail is 174px wide and the status only has to read at a glance, so its
+   pill runs smaller than the board's — same scale as the rail's other tags. */
+.attn-rail .pill { font-size: 9.5px; padding: 2px 6px; letter-spacing: .03em; }
 .rail-live { color: #3fb950; font-size: 10.5px; font-weight: 600; }
 .rail-dead { color: var(--muted); font-size: 10.5px; }
 .rail-title { font-size: 12.5px; color: var(--text); line-height: 1.35;
