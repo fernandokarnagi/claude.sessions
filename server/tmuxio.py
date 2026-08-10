@@ -545,11 +545,36 @@ def dispatch(cwd: str, prompt: str, model: str = "opus",
     return {"ok": True, "session_id": sid, "has_tmux": True}
 
 
-def say(session_id: str, text: str) -> dict:
-    """Type `text` into the live REPL prompt and submit it.
+def _input_pending(session_id: str, snippet: str) -> bool:
+    """True if `snippet` still sits on the REPL composer line (not yet submitted).
+
+    Claude's composer is a bare "❯ <text>" between two rule lines; grok/agy wrap
+    theirs in a box ("│ ❯ <text> │"). _strip drops the border glyphs, so one
+    check covers all three. On submit the composer clears and the text moves up
+    into the transcript, so finding it still there means Enter didn't take.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    key = snippet.strip()[:24]
+    if not key:
+        return False
+    return any(key in line for line in screen.splitlines()[-8:]
+               if _strip(line).startswith(("❯", ">")))
+
+
+def say(session_id: str, text: str, tries: int = 4) -> dict:
+    """Type `text` into the live REPL prompt and *reliably* submit it.
 
     Drives the *live* tmux session (one continuous conversation, visible in
     tmux) — unlike runner.run_turn which forks a separate headless resume.
+
+    The REPL's editor (Ink) debounces keystrokes: an Enter fired immediately
+    after a literal paste lands mid-render and is swallowed as a newline, so the
+    message just sits in the composer unsent (the reported "sometimes ⌘↵ doesn't
+    submit"). Fix: let the paste settle, send Enter, then verify the turn
+    actually started / the composer cleared — resending Enter until it takes.
+    This mirrors grok_say, which already had to solve exactly this.
     """
     if not text.strip():
         return {"ok": False, "error": "empty message"}
@@ -557,8 +582,16 @@ def say(session_id: str, text: str) -> dict:
         return {"ok": False, "error": "no live tmux session"}
     # -l = literal, so a word like "Enter" inside the text isn't taken as a key.
     _send_keys(session_id, "-l", "--", text)
-    _send_keys(session_id, "Enter")
-    return {"ok": True}
+    time.sleep(0.5)                       # let the editor ingest the paste
+    for attempt in range(1, tries + 1):
+        _send_keys(session_id, "Enter")
+        time.sleep(0.6)
+        # Submitted if the turn started OR the composer no longer holds the text.
+        if spinner_line(capture_pane(session_id, history=0)) \
+                or not _input_pending(session_id, text):
+            return {"ok": True, "attempts": attempt}
+        time.sleep(0.4)                   # editor still settling — retry Enter
+    return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
 
 
 def agy_set_model(session_id: str, model: str, timeout: float = 6.0) -> dict:
