@@ -327,18 +327,18 @@ body.embed .attn-rail { display: none; }
 .detail-header {
   position: relative;   /* anchors the live indicator to the panel corner */
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: 10px; padding: 18px; margin-bottom: 18px;
+  border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
 }
 /* Live state is glanceable status, not an action — it sits in the panel's top
    right corner rather than in the button row. The title reserves room for it so
    a long name wraps instead of running underneath. */
-.detail-header .live-tmux { position: absolute; top: 16px; right: 18px; }
-.detail-header h2 { margin: 0 0 10px; font-size: 18px; padding-right: 64px; }
-.sess-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.detail-header .live-tmux { position: absolute; top: 12px; right: 14px; }
+.detail-header h2 { margin: 0 0 6px; font-size: 18px; padding-right: 64px; }
+.sess-title { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .icon-btn {
   background: var(--panel-2); color: var(--muted);
   border: 1px solid var(--border); border-radius: 6px;
-  width: 26px; height: 26px; font-size: 13px; cursor: pointer; line-height: 1;
+  width: 22px; height: 22px; font-size: 12px; cursor: pointer; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center; padding: 0;
 }
 .icon-btn:hover { color: var(--accent); border-color: var(--accent); }
@@ -372,23 +372,29 @@ body.embed .attn-rail { display: none; }
 /* Marked when a note exists, so you can tell without opening the modal. */
 .desc-btn.on { color: var(--accent); border-color: rgba(88,166,255,.5); }
 
-.last-question { color: var(--text); font-size: 13px; margin: 0 0 10px; opacity: .82;
+.last-question { color: var(--text); font-size: 13px; margin: 0 0 6px; opacity: .82;
   max-width: 100%; word-break: break-word; }
-.detail-header .stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+/* row-gap stays small so a wrapped stats row doesn't open a big band of dead
+   space; column-gap keeps the label/value pairs readable. */
+.detail-header .stats { display: flex; align-items: center; gap: 5px 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 /* Autonomy + Tasks / Usage / Tokens sit together at the far right of the stats
    row. The live indicator used to live here; it's in the panel corner now. */
-.stats-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.stats-actions { display: flex; align-items: center; gap: 5px; margin-left: auto; flex-wrap: wrap; }
 .stats-actions select {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-  border-radius: 6px; padding: 4px 8px; font-size: 12px;
+  border-radius: 6px; padding: 2px 6px; font-size: 12px;
 }
 .detail-header .stats b { color: var(--text); }
 .hdr-btn {
   margin-left: auto; cursor: pointer; font-size: 12px;
   background: var(--panel-2); color: var(--muted);
-  border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px;
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px;
 }
 .hdr-btn:hover { color: var(--tool); border-color: var(--tool); }
+/* Inside the button groups the auto margin only spreads buttons apart (and, on
+   a wrapped line, throws the last one to the far right). The group already
+   right-aligns itself, so pack them at their own gap instead. */
+.chat-actions .hdr-btn, .stats-actions .hdr-btn { margin-left: 0; }
 .token-grid { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
 .token-grid div { background: var(--panel-2); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 14px; font-variant-numeric: tabular-nums; }
@@ -494,10 +500,10 @@ body.embed .attn-rail { display: none; }
 .spin { display: inline-block; color: var(--accent); animation: pulse 1s ease-in-out infinite; }
 
 /* ---- chat box on detail page ---- */
-.chat { margin-bottom: 22px; }
-.chat-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+.chat { margin-bottom: 14px; }
+.chat-row { display: flex; align-items: center; gap: 5px 10px; margin-bottom: 6px; flex-wrap: wrap; }
 /* Action buttons group at the far right; selects and indicators stay left. */
-.chat-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+.chat-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
   margin-left: auto; justify-content: flex-end; }
 .chat-row select {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -505,7 +511,7 @@ body.embed .attn-rail { display: none; }
 }
 .now-model { color: var(--muted); font-size: 12px; }
 .now-model b { color: var(--assistant); }
-.detail-project { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 6px; }
+.detail-project { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 4px; }
 .thinking-line {
   max-width: 46%;
   color: var(--thinking-pill, #d29922); font-size: 14px; font-weight: 700;
@@ -615,10 +621,10 @@ body.embed .attn-rail { display: none; }
   border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
-.chat-input { display: flex; gap: 10px; align-items: stretch; }
+.chat-input { display: flex; gap: 8px; align-items: stretch; }
 .chat-input textarea {
   flex: 1; resize: vertical; background: var(--panel); color: var(--text);
-  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 .chat-input button {
@@ -626,7 +632,7 @@ body.embed .attn-rail { display: none; }
   padding: 0 22px; font-weight: 600; font-size: 14px; cursor: pointer;
 }
 .chat-input button:disabled { opacity: .55; cursor: default; }
-.stream { margin-top: 14px; max-height: 50vh; overflow-y: auto; }
+.stream { margin-top: 10px; max-height: 50vh; overflow-y: auto; }
 
 /* dictation mic button (speech → text), sits after any input/textarea */
 .mic-btn {
@@ -650,7 +656,7 @@ body.embed .attn-rail { display: none; }
 .stream:empty { display: none; }
 .result-line { color: var(--muted); font-size: 12px; padding: 6px 0 12px; font-variant-numeric: tabular-nums; }
 .hist-title { color: var(--muted); font-size: 13px; font-weight: 600; margin: 0; }
-.hist-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 6px 0 12px; }
+.hist-bar { display: flex; align-items: center; justify-content: space-between; gap: 5px 10px; margin: 4px 0 8px; }
 .hist-toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; }
 .hist-toggle input { accent-color: var(--accent); cursor: pointer; }
 .hist-toggle select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -1050,7 +1056,7 @@ body.world-page { overflow: hidden; }
 .proj-remove:hover { color: #f85149; border-color: rgba(248,81,73,.5); }
 
 /* project chips on the session detail header */
-.detail-projects { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.detail-projects { display: flex; flex-wrap: wrap; gap: 5px; margin: 5px 0 0; }
 .proj-chip {
   display: inline-flex; align-items: center; gap: 4px;
   border: 1px solid var(--border); border-radius: 12px;
