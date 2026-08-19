@@ -31,6 +31,8 @@ SESS_ROOT = os.path.join(GROK_DIR, "sessions")
 _DIR_CACHE: dict[str, str] = {}
 # _summarize cache: dir -> (summary_mtime, size, summary dict)
 _SUMM_CACHE: dict[str, tuple] = {}
+# _update_times cache: dir -> (updates_mtime, size, prompt_ts, tool_ts)
+_TS_CACHE: dict[str, tuple] = {}
 
 _MAX_ACT = 3          # recent activities on a board summary
 _MAX_DETAIL_ACT = 400 # activities in a full detail view
@@ -137,14 +139,91 @@ _ACT_KINDS = {
 }
 
 
-def _activities(session_dir: str, limit: int) -> list[dict]:
-    """Recent readable turns (chronological). Reads only the file's tail lines."""
+def _update_times(session_dir: str) -> tuple[dict[int, str], dict[str, str]]:
+    """Per-message wall-clock times, mined from updates.jsonl.
+
+    chat_history.jsonl carries no timestamps, but the session's update stream
+    does: a `user_message_chunk` stamps the prompt it belongs to (promptIndex),
+    and every `tool_call`/`tool_call_update` stamps its toolCallId. Both keys
+    also appear on chat_history turns, so those two maps pin exact times on
+    user turns and tool results; the rest interpolate (see _activities).
+
+    Returns (prompt_index -> iso, tool_call_id -> iso). Cached on file
+    mtime+size — updates.jsonl is megabytes, and the board hits it per refresh.
+    """
+    path = os.path.join(session_dir, "updates.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}, {}
+    cached = _TS_CACHE.get(session_dir)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2], cached[3]
+
+    prompts: dict[int, str] = {}
+    tools: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # Cheap prefilter — most lines are hook/plan noise we'd only
+                # parse to throw away.
+                if "toolCallId" not in line and "user_message_chunk" not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                epoch = o.get("timestamp")
+                if not isinstance(epoch, (int, float)):
+                    continue
+                upd = (o.get("params") or {}).get("update") or {}
+                kind = upd.get("sessionUpdate")
+                if kind == "user_message_chunk":
+                    idx = (upd.get("_meta") or {}).get("promptIndex")
+                    if isinstance(idx, int):
+                        prompts.setdefault(idx, claude_parser._iso(epoch))
+                elif kind in ("tool_call", "tool_call_update"):
+                    cid = upd.get("toolCallId")
+                    if cid:
+                        tools.setdefault(cid, claude_parser._iso(epoch))
+    except OSError:
+        return {}, {}
+
+    _TS_CACHE[session_dir] = (st.st_mtime, st.st_size, prompts, tools)
+    return prompts, tools
+
+
+def _fill_times(acts: list[dict], fallback: str | None) -> None:
+    """Give every turn a ts. Turns pinned by _update_times keep theirs; the
+    rest (assistant text, reasoning) take the next known time — they were
+    written just before the tool call that follows them. Trailing turns with
+    nothing after them take the previous known time, then the session's own."""
+    nxt = None
+    for a in reversed(acts):
+        if a["ts"]:
+            nxt = a["ts"]
+        else:
+            a["ts"] = nxt
+    prev = fallback
+    for a in acts:
+        if a["ts"]:
+            prev = a["ts"]
+        else:
+            a["ts"] = prev
+
+
+def _activities(session_dir: str, limit: int, with_ts: bool = False) -> list[dict]:
+    """Recent readable turns (chronological). Reads only the file's tail lines.
+
+    with_ts also mines updates.jsonl for per-turn timestamps (detail view only —
+    the board's 3-line preview doesn't show times and isn't worth the read)."""
     path = os.path.join(session_dir, "chat_history.jsonl")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             lines = fh.readlines()
     except OSError:
         return []
+    prompts, tools = _update_times(session_dir) if with_ts else ({}, {})
     acts: list[dict] = []
     for line in lines:
         line = line.strip()
@@ -162,10 +241,24 @@ def _activities(session_dir: str, limit: int) -> list[dict]:
             text = _strip_user_info(text)
         if not text:
             continue
+        ts = None
+        if with_ts:
+            if kind == "user":
+                ts = prompts.get(o.get("prompt_index"))
+            elif kind == "tool_result":
+                ts = tools.get(o.get("tool_call_id"))
         # kind carries the role (user/assistant/thinking/tool_result) so the UI
         # labels each turn and styles assistant replies — not a flat "grok".
-        acts.append({"kind": kind, "name": None,
+        acts.append({"kind": kind, "name": None, "ts": ts,
                      "role": kind, "text": text[:2000]})
+    if with_ts:
+        # Fill across the whole transcript, then trim — a kept turn's neighbour
+        # may well be one that got sliced off.
+        try:
+            fallback = claude_parser._iso(os.path.getmtime(path))
+        except OSError:
+            fallback = None
+        _fill_times(acts, fallback)
     return acts[-limit:] if limit else acts
 
 
@@ -339,7 +432,7 @@ def get_session(sid: str) -> dict | None:
     s = _summarize(d)
     if not s:
         return None
-    acts = _activities(d, _MAX_DETAIL_ACT)
+    acts = _activities(d, _MAX_DETAIL_ACT, with_ts=True)
     acts.reverse()   # newest first for the history view
     detail = dict(s)
     detail["activities"] = acts
