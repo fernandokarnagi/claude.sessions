@@ -1,5 +1,7 @@
 """
-summarizer.py — generate a one-paragraph "what's expected from you" summary.
+summarizer.py — turn a session's last assistant message into text for the UI:
+a one-paragraph "what's expected from you" summary (generate), or the follow-up
+message to queue as a task (as_task).
 
 Runs the user's configured model via `claude --print --output-format json`
 on the session's last assistant message. The throwaway run is isolated to a
@@ -34,6 +36,19 @@ Assistant's last message:
 {msg}
 \"\"\""""
 
+TASK_PROMPT = """Below is the most recent message from an AI coding assistant, \
+after which it stopped and is now waiting for its user. Write the follow-up \
+message the user should send back to keep the work moving: the decision, answer, \
+or instruction the assistant is waiting for. Reply with that message only — no \
+preamble, heading, quotes, or explanation. Keep it under 40 words, imperative, \
+and specific to what was asked. If the assistant offered options, pick the one it \
+recommended and say so.
+
+Assistant's last message:
+\"\"\"
+{msg}
+\"\"\""""
+
 
 def _delete_throwaway(session_id: str) -> None:
     for p in glob.glob(os.path.join(parser.PROJECTS_DIR, "*", f"{session_id}.jsonl")):
@@ -45,12 +60,25 @@ def _delete_throwaway(session_id: str) -> None:
 
 async def generate(last_assistant_text: str) -> Optional[str]:
     """Return a one-paragraph summary, or None on failure."""
+    return await _run(PROMPT, last_assistant_text)
+
+
+async def as_task(last_assistant_text: str) -> Optional[str]:
+    """Return the last assistant message rewritten as the follow-up message to
+    send back — the text of a queued task. None on failure.
+
+    Same throwaway run as generate(); only the prompt differs.
+    """
+    return await _run(TASK_PROMPT, last_assistant_text)
+
+
+async def _run(prompt_tmpl: str, last_assistant_text: str) -> Optional[str]:
     text = (last_assistant_text or "").strip()
     if not text:
         return None
     os.makedirs(parser.SUMMARIZER_CWD, exist_ok=True)
 
-    prompt = PROMPT.format(msg=text[:MAX_INPUT_CHARS])
+    prompt = prompt_tmpl.format(msg=text[:MAX_INPUT_CHARS])
     cmd = [CLAUDE_BIN, "--print", "--output-format", "json", prompt]
 
     try:

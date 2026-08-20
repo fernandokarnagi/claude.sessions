@@ -408,6 +408,20 @@ body.embed .attn-rail { display: none; }
 .event .hd { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
 .event .hd .kind { font-size: 11px; font-weight: 700; text-transform: uppercase; }
 .event .hd .ts { color: var(--muted); font-size: 11px; }
+/* ＋ Task on an assistant message: parked at the right of the header, faint
+   until you hover the message so it never competes with the text. Purple, not
+   the blue every other button uses — it queues work rather than navigating. */
+.event .hd .ev-task {
+  margin-left: auto; background: none; color: var(--result);
+  border: 1px solid rgba(188,140,255,.4); border-radius: 6px; padding: 1px 7px;
+  font-size: 11px; cursor: pointer; opacity: .45; transition: opacity .12s;
+}
+.event.assistant:hover .hd .ev-task, .event .hd .ev-task:focus { opacity: 1; }
+.event .hd .ev-task:hover {
+  color: var(--result); border-color: var(--result);
+  background: rgba(188,140,255,.12); opacity: 1;
+}
+.event .hd .ev-task:disabled { cursor: default; opacity: 1; }
 .event pre {
   margin: 0; white-space: pre-wrap; word-break: break-word;
   font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;

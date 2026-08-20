@@ -692,6 +692,51 @@ def api_add_task(session_id: str, body: TaskBody):
     return tasks.add_task(session_id, body.text, asked=body.asked)
 
 
+def _last_assistant_text(session_id: str) -> str | None:
+    """The newest assistant message of a claude, grok, or agy session.
+
+    Activities come back newest-first from every parser, so the first assistant
+    entry with text is the turn the session stopped on."""
+    detail = parser.get_session(session_id)
+    if detail is None and grokparser.has_session(session_id):
+        detail = grokparser.get_session(session_id)
+    if detail is None and agyparser.has_conversation(session_id):
+        detail = agyparser.get_conversation(session_id)
+    if detail is None:
+        return None
+    return next(
+        (a["text"] for a in detail.get("activities", [])
+         if a.get("kind") == "assistant" and (a.get("text") or "").strip()),
+        None,
+    )
+
+
+class TaskGenBody(BaseModel):
+    text: str = ""          # the assistant message to work from; "" = the latest
+
+
+@app.post("/api/sessions/{session_id}/tasks/summarize")
+async def api_task_summarize(session_id: str, body: TaskGenBody | None = None):
+    """Queue a task written from an assistant message.
+
+    The 📋 Task button on a message in the history posts that message's text;
+    with no text the session's latest assistant message is used. Runs the same
+    throwaway `claude --print` as the waiting summary, but with a prompt that
+    produces the reply to send back, so the new task is ready to Ask (or edit)
+    instead of being a recap. Not cached: it is an explicit button press.
+    """
+    last = (body.text.strip() if body and body.text.strip()
+            else _last_assistant_text(session_id))
+    if last is None:
+        if not _session_exists(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
+        raise HTTPException(status_code=409, detail="no assistant message yet")
+    text = await summarizer.as_task(last)
+    if not text:
+        raise HTTPException(status_code=502, detail="could not summarize the last message")
+    return tasks.add_task(session_id, text)
+
+
 @app.patch("/api/sessions/{session_id}/tasks/{tid}")
 def api_update_task(session_id: str, tid: str, body: TaskBody):
     text = body.text if body.text.strip() else None

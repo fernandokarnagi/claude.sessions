@@ -79,6 +79,79 @@ def test_generate_handles_non_json(tmp_path, monkeypatch):
     assert out == "plain text answer"
 
 
+# ---- last reply -> task ------------------------------------------------------
+
+def test_as_task_uses_the_task_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(parser, "SUMMARIZER_CWD", str(tmp_path / "sumcwd"))
+    monkeypatch.setattr(summarizer, "_delete_throwaway", lambda sid: None)
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["prompt"] = args[-1]
+        return _FakeProc(b'{"result":"Go with option 2, the cached parser.",'
+                         b'"session_id":"throw-2"}')
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    out = asyncio.run(summarizer.as_task("Option 1 or option 2? I'd pick 2."))
+    assert out == "Go with option 2, the cached parser."
+    assert "follow-up message the user should send back" in seen["prompt"]
+
+
+def test_summarize_queues_the_generated_text(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server import app as appmod, tasks
+
+    monkeypatch.setattr(tasks, "_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(appmod, "_last_assistant_text", lambda sid: "Shall I deploy?")
+
+    async def fake_as_task(text):
+        assert text == "Shall I deploy?"
+        return "Deploy to prod."
+
+    monkeypatch.setattr(appmod.summarizer, "as_task", fake_as_task)
+
+    client = TestClient(appmod.app)
+    r = client.post("/api/sessions/s1/tasks/summarize")
+    assert r.status_code == 200
+    assert r.json()["text"] == "Deploy to prod."
+    assert [t["text"] for t in tasks.list_tasks("s1")] == ["Deploy to prod."]
+    assert tasks.pending_count("s1") == 1     # queued, not asked
+
+
+def test_summarize_uses_the_posted_message(tmp_path, monkeypatch):
+    """The 📋 Task button posts the message it sits on, not the latest one."""
+    from fastapi.testclient import TestClient
+    from server import app as appmod, tasks
+
+    monkeypatch.setattr(tasks, "_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(appmod, "_last_assistant_text", lambda sid: "the newest reply")
+    seen = {}
+
+    async def fake_as_task(text):
+        seen["text"] = text
+        return "Answer the older question."
+
+    monkeypatch.setattr(appmod.summarizer, "as_task", fake_as_task)
+
+    r = TestClient(appmod.app).post("/api/sessions/s1/tasks/summarize",
+                                    json={"text": "an older reply"})
+    assert r.status_code == 200
+    assert seen["text"] == "an older reply"
+    assert [t["text"] for t in tasks.list_tasks("s1")] == ["Answer the older question."]
+
+
+def test_summarize_404s_for_an_unknown_session(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server import app as appmod, tasks
+
+    monkeypatch.setattr(tasks, "_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(appmod, "_last_assistant_text", lambda sid: None)
+    monkeypatch.setattr(appmod, "_session_exists", lambda sid: False)
+
+    r = TestClient(appmod.app).post("/api/sessions/nope/tasks/summarize")
+    assert r.status_code == 404
+
+
 # ---- exclusion of summarizer sessions ----------------------------------------
 
 def test_summarizer_sessions_excluded_from_list(tmp_path, monkeypatch):
