@@ -160,6 +160,29 @@ def test_a_failed_tool_shows_its_error_instead(db):
     assert "exit 127: no such command" in texts
 
 
+def test_a_question_tool_reads_as_the_question_it_asked(db):
+    """It has no command or path to show, so it used to fall through to a raw
+    json.dumps of its input — the question, every option and every description
+    as one wall of quotes."""
+    conn = sqlite3.connect(str(db / "opencode.db"))
+    _part(conn, "p8", "m2", "ses_main", 8_000,
+          {"type": "tool", "tool": "question",
+           "state": {"status": "completed", "input": {"questions": [
+               {"header": "Explore User node",
+                "question": "Want me to trace it?",
+                "options": [
+                    {"label": "Yes, trace it", "description": "Walk the graph"},
+                    {"label": "No, just show the report",
+                     "description": "Keep to the summary"}]}]}}})
+    conn.commit()
+    conn.close()
+    opencodeparser._SUMM_CACHE.clear()
+    texts = [a["text"] for a in opencodeparser.get_session("ses_main")["activities"]]
+    asked = next(t for t in texts if "trace it" in t)
+    assert asked == "Want me to trace it?\n1. Yes, trace it  2. No, just show the report"
+    assert "{" not in asked
+
+
 def test_injected_editor_context_is_not_the_users_words(db):
     """opencode rides IDE context on the user's message as an extra text part —
     rendering it as something the human typed would be a lie."""

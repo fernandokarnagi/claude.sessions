@@ -1,6 +1,11 @@
 """
 Reading opencode's permission gate off a tmux pane.
 
+The gate is a three-stage dialog, not one screen. "Allow always" and "Reject"
+don't answer the request — each swaps the dialog for a follow-up under its own
+header ("Always allow" → Confirm/Cancel, "Reject permission" → a reason box).
+Both frames have to be recognised too, or the board calls a blocked session idle.
+
 opencode doesn't render a numbered menu like Claude Code — it draws a horizontal
 row of options and marks the selected one by *colour alone*. A plain
 `capture-pane` strips colour, so the highlight has to come from a second capture
@@ -120,3 +125,97 @@ def test_a_gate_outranks_the_busy_footer():
     has to win, or the board shows THINKING for a session that's blocked."""
     assert tmuxio._OPENCODE_GATE_HEAD_RE.search(GATE)
     assert not tmuxio._OPENCODE_GATE_HEAD_RE.search(BUSY)
+
+
+# Stage 2 of "Allow always": the request is *not* answered yet — opencode wants
+# a Confirm before it writes the pattern into the always-list.
+#
+# Unlike GATE above, this frame and REJECT are reconstructed from opencode's own
+# dialog code (header text, option labels and body copy taken verbatim from it)
+# rather than captured, so the layout around them is indicative — the parser
+# keys on the header and the option row, both of which are exact.
+CONFIRM = """\
+  ┃  △ Always allow
+  ┃
+  ┃  This will allow the following patterns until OpenCode is restarted.
+  ┃
+  ┃  - /tmp/*
+  ┃
+  ┃
+  ┃   Confirm   Cancel  ⇆ select  enter confirm  esc can
+  ┃
+"""
+
+# Stage 2 of "Reject": a free-text box for the reason. No option row at all —
+# the actions are the footer's key hints.
+REJECT = """\
+  ┃  △ Reject permission
+  ┃ Tell OpenCode what to do differently
+  ┃ ╭──────────────────╮
+  ┃ │                  │
+  ┃ ╰──────────────────╯
+  ┃  enter confirm  esc cancel
+"""
+
+
+def _ansi_confirm(selected):
+    """CONFIRM's option row with SGR runs, same shape as _ansi()."""
+    row = "  ┃  "
+    for label in ("Confirm", "Cancel"):
+        sgr = "\x1b[38;2;10;10;10;48;2;245;167;66m" if label == selected \
+            else f"\x1b[{DIM}m"
+        row += f" {sgr}{label}\x1b[0m  "
+    row += "⇆ select  enter confirm  esc can"
+    lines = CONFIRM.splitlines()
+    lines[7] = row
+    return "\n".join(lines) + "\n"
+
+
+def test_the_allow_always_confirmation_is_a_gate():
+    """The bug: only "Permission required" was recognised, so the pane sitting
+    at this frame read as idle and the session hung on an unanswered dialog."""
+    gate = tmuxio.parse_opencode_gate(CONFIRM)
+    assert gate is not None
+    assert gate["stage"] == "always"
+    assert [(o["num"], o["label"]) for o in gate["options"]] == [
+        (1, "Confirm"), (2, "Cancel")]
+
+
+def test_the_confirmation_says_what_it_will_allow():
+    gate = tmuxio.parse_opencode_gate(CONFIRM)
+    assert gate["question"] == (
+        "This will allow the following patterns until OpenCode is restarted. "
+        "— - /tmp/*")
+
+
+def test_the_confirmation_footer_hints_are_not_options():
+    """Its own hints read "enter confirm  esc cancel" — lowercase, which is the
+    only thing keeping them out of a row that also holds Confirm and Cancel."""
+    gate = tmuxio.parse_opencode_gate(CONFIRM)
+    assert [o["label"] for o in gate["options"]] == ["Confirm", "Cancel"]
+
+
+def test_the_confirmation_highlight_also_comes_from_colour():
+    for want in ("Confirm", "Cancel"):
+        gate = tmuxio.parse_opencode_gate(CONFIRM, _ansi_confirm(want))
+        assert [o["label"] for o in gate["options"] if o["selected"]] == [want]
+
+
+def test_the_reject_reason_box_is_a_gate():
+    """No option row here, so the row-based path can't see it; the header has
+    to carry it. Its actions are the two key hints."""
+    gate = tmuxio.parse_opencode_gate(REJECT)
+    assert gate is not None
+    assert gate["stage"] == "reject"
+    assert [(o["num"], o["label"]) for o in gate["options"]] == [
+        (1, "Confirm"), (2, "Cancel")]
+    assert gate["question"] == "Tell OpenCode what to do differently"
+
+
+def test_the_first_stage_is_still_named():
+    assert tmuxio.parse_opencode_gate(GATE)["stage"] == "permission"
+
+
+def test_a_follow_up_stage_outranks_the_busy_footer_too():
+    for frame in (CONFIRM, REJECT):
+        assert tmuxio._OPENCODE_GATE_HEAD_RE.search(frame)

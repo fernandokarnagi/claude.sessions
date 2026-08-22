@@ -121,6 +121,28 @@ def _model_label(raw: str | None) -> str | None:
     return f"{prov}/{mid}" if prov else str(mid)
 
 
+def _question_text(inp: dict) -> str:
+    """The `question` tool's input as the question plus its numbered choices.
+
+    opencode numbers the rows from 1 in the TUI, so this reads the same way as
+    the dialog the user is looking at.
+    """
+    qs = inp.get("questions")
+    if not isinstance(qs, list) or not qs:
+        return ""
+    out = []
+    for q in qs:
+        if not isinstance(q, dict):
+            continue
+        text = str(q.get("question") or q.get("header") or "").strip()
+        opts = [str(o.get("label") or "").strip()
+                for o in q.get("options") or [] if isinstance(o, dict)]
+        opts = [o for o in opts if o]
+        numbered = "  ".join(f"{i}. {o}" for i, o in enumerate(opts, 1))
+        out.append(f"{text}\n{numbered}" if numbered else text)
+    return "\n".join(o for o in out if o)
+
+
 def _tool_text(data: dict) -> str:
     """A one-line-ish rendering of a tool part: its most identifying argument,
     or the error when the call failed."""
@@ -130,6 +152,11 @@ def _tool_text(data: dict) -> str:
     inp = state.get("input") or {}
     if not isinstance(inp, dict):
         return ""
+    # The `question` tool asks the user something; dumping its JSON put the
+    # whole option list, descriptions and all, on screen as one wall of quotes.
+    asked = _question_text(inp)
+    if asked:
+        return asked
     # The argument that says what the call actually touched, by tool.
     for key in ("command", "filePath", "path", "pattern", "query", "description"):
         v = inp.get(key)

@@ -1223,11 +1223,11 @@ def api_answer(session_id: str, body: AnswerBody):
     For a "No, and tell Claude what to do differently" option, include `text`
     to type the follow-up guidance after selecting it.
 
-    opencode's gate is a horizontal row of options with no free-text choice, so
-    `text` is ignored there.
+    opencode's gate is a horizontal row of options; picking "Reject" there opens
+    a box asking what to do instead, and `text` is typed into it.
     """
     if opencodeparser.has_session(session_id):
-        result = tmuxio.opencode_answer(session_id, body.choice)
+        result = tmuxio.opencode_answer(session_id, body.choice, body.text)
     else:
         result = tmuxio.answer(session_id, body.choice, body.text)
     if not result.get("ok"):
