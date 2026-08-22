@@ -24,8 +24,8 @@ from pydantic import BaseModel
 
 from . import (agyparser, archives, attention, autonomy, descriptions,
                grokparser, models, ollamausage, opencodeparser, overrides,
-               parser, projects, registry, runner, slackbot, summaries,
-               summarizer, tasks, tmuxio)
+               parser, pins, projects, registry, runner, slackbot,
+               summaries, summarizer, tasks, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -917,6 +917,40 @@ def api_delete_task(session_id: str, tid: str):
     return {"id": tid, "deleted": True}
 
 
+class PinBody(BaseModel):
+    text: str = ""
+    kind: str = "assistant"     # which side of the conversation it came from
+    ts: str | None = None       # timestamp of the original message, if known
+
+
+@app.get("/api/sessions/{session_id}/pins")
+def api_pins(session_id: str):
+    """Messages bookmarked out of this session's history, newest first."""
+    return {"pins": pins.list_pins(session_id)}
+
+
+@app.post("/api/sessions/{session_id}/pins")
+def api_add_pin(session_id: str, body: PinBody):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    return pins.add_pin(session_id, body.text, kind=body.kind, ts=body.ts)
+
+
+# Declared before /pins/{pid} — routes match in order, so the other way round
+# "all" would be swallowed as a pin id.
+@app.delete("/api/sessions/{session_id}/pins/all")
+def api_delete_all_pins(session_id: str):
+    """Unpin everything for this session."""
+    return {"deleted": pins.delete_all(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}/pins/{pid}")
+def api_delete_pin(session_id: str, pid: str):
+    if not pins.delete_pin(session_id, pid):
+        raise HTTPException(status_code=404, detail="pin not found")
+    return {"id": pid, "deleted": True}
+
+
 class TitleBody(BaseModel):
     title: str = ""
 
@@ -1335,7 +1369,8 @@ def api_reset(session_id: str):
     # conversation moved regardless, and leaving the state on the dead id is
     # the exact loss this endpoint exists to prevent.
     if new_id and new_id != session_id:
-        for store in (overrides, descriptions, tasks, projects, autonomy, attention):
+        for store in (overrides, descriptions, tasks, pins, projects, autonomy,
+                      attention):
             store.rekey(session_id, new_id)
     if not result.get("ok"):
         # Retiring the old id is deliberately *not* done here. A failed rename
