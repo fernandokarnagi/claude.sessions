@@ -23,8 +23,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (agyparser, archives, attention, autonomy, descriptions,
-               grokparser, models, ollamausage, overrides, parser, projects,
-               registry, runner, slackbot, summaries, summarizer, tasks, tmuxio)
+               grokparser, models, ollamausage, opencodeparser, overrides,
+               parser, projects, registry, runner, slackbot, summaries,
+               summarizer, tasks, tmuxio)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -185,6 +186,12 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
         data["sessions"].append(s)
+    for s in _opencode_summaries(titles, arch_ids, marked, mode, live_tmux):
+        if statuses and s["status"] not in statuses:
+            continue
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        data["sessions"].append(s)
     data["sessions"].sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     data["total"] = len(data["sessions"])
     return data
@@ -298,6 +305,55 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
     return out
 
 
+def _opencode_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
+    """opencode sessions decorated for the board (title override, archived,
+    attention, live-tmux), honoring the archived visibility mode.
+
+    Unlike grok, opencode's permission gate is readable from the pane, so a live
+    session can report pending_approval — that's what puts it in the To-do inbox
+    rather than leaving it silently blocked.
+    """
+    live_ids = live_ids if live_ids is not None else tmuxio.tmux_sessions()
+    errs = tmuxio.error_lines()      # cached sweep — no extra tmux calls here
+    descs = descriptions.all_descriptions()
+    out = []
+    for s in opencodeparser.list_sessions():
+        sid = s["session_id"]
+        s["archived"] = sid in arch_ids
+        if mode == "exclude" and s["archived"]:
+            continue
+        if mode == "only" and not s["archived"]:
+            continue
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descs.get(sid)
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        if sid in live_ids:
+            s["live_tmux"] = s["live"] = True
+            _apply_opencode_live(s, sid)
+            s["error"] = errs.get(sid)
+        else:
+            s["live_tmux"] = s["live"] = False
+            s["error"] = None
+            if s["status"] == "THINKING":
+                s["status"] = "WAITING"      # not live → never surface THINKING
+        out.append(s)
+    return out
+
+
+def _apply_opencode_live(s: dict, session_id: str) -> None:
+    """Status + gate flag for a live opencode pane: a permission gate pins
+    WAITING and raises pending_approval, mid-turn is THINKING, else WAITING."""
+    if tmuxio.opencode_pending(session_id) is not None:
+        s["status"] = "WAITING"
+        s["pending_approval"] = True
+        return
+    s["pending_approval"] = False
+    s["status"] = "THINKING" if tmuxio.opencode_working(session_id) else "WAITING"
+
+
 @app.get("/api/search")
 def api_search(q: str = Query(""), archived: str | None = Query(None)):
     """Search by id/title/project. Archived sessions are excluded unless
@@ -322,7 +378,8 @@ def api_search(q: str = Query(""), archived: str | None = Query(None)):
     if ql:
         marked = attention.marked_ids()
         for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
-                  + _grok_summaries(titles, arch_ids, marked, mode="all")):
+                  + _grok_summaries(titles, arch_ids, marked, mode="all")
+                  + _opencode_summaries(titles, arch_ids, marked, mode="all")):
             if not include_archived and s.get("archived"):
                 continue
             if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
@@ -347,6 +404,30 @@ def api_session(session_id: str):
                 detail["live_tmux"] = detail["live"] = True
                 detail["status"] = ("THINKING" if tmuxio.grok_working(session_id)
                                     else "WAITING")
+                detail["error"] = tmuxio.error_lines().get(session_id)
+            else:
+                detail["live_tmux"] = detail["live"] = False
+                detail["error"] = None
+                if detail.get("status") == "THINKING":
+                    detail["status"] = "WAITING"
+            titles = overrides.all_titles()
+            if session_id in titles:
+                detail["title"], detail["renamed"] = titles[session_id], True
+            detail["description"] = descriptions.get(session_id)
+            detail["archived"] = archives.is_archived(session_id)
+            detail["attention"] = attention.is_marked(session_id)
+            detail["autonomy"] = autonomy.get(session_id)
+            detail["projects"] = projects.projects_for(session_id)
+            detail["task_count"] = tasks.pending_count(session_id)
+            return detail
+        if opencodeparser.has_session(session_id):
+            detail = opencodeparser.get_session(session_id)  # read-only, sqlite
+            if detail is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            # read-only, but a tmux named after its id = a live REPL is running.
+            if session_id in tmuxio.tmux_sessions():
+                detail["live_tmux"] = detail["live"] = True
+                _apply_opencode_live(detail, session_id)
                 detail["error"] = tmuxio.error_lines().get(session_id)
             else:
                 detail["live_tmux"] = detail["live"] = False
@@ -432,6 +513,23 @@ def api_status(session_id: str):
                 s["title"], s["renamed"] = t, True
             s["description"] = descriptions.get(session_id)
             return s
+        if opencodeparser.has_session(session_id):
+            s = opencodeparser.get_summary(session_id)
+            if s is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            if session_id in tmuxio.tmux_sessions():
+                s["live_tmux"] = s["live"] = True
+                _apply_opencode_live(s, session_id)
+                s["error"] = tmuxio.error_lines().get(session_id)
+            elif s.get("status") == "THINKING":
+                s["status"] = "WAITING"
+            s["autonomy"] = autonomy.get(session_id)
+            s["projects"] = projects.projects_for(session_id)
+            t = overrides.get_title(session_id)
+            if t:
+                s["title"], s["renamed"] = t, True
+            s["description"] = descriptions.get(session_id)
+            return s
         s = agyparser._summarize(os.path.join(agyparser.CONV_DIR, f"{session_id}.db")) \
             if agyparser.has_conversation(session_id) else None
         if s is None:
@@ -477,11 +575,13 @@ async def api_summary(session_id: str):
     """
     detail = parser.get_session(session_id)
     if detail is None:
-        # agy + grok conversations are read-only — no LLM "what's expected" summary.
+        # agy, grok + opencode stores are read-only — no LLM "what's expected" summary.
         if agyparser.has_conversation(session_id):
             return {"status": None, "summary": None, "reason": "agy (read-only)"}
         if grokparser.has_session(session_id):
             return {"status": None, "summary": None, "reason": "grok (read-only)"}
+        if opencodeparser.has_session(session_id):
+            return {"status": None, "summary": None, "reason": "opencode (read-only)"}
         raise HTTPException(status_code=404, detail="session not found")
 
     status = detail.get("status")
@@ -512,10 +612,11 @@ async def api_summary(session_id: str):
 
 
 def _session_exists(session_id: str) -> bool:
-    """A claude transcript, agy conversation, or grok session exists for this id."""
+    """A claude transcript, agy conversation, grok or opencode session exists."""
     return (parser.session_path(session_id) is not None
             or agyparser.has_conversation(session_id)
-            or grokparser.has_session(session_id))
+            or grokparser.has_session(session_id)
+            or opencodeparser.has_session(session_id))
 
 
 @app.post("/api/sessions/{session_id}/archive")
@@ -594,6 +695,29 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
         if sid in live_ids:
             s["live_tmux"] = True
             s["status"] = "WAITING"
+            s["error"] = tmuxio.error_lines().get(sid)
+        else:
+            s["live_tmux"] = False
+            s["error"] = None
+            if s.get("status") == "THINKING":
+                s["status"] = "WAITING"
+        s["task_count"] = tasks.pending_count(sid)
+        return s
+    if opencodeparser.has_session(session_id):
+        s = opencodeparser.get_summary(session_id)
+        if s is None:
+            return None
+        sid = s["session_id"]
+        s["default_title"] = s["title"]
+        if sid in titles:
+            s["title"], s["renamed"] = titles[sid], True
+        s["description"] = descriptions.get(sid)
+        s["archived"] = sid in arch_ids
+        s["attention"] = sid in marked
+        s["autonomy"] = autonomy.get(sid)
+        if sid in live_ids:
+            s["live_tmux"] = True
+            _apply_opencode_live(s, sid)
             s["error"] = tmuxio.error_lines().get(sid)
         else:
             s["live_tmux"] = False
@@ -693,13 +817,15 @@ def api_add_task(session_id: str, body: TaskBody):
 
 
 def _last_assistant_text(session_id: str) -> str | None:
-    """The newest assistant message of a claude, grok, or agy session.
+    """The newest assistant message of a claude, grok, opencode, or agy session.
 
     Activities come back newest-first from every parser, so the first assistant
     entry with text is the turn the session stopped on."""
     detail = parser.get_session(session_id)
     if detail is None and grokparser.has_session(session_id):
         detail = grokparser.get_session(session_id)
+    if detail is None and opencodeparser.has_session(session_id):
+        detail = opencodeparser.get_session(session_id)
     if detail is None and agyparser.has_conversation(session_id):
         detail = agyparser.get_conversation(session_id)
     if detail is None:
@@ -861,6 +987,7 @@ def api_tmux(session_id: str):
     `prompt` is non-null only when the live REPL is sitting at a Yes/No/... gate.
     """
     is_agy = agyparser.has_conversation(session_id)
+    is_opencode = not is_agy and opencodeparser.has_session(session_id)
     # For agy, the console pane IS the conversation view (its .db store is lossy),
     # so capture full scrollback once and slice the visible frame from its tail
     # (gate/spinner/input live at the bottom) — one capture, not two.
@@ -874,11 +1001,25 @@ def api_tmux(session_id: str):
         if screen is None:
             return {"session_id": session_id, "has_tmux": False, "prompt": None, "screen": None}
         full = screen
-    # agy gates aren't numbered menus — use the agy gate parser for them.
-    prompt = agyparser.parse_gate(screen) if is_agy else None
-    if prompt is None:
+    # Neither agy nor opencode gates are numbered menus — each has its own
+    # parser. opencode's marks the selected option by colour alone, so its
+    # parser re-captures the pane with ANSI kept (see tmuxio.opencode_pending).
+    if is_agy:
+        prompt = agyparser.parse_gate(screen)
+    elif is_opencode:
+        prompt = tmuxio.opencode_pending(session_id)
+    else:
+        prompt = None
+    if prompt is None and not is_opencode:
         prompt = tmuxio.parse_prompt(screen)
-    spinner = agyparser.spinner_line(screen) if is_agy else tmuxio.spinner_line(screen)
+    # opencode's spinner is bare animated dots — no "what it's thinking" text to
+    # lift out of it, so it stays empty rather than showing noise.
+    if is_agy:
+        spinner = agyparser.spinner_line(screen)
+    elif is_opencode:
+        spinner = None
+    else:
+        spinner = tmuxio.spinner_line(screen)
     # Error/retry banner off the *visible* frame only, so it disappears from the
     # response as soon as the REPL recovers (see tmuxio.error_line).
     return {
@@ -945,7 +1086,8 @@ def api_launchers():
     """Tmux launch scripts for the copy-paste popup. `claude` = runclaude_*.sh
     (per model); `agy` = runagy_*.sh (Antigravity, agy --conversation <id>)."""
     return {"launchers": models.launchers(), "agy": models.agy_launchers(),
-            "grok": models.grok_launchers()}
+            "grok": models.grok_launchers(),
+            "opencode": models.opencode_launchers()}
 
 
 @app.post("/api/sessions/{session_id}/usage")
@@ -966,6 +1108,15 @@ def api_usage(session_id: str):
             result = tmuxio.grok_usage(session_id)
         else:
             result = grokparser.usage_text(session_id)
+    elif opencodeparser.has_session(session_id):
+        # opencode has no /usage command, but it records cost + tokens per
+        # session in its db, so the panel is built from there. An Ollama-hosted
+        # model defers to the ollama.com quota for the same reason as above.
+        oc = opencodeparser.get_summary(session_id)
+        if oc and ollamausage.is_cloud_model(oc.get("model")):
+            result = ollamausage.usage()
+        else:
+            result = opencodeparser.usage_text(session_id)
     elif agyparser.has_conversation(session_id):
         result = tmuxio.agy_usage(session_id)
     else:
@@ -1051,6 +1202,8 @@ def api_say(session_id: str, body: SayBody):
     # Enter as a newline instead of a submit. grok_say settles + verifies.
     if grokparser.has_session(session_id):
         result = tmuxio.grok_say(session_id, body.text)
+    elif opencodeparser.has_session(session_id):
+        result = tmuxio.opencode_say(session_id, body.text)
     else:
         result = tmuxio.say(session_id, body.text)
     if not result.get("ok"):
@@ -1069,8 +1222,14 @@ def api_answer(session_id: str, body: AnswerBody):
 
     For a "No, and tell Claude what to do differently" option, include `text`
     to type the follow-up guidance after selecting it.
+
+    opencode's gate is a horizontal row of options with no free-text choice, so
+    `text` is ignored there.
     """
-    result = tmuxio.answer(session_id, body.choice, body.text)
+    if opencodeparser.has_session(session_id):
+        result = tmuxio.opencode_answer(session_id, body.choice)
+    else:
+        result = tmuxio.answer(session_id, body.choice, body.text)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "answer failed"))
     return result
@@ -1106,7 +1265,13 @@ def api_compact(session_id: str, body: CompactBody = CompactBody()):
     grok has its own /compact and the same command shape, so it only needs the
     grok submit path — its editor debounces keystrokes and swallows an Enter
     sent too soon after the text (see tmuxio.grok_say).
+
+    opencode 1.18 has no /compact — it isn't in the command palette — so there
+    is nothing to run there.
     """
+    if opencodeparser.has_session(session_id):
+        raise HTTPException(status_code=400,
+                            detail="opencode has no /compact command")
     if grokparser.has_session(session_id):
         cmd = "/compact"
         if body.instructions.strip():
@@ -1139,10 +1304,20 @@ def api_reset(session_id: str):
 
     Not available for agy: its conversations aren't identified by anything it
     creates on reset, so there'd be no new id to follow.
+
+    Not available for opencode either, for the mirror-image reason: it does have
+    /new, but it doesn't write the session row until the first turn of that new
+    conversation lands, so there is no new id to follow at reset time — we'd
+    rename nothing and strand the tmux under the old name.
     """
     if agyparser.has_conversation(session_id):
         raise HTTPException(status_code=400,
                             detail="reset is Claude Code and grok only")
+    if opencodeparser.has_session(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail="reset is Claude Code and grok only — opencode does not "
+                   "register a new session until its first turn")
     if grokparser.has_session(session_id):
         # grok keys sessions by directory, so the thing to watch is the
         # project's folder — the parent of this session's own.
@@ -1223,6 +1398,18 @@ def api_triage():
     for s in _grok_summaries(titles, arch_ids, marked, "exclude", live_tmux):
         if not (s["live_tmux"] or s["attention"]):
             continue
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        out.append(s)
+
+    # Include opencode sessions that are live (tmux running) or manually pinned.
+    # _opencode_summaries already set pending_approval off the live pane, so a
+    # gated one only needs its prompt read out of opencode's own gate widget.
+    for s in _opencode_summaries(titles, arch_ids, marked, "exclude", live_tmux):
+        if not (s["live_tmux"] or s["attention"]):
+            continue
+        if s.get("pending_approval"):
+            s["prompt"] = tmuxio.opencode_pending(s["session_id"])
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
         out.append(s)
@@ -1358,6 +1545,14 @@ def triage_page():
 @app.get("/projects.html")
 def projects_page():
     return FileResponse(os.path.join(STATIC_DIR, "projects.html"))
+
+
+@app.get("/favicon.ico")
+def favicon():
+    # Browsers ask for /favicon.ico even when a page links an SVG icon.
+    return FileResponse(
+        os.path.join(STATIC_DIR, "favicon.svg"), media_type="image/svg+xml"
+    )
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

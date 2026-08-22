@@ -125,3 +125,21 @@ def grok_launchers() -> list[dict]:
         key = os.path.basename(path)[len("rungrok_"):-len(".sh")]
         out.append({"key": key, "script": path, "model": "grok"})
     return out
+
+
+def opencode_launchers() -> list[dict]:
+    """The runopencode_<x>.sh scripts — opencode tmux launchers.
+
+    opencode resumes a session with `opencode --session <ses_id>`; the script
+    wraps that (tmux name == session id). `runopencode_base.sh` is the shared
+    machinery those wrappers call, not something you can launch on its own, so
+    it's filtered out the same way runclaude_base.sh is.
+    Returns [{key, script}] sorted by key.
+    """
+    out = []
+    for path in sorted(glob.glob(os.path.join(SCRIPTS_DIR, "runopencode_*.sh"))):
+        key = os.path.basename(path)[len("runopencode_"):-len(".sh")]
+        if key in _NOT_LAUNCHERS:
+            continue
+        out.append({"key": key, "script": path, "model": "opencode"})
+    return out
