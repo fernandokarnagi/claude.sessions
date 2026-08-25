@@ -266,3 +266,73 @@ def delete_workflow(wid: str) -> bool:
             del data["bindings"][sid]
         _save(data)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Composition — a stage rendered as the prompt that actually gets typed.
+# ---------------------------------------------------------------------------
+
+def _join(names: list[str]) -> str:
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def mode_sentence(mode: str, names: list[str]) -> str:
+    """One line telling the session how these agents work together.
+
+    This sentence is the whole difference between a pile of personas and a
+    procedure, so it is spelled out rather than left for the model to infer.
+    """
+    if not names:
+        return "No agents are assigned to this stage."
+    if mode == "solo":
+        return f"Coordination: solo. {names[0]} runs this stage alone."
+    if mode == "coordinator":
+        lead, rest = names[0], names[1:]
+        if not rest:
+            return f"Coordination: coordinator. {lead} runs this stage alone."
+        return (f"Coordination: coordinator. {lead} leads this stage and "
+                f"delegates to {_join(rest)}. {lead} owns the final answer.")
+    if mode == "handoff":
+        return (f"Coordination: hand-off. Run in order: {' → '.join(names)}. "
+                "Each agent takes the previous agent's output as its input.")
+    return (f"Coordination: parallel. {_join(names)} each work the same input "
+            "independently; merge the results at the end.")
+
+
+def compose_stage(wid: str, stage_index: int) -> str:
+    """Render one stage as a single markdown prompt."""
+    wf = get_workflow(wid)
+    if wf is None:
+        raise ValueError("workflow not found")
+    stages = wf.get("stages", [])
+    if not 0 <= stage_index < len(stages):
+        raise ValueError(f"stage index {stage_index} out of range")
+    stage = stages[stage_index]
+    by_id = {a["id"]: a for a in wf.get("agents", [])}
+    taking_part = [by_id[i] for i in stage.get("agent_ids", []) if i in by_id]
+
+    lines = [f"# Workflow: {wf['title']}"]
+    if wf.get("description"):
+        lines.append(wf["description"])
+    lines.append("")
+    lines.append(f"## Stage {stage_index + 1}/{len(stages)}: {stage['name']}")
+    if stage.get("goal"):
+        lines.append(f"Goal: {stage['goal']}")
+    if stage.get("exit_criteria"):
+        lines.append(f"Exit criteria: {stage['exit_criteria']}")
+    lines.append("")
+    lines.append(mode_sentence(stage.get("mode", DEFAULT_MODE),
+                               [a["name"] for a in taking_part]))
+    for a in taking_part:
+        lines.append("")
+        head = f"### {a['name']}"
+        if a.get("role"):
+            head += f" — {a['role']}"
+        lines.append(head)
+        if a.get("model"):
+            lines.append(f"Model: {a['model']}")
+        if a.get("prompt"):
+            lines.append(a["prompt"])
+    return "\n".join(lines).strip() + "\n"
