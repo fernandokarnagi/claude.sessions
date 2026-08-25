@@ -18,14 +18,14 @@ import time
 import uuid
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (agyparser, archives, attention, autonomy, descriptions,
                grokparser, models, ollamausage, opencodeparser, overrides,
                parser, pins, projects, registry, runner, slackbot,
-               summaries, summarizer, tasks, tmuxio)
+               summaries, summarizer, tasks, tmuxio, workflows)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -1545,6 +1545,99 @@ def api_relay(body: RelayBody):
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "relay failed"))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Workflows — reusable multi-agent blueprints (see server/workflows.py).
+# ---------------------------------------------------------------------------
+class WorkflowBody(BaseModel):
+    title: str = ""
+    description: str = ""
+
+
+class WorkflowDocBody(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    agents: list[dict] | None = None
+    stages: list[dict] | None = None
+
+
+class ImportBody(BaseModel):
+    yaml: str = ""
+
+
+class PreviewBody(BaseModel):
+    stage_index: int = 0
+
+
+@app.get("/api/workflows")
+def api_workflows():
+    """All workflows with counts (list page + the assign picker)."""
+    return {"workflows": workflows.list_workflows()}
+
+
+@app.post("/api/workflows")
+def api_create_workflow(body: WorkflowBody):
+    if not body.title.strip():
+        raise HTTPException(status_code=400, detail="title is required")
+    return workflows.create_workflow(body.title, body.description)
+
+
+@app.get("/api/workflows/{wid}")
+def api_workflow(wid: str):
+    wf = workflows.get_workflow(wid)
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return wf
+
+
+@app.put("/api/workflows/{wid}")
+def api_update_workflow(wid: str, body: WorkflowDocBody):
+    """One PUT replaces the whole document — the editor saves on a button, so
+    there is no partial-update case to serve."""
+    try:
+        wf = workflows.update_workflow(wid, title=body.title,
+                                       description=body.description,
+                                       agents=body.agents, stages=body.stages)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if wf is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return wf
+
+
+@app.delete("/api/workflows/{wid}")
+def api_delete_workflow(wid: str):
+    if not workflows.delete_workflow(wid):
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return {"id": wid, "deleted": True}
+
+
+@app.get("/api/workflows/{wid}/export")
+def api_export_workflow(wid: str):
+    text = workflows.to_yaml(wid)
+    if text is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return PlainTextResponse(text, media_type="text/yaml")
+
+
+@app.post("/api/workflows/import")
+def api_import_workflow(body: ImportBody):
+    try:
+        return workflows.from_yaml(body.yaml)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/workflows/{wid}/preview")
+def api_preview_stage(wid: str, body: PreviewBody):
+    """Exactly what a send would type — shown before anything is sent."""
+    if workflows.get_workflow(wid) is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    try:
+        return {"prompt": workflows.compose_stage(wid, body.stage_index)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.get("/")
