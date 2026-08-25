@@ -242,7 +242,7 @@ claude.sessions/
 │   ├── summaries.py         # persisted "what's expected" summaries (keyed by mtime)
 │   ├── summarizer.py        # generates summaries via `claude --print` (isolated + cleaned up)
 │   └── static/              # index.html, session.html, search.html, app.js, style.css
-└── tests/                   # pytest suite (55 tests)
+└── tests/                   # pytest suite (298 tests)
 ```
 
 - **`parser.py`** is pure/file-based and independently testable. Summaries are cached per file
@@ -290,7 +290,7 @@ These hold per-user runtime data. Back them up if you want to preserve renames a
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # run the test suite (55 tests)
+.venv/bin/python -m pytest tests/ -q     # run the test suite (298 tests)
 ```
 
 Static assets are referenced with a `?v=N` query; bump it (and rely on the `no-store` header)
