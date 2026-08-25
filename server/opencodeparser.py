@@ -270,13 +270,108 @@ _SESSION_COLS = ("id, directory, title, model, agent, cost, tokens_input, "
                  "time_created, time_updated, parent_id")
 
 
+# ---- sub-agents --------------------------------------------------------------
+#
+# opencode runs a sub-agent as a real child session (`session.parent_id`) driven
+# by a `task` tool part on the parent. Neither of those touches the parent row,
+# so the parent's time_updated freezes for the whole run — which is why a
+# delegating opencode session used to read WAITING on the board.
+#
+# Two bulk lookups answer it for every session at once: how many task parts are
+# still open, and when each parent's children last wrote. Both scan the whole
+# store (a json_extract over `part` is ~100ms and grows), so they are cached on
+# a short TTL rather than run per session per poll.
+_SUB_TTL = 2.0
+_SUB_BULK: dict[str, object] = {"at": 0.0, "running": {}, "child_mtime": {}}
+
+# A task part is finished once its state reaches one of these; anything else
+# (pending, running, or a state opencode hasn't invented yet) counts as live.
+_DONE_STATES = ("completed", "error")
+
+
+def _bulk_subagents() -> tuple[dict, dict]:
+    """({session_id: running task count}, {parent_id: newest child mtime})."""
+    import time as _time
+    now = _time.monotonic()
+    if now - float(_SUB_BULK["at"]) < _SUB_TTL:
+        return dict(_SUB_BULK["running"]), dict(_SUB_BULK["child_mtime"])  # type: ignore[arg-type]
+    running = {
+        r["session_id"]: int(r["n"])
+        for r in _query(
+            "SELECT session_id, COUNT(*) AS n FROM part "
+            "WHERE json_extract(data,'$.tool') = 'task' "
+            f"AND COALESCE(json_extract(data,'$.state.status'),'') NOT IN {_DONE_STATES} "
+            "GROUP BY session_id")
+    }
+    child = {
+        r["parent_id"]: _ms(r["m"])
+        for r in _query("SELECT parent_id, MAX(time_updated) AS m FROM session "
+                        "WHERE parent_id IS NOT NULL GROUP BY parent_id")
+    }
+    _SUB_BULK["at"], _SUB_BULK["running"], _SUB_BULK["child_mtime"] = now, running, child
+    return dict(running), dict(child)
+
+
+def _apply_subagents(s: dict, sid: str) -> None:
+    """Attach the running sub-agent count and re-age the status around it."""
+    running, child = _bulk_subagents()
+    n = running.get(sid, 0)
+    s["subagents_running"] = n
+    age_from = s["mtime"]
+    if n:
+        age_from = max(age_from, child.get(sid) or 0)
+    s["status"] = claude_parser.compute_status(age_from)
+
+
+def subagents(sid: str) -> list[dict]:
+    """Full sub-agent roster for one session, oldest first (detail view only).
+
+    Joins each `task` part on the parent to the child session it spawned, so the
+    row carries both what was asked (the part's input) and what the run actually
+    cost (the child's tokens). Ordering is by the part's creation time.
+    """
+    children = {
+        r["id"]: r for r in _query(
+            "SELECT id, title, agent, model, time_created, time_updated, "
+            "tokens_input, tokens_output FROM session WHERE parent_id = ?", (sid,))
+    }
+    # opencode does not record which child a task part spawned, so pair them up
+    # in creation order — both lists are per-parent and chronological.
+    kids = sorted(children.values(), key=lambda r: r["time_created"])
+    out = []
+    for i, r in enumerate(_query(
+            "SELECT id, time_created, time_updated, data FROM part "
+            "WHERE session_id = ? AND json_extract(data,'$.tool') = 'task' "
+            "ORDER BY time_created", (sid,))):
+        try:
+            d = json.loads(r["data"])
+        except (ValueError, TypeError):
+            continue
+        state = d.get("state") or {}
+        inp = state.get("input") or {}
+        kid = kids[i] if i < len(kids) else None
+        status = state.get("status")
+        out.append({
+            "agent_id": d.get("callID") or r["id"],
+            "agent_type": inp.get("subagent_type") or (kid["agent"] if kid else "") or "agent",
+            "description": str(inp.get("description") or "")[:120],
+            "running": status not in _DONE_STATES,
+            "status": status,
+            "started_at": _ms(r["time_created"]),
+            "mtime": _ms(r["time_updated"]),
+            "turns": None,
+            "child_session_id": kid["id"] if kid else None,
+        })
+    return out
+
+
 def _summarize(row: sqlite3.Row, step_count: int) -> dict:
     sid = row["id"]
     mtime = _ms(row["time_updated"])
     cached = _SUMM_CACHE.get(sid)
     if cached and cached[0] == row["time_updated"]:
         s = dict(cached[1])
-        s["status"] = claude_parser.compute_status(s["mtime"])
+        _apply_subagents(s, sid)
         return s
 
     cwd = row["directory"]
@@ -309,7 +404,9 @@ def _summarize(row: sqlite3.Row, step_count: int) -> dict:
         "autonomy": "manual",
     }
     _SUMM_CACHE[sid] = (row["time_updated"], summary)
-    return dict(summary)
+    summary = dict(summary)
+    _apply_subagents(summary, sid)
+    return summary
 
 
 # ---- public API (mirrors grokparser) ----------------------------------------
@@ -358,6 +455,7 @@ def get_session(sid: str) -> dict | None:
     acts.reverse()                       # newest first for the history view
     detail = dict(s)
     detail["activities"] = acts
+    detail["subagents"] = subagents(sid)
     return detail
 
 

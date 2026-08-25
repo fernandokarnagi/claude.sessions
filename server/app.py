@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from . import (agyparser, archives, attention, autonomy, descriptions,
                grokparser, models, ollamausage, opencodeparser, overrides,
                parser, pins, projects, registry, runner, slackbot,
-               summaries, summarizer, tasks, tmuxio, workflows)
+               subagents, summaries, summarizer, tasks, tmuxio, workflows)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -57,6 +57,24 @@ _MTIME_EPS = 1.0
 # A live tmux REPL that's merely idle must not age past WAITING — it's still
 # alive and waiting on you. Only once its tmux is killed can it decay further.
 _BEYOND_WAITING = {"SITTING", "SLEEPING", "ENDED"}
+
+
+def _apply_delegating(s: dict) -> dict:
+    """Raise DELEGATING when sub-agents are running. Applied LAST, everywhere.
+
+    Every status path here ends by deciding between THINKING and WAITING off the
+    pane, and a pane whose main agent has handed work to sub-agents looks exactly
+    like an idle one. The parsers already counted the runs still open, so the
+    last word belongs to them.
+
+    Only THINKING/WAITING are overridden. A session that decayed further has been
+    quiet for over half an hour — an unresolved sub-agent call that old is an
+    abandoned run, not live work, and pinning it as busy forever would be worse
+    than the bug this fixes.
+    """
+    if s.get("subagents_running") and s.get("status") in parser.DELEGATABLE:
+        s["status"] = parser.DELEGATING
+    return s
 
 
 def _decorate(summary: dict, web_mtimes: dict, running: set[str],
@@ -129,7 +147,7 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["error"] = errs.get(sid)
     else:
         summary["error"] = None
-    return summary
+    return _apply_delegating(summary)
 
 
 # Sessions that are idle and waiting on the user (the "needs attention" set).
@@ -306,7 +324,7 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
             s["error"] = None
             if s["status"] == "THINKING":
                 s["status"] = "WAITING"      # not live → never surface THINKING
-        out.append(s)
+        out.append(_apply_delegating(s))
     return out
 
 
@@ -344,7 +362,7 @@ def _opencode_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None)
             s["error"] = None
             if s["status"] == "THINKING":
                 s["status"] = "WAITING"      # not live → never surface THINKING
-        out.append(s)
+        out.append(_apply_delegating(s))
     return out
 
 
@@ -415,6 +433,7 @@ def api_session(session_id: str):
                 detail["error"] = None
                 if detail.get("status") == "THINKING":
                     detail["status"] = "WAITING"
+            _apply_delegating(detail)
             titles = overrides.all_titles()
             if session_id in titles:
                 detail["title"], detail["renamed"] = titles[session_id], True
@@ -439,6 +458,7 @@ def api_session(session_id: str):
                 detail["error"] = None
                 if detail.get("status") == "THINKING":
                     detail["status"] = "WAITING"
+            _apply_delegating(detail)
             titles = overrides.all_titles()
             if session_id in titles:
                 detail["title"], detail["renamed"] = titles[session_id], True
@@ -511,6 +531,8 @@ def api_status(session_id: str):
                 s["error"] = tmuxio.error_lines().get(session_id)
             elif s.get("status") == "THINKING":
                 s["status"] = "WAITING"
+            _apply_delegating(s)
+            s["subagents"] = grokparser._subagents(grokparser.session_dir(session_id) or "")
             s["autonomy"] = autonomy.get(session_id)
             s["projects"] = projects.projects_for(session_id)
             t = overrides.get_title(session_id)
@@ -528,6 +550,8 @@ def api_status(session_id: str):
                 s["error"] = tmuxio.error_lines().get(session_id)
             elif s.get("status") == "THINKING":
                 s["status"] = "WAITING"
+            _apply_delegating(s)
+            s["subagents"] = opencodeparser.subagents(session_id)
             s["autonomy"] = autonomy.get(session_id)
             s["projects"] = projects.projects_for(session_id)
             t = overrides.get_title(session_id)
@@ -555,6 +579,13 @@ def api_status(session_id: str):
         s["description"] = descriptions.get(session_id)
         return s
     _decorate(s, registry.web_mtimes(), runner.running_ids())
+    # The detail page merges this over the loaded detail on every poll, so the
+    # sub-agent panel tracks a run as it happens. Affordable for one session;
+    # the board deliberately gets the count only.
+    path = parser.session_path(session_id)
+    if path:
+        s["subagents"] = subagents.for_session(
+            path, set(s.get("open_agent_calls") or {}), deep=True)
     s["autonomy"] = autonomy.get(session_id)
     s["projects"] = projects.projects_for(session_id)
     return s
@@ -590,7 +621,7 @@ async def api_summary(session_id: str):
         raise HTTPException(status_code=404, detail="session not found")
 
     status = detail.get("status")
-    if status == "THINKING":
+    if status in ("THINKING", parser.DELEGATING):
         return {"status": status, "summary": None, "reason": "still working"}
     if status not in _WAITING_STATUSES:
         return {"status": status, "summary": None, "reason": "not waiting"}
@@ -684,7 +715,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
         s["task_count"] = tasks.pending_count(sid)
-        return s
+        return _apply_delegating(s)
     if grokparser.has_session(session_id):
         s = grokparser.get_summary(session_id)
         if s is None:
@@ -707,7 +738,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
         s["task_count"] = tasks.pending_count(sid)
-        return s
+        return _apply_delegating(s)
     if opencodeparser.has_session(session_id):
         s = opencodeparser.get_summary(session_id)
         if s is None:
@@ -730,7 +761,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
             if s.get("status") == "THINKING":
                 s["status"] = "WAITING"
         s["task_count"] = tasks.pending_count(sid)
-        return s
+        return _apply_delegating(s)
     return None
 
 

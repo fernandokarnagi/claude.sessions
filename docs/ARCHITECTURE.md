@@ -63,6 +63,8 @@ The `ix` auto-clustering splits the repo into 14 generic regions all labelled `S
 
 **Status is a recency heuristic, not a lifecycle.** THINKING < 30s, WAITING < 30min, SITTING < 2h, SLEEPING < 24h, else ENDED. Thresholds live at the top of `parser.py`. A transcript that says "session saved" still ages by clock, not by content.
 
+**DELEGATING is the one status that is not about the clock.** Every runtime writes sub-agent turns somewhere other than the session's own transcript — Claude Code into a `<session-id>/subagents/` directory (`subagents.py`), grok into `updates.jsonl` events, opencode into child sessions — so a session delegating an hour of work looks byte-for-byte identical to an abandoned one. Two things follow: the age is measured from the freshest write across the session *and* its sub-agent files, and `app._apply_delegating` raises DELEGATING over THINKING/WAITING as the last step of every status path. It stops at SITTING deliberately: an unanswered sub-agent call older than half an hour is a dead run, and pinning it as busy forever would be worse than the staleness it fixes.
+
 **The gate loop (what makes it a control plane).** `capture_pane` screenshots a live pane; a regex over numbered `❯ N.` rows detects a pending permission prompt and rejects idle/running screens. `pending_ids()` caches a full-fleet scan with a 1s TTL. Three consumers race for that result and they are deliberately not symmetric:
 
 - the **autonomy watcher** applies policy first — `yolo` approves every permission gate, `auto-safe` approves read-only gates and escalates writes and shell commands, `manual` never acts. No level answers a multiple-choice question (a numbered menu with no yes/no in it): that is a decision about the work, not about risk, so it always waits for a human and is posted to Slack even on a `yolo` session;
@@ -171,7 +173,9 @@ graphify path "AttnRail" "WatchCols"
 
 **`server/app.py`** — HTTP surface. FastAPI app, static mounting, `no-store` middleware, background-thread startup, SSE streaming. Contains the Pydantic request bodies (`SendBody`, `ProjectBody`, `TaskBody`, `RelayBody`, `TitleBody`, …) and ~35 `api_*` handlers. Depends on nearly every other server module; almost nothing depends on it. *Change carefully:* `_decorate`, `api_triage`, `event_stream`.
 
-**`server/parser.py`** — transcript reading. Session discovery, summary extraction, status computation, search with glob wildcards, byte-offset tail. Pure functions over files, cached by mtime+size. No dependencies on the rest of the server. *Change carefully:* status thresholds, `list_sessions` return shape.
+**`server/parser.py`** — transcript reading. Session discovery, summary extraction, status computation, search with glob wildcards, byte-offset tail. Pure functions over files, cached by mtime+size. No dependencies on the rest of the server beyond `subagents.py`. *Change carefully:* status thresholds, `list_sessions` return shape.
+
+**`server/subagents.py`** — the sub-agent runs beside a Claude Code transcript. Reads `<session-id>/subagents/agent-*.jsonl` and its `.meta.json` sidecar. Two entry points, split by cost: `latest_mtime` is one `scandir` with no parsing and runs for every session on every board poll; `for_session` parses metadata and is reserved for the detail view. Which runs are *live* is not decided here — it comes from the main transcript's unanswered `Agent`/`Task` calls.
 
 **`server/tmuxio.py`** — terminal driver. Pane capture, gate parsing, key sending, error-line extraction, session listing, spawn (`dispatch`), inter-session `relay`, `kill`. Depends only on the tmux binary. *Change carefully:* `capture_pane`, `parse_prompt`, `_send_keys`.
 
@@ -182,6 +186,8 @@ graphify path "AttnRail" "WatchCols"
 **`server/registry.py`** — WEB/CLI origin, derived from the last web-driven transcript mtime. Lock-guarded, atomic-replace JSON persistence — the template the other state modules follow.
 
 **State modules — `overrides.py`, `attention.py`, `descriptions.py`, `tasks.py`, `projects.py`, `archives.py`, `summaries.py`.** One concern each, one gitignored JSON file each, same load/lock/atomic-save shape. Read one and you have read them all. `tasks.py` and `projects.py` are the largest because they carry real domain structure.
+
+**`server/workflows.py`** — blueprint store: agent rosters, stages, stage→prompt composition, and per-session bindings. Same load/lock/atomic-save shape as the other state modules, gitignored to `.workflows.json`. `app.py` depends on it the way it depends on `projects.py`: CRUD plus YAML import/export for the blueprint, and a thin per-session bind/send/advance surface over the binding. Nothing here spawns a session or drives tmux directly — sending a stage composes a prompt and hands it to `tmuxio.say`.
 
 **`server/summarizer.py`** — generates the "what's expected from you" paragraph via `claude --print` in an isolated cwd, deleting its throwaway transcript so it never shows up in listings. Lazy and cached per waiting episode; spends model quota.
 

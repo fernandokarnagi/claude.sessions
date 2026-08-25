@@ -97,7 +97,7 @@ pytest), and starts uvicorn. Open the URL in your browser. Stop with **Ctrl+C**.
 
 ## Status model
 
-Status is inferred from **time since the transcript was last written** (logs have no explicit
+Status is inferred from **time since the session was last written** (logs have no explicit
 "ended" marker). Tunable constants live at the top of `server/parser.py`:
 
 | Status     | Idle time        | Constant            |
@@ -111,6 +111,28 @@ Status is inferred from **time since the transcript was last written** (logs hav
 The THINKING grace window smooths over pauses between tool calls so the badge doesn't flicker.
 This is a recency heuristic, **not semantic** — a session that printed "Session saved" still
 shows by elapsed time, not by reading the message.
+
+### DELEGATING
+
+**DELEGATING** sits outside that ladder. It means one or more sub-agents are running right
+now, and it overrides THINKING and WAITING (never SITTING or below — an unanswered sub-agent
+call that old is an abandoned run, not live work).
+
+It exists because every runtime parks sub-agent turns somewhere other than the session's own
+transcript, which then goes untouched for the whole run:
+
+| Runtime     | Where sub-agent turns go                             | Still running when…                    |
+|-------------|------------------------------------------------------|----------------------------------------|
+| Claude Code | `<projects>/<cwd>/<session-id>/subagents/agent-*.jsonl` | an `Agent`/`Task` `tool_use` has no `tool_result` yet |
+| grok        | `subagent_spawned` / `subagent_finished` in `updates.jsonl` | spawned with no matching finish        |
+| opencode    | a child session (`session.parent_id`) per run          | the parent's `task` part is not `completed`/`error` |
+
+"Idle time" is therefore measured from the session's freshest write **anywhere** — sub-agent
+files included. Before this, a session delegating an hour of work aged to WAITING after 30
+seconds and sat on the board looking like it needed you.
+
+Sub-agent runs surface as a `⚡ n` badge on the card and a roster on the session page (type,
+what was delegated, running/done, turns, elapsed).
 
 ---
 

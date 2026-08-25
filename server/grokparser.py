@@ -279,7 +279,7 @@ def _summarize(session_dir: str) -> dict | None:
     cached = _SUMM_CACHE.get(session_dir)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         s = dict(cached[2])
-        s["status"] = claude_parser.compute_status(s["mtime"])
+        _apply_subagents(s, session_dir)
         return s
 
     info = _load_json(sp)
@@ -325,7 +325,116 @@ def _summarize(session_dir: str) -> dict | None:
         "autonomy": "manual",
     }
     _SUMM_CACHE[session_dir] = (st.st_mtime, st.st_size, summary)
-    return dict(summary)
+    summary = dict(summary)
+    _apply_subagents(summary, session_dir)
+    return summary
+
+
+def _apply_subagents(s: dict, session_dir: str) -> None:
+    """Attach the running sub-agent count and re-age the status around it.
+
+    summary.json does not move while a sub-agent runs — updates.jsonl does. Ageing
+    off summary.json alone is what let a delegating session read WAITING.
+    """
+    live = [r for r in _subagent_map(session_dir).values() if r["running"]]
+    running = len(live)
+    s["subagents_running"] = running
+    s["subagents_active"] = [r["description"] for r in live if r["description"]][:8]
+    age_from = s["mtime"]
+    if running:
+        try:
+            age_from = max(age_from, os.path.getmtime(_updates_path(session_dir)))
+        except OSError:
+            pass
+    s["status"] = claude_parser.compute_status(age_from)
+
+
+# ---- sub-agents --------------------------------------------------------------
+#
+# grok narrates its own delegation in updates.jsonl: `subagent_spawned` when a
+# run starts, `subagent_finished` when it ends, both carrying the child session
+# id. That is a far better signal than anything in chat_history.jsonl, which
+# stays untouched for the whole run — the reason a delegating grok session used
+# to sit on the board reading WAITING.
+#
+# updates.jsonl is append-only and can reach tens of thousands of lines, so the
+# scan is incremental: parse only the bytes appended since the last look and
+# fold them into the records already held.
+_SUB_CACHE: dict[str, tuple[int, dict]] = {}   # session_dir -> (bytes read, {id: record})
+
+
+def _updates_path(session_dir: str) -> str:
+    return os.path.join(session_dir, "updates.jsonl")
+
+
+def _subagents(session_dir: str) -> list[dict]:
+    """Sub-agent runs for a grok session, oldest first."""
+    return sorted(_subagent_map(session_dir).values(), key=lambda r: r["started_at"] or 0)
+
+
+def _subagent_map(session_dir: str) -> dict:
+    path = _updates_path(session_dir)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    offset, records = _SUB_CACHE.get(session_dir, (0, {}))
+    if offset == size:
+        return records
+    if offset > size:                    # truncated / rotated — start over
+        offset, records = 0, {}
+    records = dict(records)
+    # Binary mode: the cursor is a byte count, and text-mode seek() only accepts
+    # opaque cookies from tell(), not a byte offset.
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            raw = fh.read()
+    except OSError:
+        return records
+    # Leave a partial trailing line for the next pass rather than dropping it.
+    cut = raw.rfind(b"\n")
+    if cut == -1:
+        return records
+    raw = raw[: cut + 1]
+    consumed = offset + len(raw)
+
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except ValueError:
+            continue
+        upd = ((evt.get("params") or {}).get("update") or {})
+        kind = upd.get("sessionUpdate")
+        if kind not in ("subagent_spawned", "subagent_finished"):
+            continue
+        aid = upd.get("subagent_id") or upd.get("child_session_id")
+        if not aid:
+            continue
+        ts = evt.get("timestamp")
+        rec = records.setdefault(aid, {
+            "agent_id": aid, "agent_type": "agent", "description": "",
+            "running": True, "status": None, "started_at": None,
+            "mtime": None, "turns": None, "duration_ms": None, "model": None,
+        })
+        if kind == "subagent_spawned":
+            rec["agent_type"] = upd.get("subagent_type") or rec["agent_type"]
+            rec["description"] = (upd.get("description") or "")[:120]
+            rec["model"] = upd.get("model")
+            rec["started_at"] = ts
+            rec["mtime"] = ts
+            rec["running"] = True
+        else:
+            rec["running"] = False
+            rec["status"] = upd.get("status")
+            rec["turns"] = upd.get("turns")
+            rec["duration_ms"] = upd.get("duration_ms")
+            rec["mtime"] = ts
+    _SUB_CACHE[session_dir] = (consumed, records)
+    return records
 
 
 def _iso_to_epoch(s: str | None) -> float | None:
@@ -436,4 +545,5 @@ def get_session(sid: str) -> dict | None:
     acts.reverse()   # newest first for the history view
     detail = dict(s)
     detail["activities"] = acts
+    detail["subagents"] = _subagents(d)
     return detail
