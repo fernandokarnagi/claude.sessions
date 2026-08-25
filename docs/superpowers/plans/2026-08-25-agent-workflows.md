@@ -6,16 +6,16 @@
 
 **Architecture:** A new `server/workflows.py` store follows the exact pattern of `server/projects.py` — one gitignored JSON file, an `RLock`, atomic tmp+replace writes. A pure `compose_stage()` renders a stage into one markdown prompt. `server/app.py` gains CRUD, YAML import/export, preview, and per-session bind/send/advance routes. The front end adds `workflows.html` plus a `Workflows` controller (list + editor) and a `Workflow` panel on the session detail page. No orchestration, no spawning, no auto-advance.
 
-**Tech Stack:** Python 3.14, FastAPI, Pydantic v2, pytest + `fastapi.testclient`, PyYAML, vanilla ES6 (no build step), plain CSS.
+**Tech Stack:** Python 3.14, FastAPI, Pydantic v2, pytest + `fastapi.testclient` (needs httpx), PyYAML, vanilla ES6 (no build step), plain CSS.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-agent-workflows-design.md`
 
 ## Global Constraints
 
-- Python runs from the repo venv: `.venv/bin/python`, `.venv/bin/pytest`, `.venv/bin/pip`.
+- Python runs from the repo venv. The repo's documented test command is `.venv/bin/python -m pytest` (README.md:196, docs/ARCHITECTURE.md:131) — `-m` is what puts the repo root on `sys.path` so `from server import ...` resolves. Never invoke the bare `.venv/bin/python -m pytest` shim, and never add a `conftest.py` to work around it.
 - Store file is `server/.workflows.json`, gitignored like `.projects.json` — never commit it, never `rm` a real one during testing. Tests always `monkeypatch.setattr(workflows, "_PATH", str(tmp_path / "workflows.json"))`.
 - Store module writes atomically: `json.dump` to `_PATH + ".tmp"`, then `os.replace`. Guard every read/write with a module-level `threading.RLock()`.
-- New dependency, and the only one: `pyyaml>=6.0` in `requirements.txt`.
+- New dependencies: `pyyaml>=6.0` (the feature) and `httpx>=0.27` (what `fastapi.testclient` imports; absent from the venv today, which is why `tests/test_pins.py` currently fails to collect). Both added in Task 4.
 - Coordination modes are exactly `("coordinator", "handoff", "parallel", "solo")`.
 - Workflow ids are `uuid.uuid4().hex[:12]`. Stage ids are `s<n>` where `n` is one past the highest number already used in that workflow; ids are never reused and never rewritten.
 - Agent `model` defaults to `"opus"` and is never validated against a model list.
@@ -216,7 +216,7 @@ def test_corrupt_file_reads_as_empty(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_workflows.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflows.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'server.workflows'`
 
 - [ ] **Step 3: Write the store**
@@ -496,7 +496,7 @@ def delete_workflow(wid: str) -> bool:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_workflows.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflows.py -v`
 Expected: PASS (17 tests)
 
 - [ ] **Step 5: Gitignore the store file**
@@ -635,7 +635,7 @@ def test_unknown_workflow():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_compose.py -v`
+Run: `.venv/bin/python -m pytest tests/test_compose.py -v`
 Expected: FAIL — `AttributeError: module 'server.workflows' has no attribute 'compose_stage'`
 
 - [ ] **Step 3: Implement composition**
@@ -715,7 +715,7 @@ def compose_stage(wid: str, stage_index: int) -> str:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_compose.py -v`
+Run: `.venv/bin/python -m pytest tests/test_compose.py -v`
 Expected: PASS (9 tests)
 
 - [ ] **Step 5: Commit**
@@ -879,7 +879,7 @@ def test_rekey_does_not_clobber_an_existing_binding(wid):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_workflow_bindings.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_bindings.py -v`
 Expected: FAIL — `AttributeError: module 'server.workflows' has no attribute 'bind'`
 
 - [ ] **Step 3: Implement bindings**
@@ -1009,7 +1009,7 @@ def rekey(old_id: str, new_id: str) -> None:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_workflow_bindings.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_bindings.py -v`
 Expected: PASS (13 tests)
 
 - [ ] **Step 5: Commit**
@@ -1032,17 +1032,25 @@ git commit -m "feat(workflows): bind a workflow to a session with a stage pointe
 - Consumes: `get_workflow`, `create_workflow`, `update_workflow`, `validate` from Tasks 1–3.
 - Produces: `to_yaml(wid: str) -> str | None`; `from_yaml(text: str) -> dict` (raises `ValueError`).
 
-- [ ] **Step 1: Add the dependency**
+- [ ] **Step 1: Add the dependencies**
 
 Append to `requirements.txt`:
 
 ```
 pyyaml>=6.0
+httpx>=0.27
 ```
 
-Install it: `.venv/bin/pip install "pyyaml>=6.0"`
-Verify: `.venv/bin/python -c "import yaml; print(yaml.__version__)"`
-Expected: a version at or above `6.0`.
+`pyyaml` is what this feature needs. `httpx` is what `fastapi.testclient.TestClient` needs: it is missing from both `requirements.txt` and the venv today, so every TestClient test in the repo — the existing `tests/test_pins.py` included — fails at collection with `RuntimeError: The starlette.testclient module requires the httpx package`. Tasks 5 and 6 are TestClient tests, so the suite has to be able to collect them.
+
+Install both: `.venv/bin/pip install "pyyaml>=6.0" "httpx>=0.27"`
+Verify:
+
+```bash
+.venv/bin/python -c "import yaml, httpx; print(yaml.__version__, httpx.__version__)"
+```
+
+Expected: yaml at or above `6.0`, httpx at or above `0.27`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1145,7 +1153,7 @@ def test_import_without_ids_mints_them():
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_workflow_yaml.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_yaml.py -v`
 Expected: FAIL — `AttributeError: module 'server.workflows' has no attribute 'to_yaml'`
 
 - [ ] **Step 4: Implement export and import**
@@ -1203,12 +1211,12 @@ def from_yaml(text: str) -> dict:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_workflow_yaml.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_yaml.py -v`
 Expected: PASS (9 tests)
 
 - [ ] **Step 6: Run the whole suite**
 
-Run: `.venv/bin/pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: everything passes, no new failures.
 
 - [ ] **Step 7: Commit**
@@ -1344,7 +1352,7 @@ def test_preview_out_of_range_is_400(client):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_workflow_api.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_api.py -v`
 Expected: FAIL — every request returns 404 (routes do not exist).
 
 - [ ] **Step 3: Add the routes**
@@ -1462,7 +1470,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_workflow_api.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_api.py -v`
 Expected: PASS (12 tests)
 
 - [ ] **Step 5: Commit**
@@ -1616,7 +1624,7 @@ def test_unassign(client, wid):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_workflow_session_api.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_session_api.py -v`
 Expected: FAIL — the `/api/sessions/{sid}/workflow` routes return 404.
 
 - [ ] **Step 3: Add the routes**
@@ -1701,7 +1709,7 @@ def api_advance_stage(session_id: str, body: AdvanceBody):
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_workflow_session_api.py -v`
+Run: `.venv/bin/python -m pytest tests/test_workflow_session_api.py -v`
 Expected: PASS (11 tests)
 
 - [ ] **Step 5: Carry the binding through a /clear**
@@ -1753,7 +1761,7 @@ def test_sessions_list_carries_the_binding(client, wid, monkeypatch):
 
 - [ ] **Step 8: Run the whole suite**
 
-Run: `.venv/bin/pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: everything passes.
 
 - [ ] **Step 9: Commit**
@@ -2229,7 +2237,7 @@ Reload `http://localhost:8765/workflows.html?id=<wid>`. Check: adding an agent, 
 
 - [ ] **Step 4: Run the suite**
 
-Run: `.venv/bin/pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: all green (this task is front-end only, but the suite must stay clean).
 
 - [ ] **Step 5: Commit**
@@ -2444,7 +2452,7 @@ Then, on a session that does have a live pane, press "▶ Send stage" once and c
 
 - [ ] **Step 7: Run the suite**
 
-Run: `.venv/bin/pytest -q`
+Run: `.venv/bin/python -m pytest -q`
 Expected: all green.
 
 - [ ] **Step 8: Commit**
@@ -2503,7 +2511,7 @@ git commit -m "docs: workflows module"
 
 After Task 10, the whole feature is checkable in one pass:
 
-- [ ] `.venv/bin/pytest -q` — all tests pass, including the five new files.
+- [ ] `.venv/bin/python -m pytest tests/ -q` — all tests pass, including the five new files.
 - [ ] `git status` — `server/.workflows.json` does not appear (it is ignored).
 - [ ] A workflow defined in the UI, exported to YAML, deleted, and re-imported produces the same agents and stages.
 - [ ] A session with that workflow assigned shows the correct stage prompt, sends it into a live REPL, and advances.
