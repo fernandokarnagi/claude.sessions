@@ -19,6 +19,7 @@ server/.autonomy.json
 server/.projects.json
 server/.tasks.json
 server/.pins.json
+server/.workflows.json
 server/.ollama_usage.json
 server/.descriptions.json
 server/.*.tmp
