@@ -164,6 +164,7 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     levels = autonomy.all()
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
+    wf_map = workflows.bindings_by_session()
     for s in data["sessions"]:
         _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
         sid = s["session_id"]
@@ -171,6 +172,7 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["projects"] = proj_map.get(sid, [])
         s["task_count"] = task_counts.get(sid, 0)
+        s["workflow"] = wf_map.get(sid)
 
     # Merge in Antigravity (agy) + grok sessions — read-only, already summary-shaped.
     marked = attention.marked_ids()
@@ -179,18 +181,21 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
             continue
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         data["sessions"].append(s)
     for s in _grok_summaries(titles, arch_ids, marked, mode, live_tmux):
         if statuses and s["status"] not in statuses:
             continue
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         data["sessions"].append(s)
     for s in _opencode_summaries(titles, arch_ids, marked, mode, live_tmux):
         if statuses and s["status"] not in statuses:
             continue
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         data["sessions"].append(s)
     data["sessions"].sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     data["total"] = len(data["sessions"])
@@ -1370,7 +1375,7 @@ def api_reset(session_id: str):
     # the exact loss this endpoint exists to prevent.
     if new_id and new_id != session_id:
         for store in (overrides, descriptions, tasks, pins, projects, autonomy,
-                      attention):
+                      attention, workflows):
             store.rekey(session_id, new_id)
     if not result.get("ok"):
         # Retiring the old id is deliberately *not* done here. A failed rename
@@ -1400,6 +1405,7 @@ def api_triage():
     levels = autonomy.all()
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
+    wf_map = workflows.bindings_by_session()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
@@ -1417,6 +1423,7 @@ def api_triage():
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
         s["projects"] = proj_map.get(sid, [])
         s["task_count"] = task_counts.get(sid, 0)
+        s["workflow"] = wf_map.get(sid)
         out.append(s)
 
     # Include agy conversations that are live or manually pinned.
@@ -1427,6 +1434,7 @@ def api_triage():
             s["prompt"] = tmuxio.pending(s["session_id"])
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         out.append(s)
 
     # Include grok sessions that are live (tmux running) or manually pinned.
@@ -1435,6 +1443,7 @@ def api_triage():
             continue
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         out.append(s)
 
     # Include opencode sessions that are live (tmux running) or manually pinned.
@@ -1447,6 +1456,7 @@ def api_triage():
             s["prompt"] = tmuxio.opencode_pending(s["session_id"])
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
+        s["workflow"] = wf_map.get(s["session_id"])
         out.append(s)
 
     # Gated (needs-approval) always on top; otherwise A→Z by title.
@@ -1643,6 +1653,81 @@ def api_preview_stage(wid: str, body: PreviewBody):
         return {"prompt": workflows.compose_stage(wid, body.stage_index)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+class AssignBody(BaseModel):
+    workflow_id: str
+
+
+class AdvanceBody(BaseModel):
+    delta: int = 1
+
+
+def _binding_view(session_id: str) -> dict:
+    """Binding plus the prompt the current stage would send. One call, because
+    the panel never wants one without the other."""
+    b = workflows.get_binding(session_id)
+    if b is None:
+        return {"bound": False}
+    out = dict(b)
+    out["bound"] = True
+    stage_id = ""
+    wf = workflows.get_workflow(b["workflow_id"])
+    stages = (wf or {}).get("stages", [])
+    if stages:
+        stage_id = stages[b["stage_index"]]["id"]
+        out["prompt"] = workflows.compose_stage(b["workflow_id"], b["stage_index"])
+    else:
+        out["prompt"] = ""
+    out["stage_id"] = stage_id
+    out["sent"] = stage_id in b.get("sent", [])
+    return out
+
+
+@app.get("/api/sessions/{session_id}/workflow")
+def api_session_workflow(session_id: str):
+    return _binding_view(session_id)
+
+
+@app.post("/api/sessions/{session_id}/workflow")
+def api_assign_workflow(session_id: str, body: AssignBody):
+    if not _session_exists(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    if workflows.bind(session_id, body.workflow_id) is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return _binding_view(session_id)
+
+
+@app.delete("/api/sessions/{session_id}/workflow")
+def api_unassign_workflow(session_id: str):
+    workflows.unbind(session_id)
+    return {"session_id": session_id, "bound": False}
+
+
+@app.post("/api/sessions/{session_id}/workflow/send")
+def api_send_stage(session_id: str):
+    """Type the current stage's composed prompt into the live REPL.
+
+    Sending is always a button press: assigning a workflow costs nothing, and
+    the operator decides when a stage actually runs.
+    """
+    view = _binding_view(session_id)
+    if not view.get("bound"):
+        raise HTTPException(status_code=409, detail="no workflow assigned")
+    if not view.get("prompt"):
+        raise HTTPException(status_code=409, detail="this workflow has no stages")
+    result = tmuxio.say(session_id, view["prompt"])
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error", "send failed"))
+    workflows.mark_sent(session_id, view["stage_id"])
+    return _binding_view(session_id)
+
+
+@app.post("/api/sessions/{session_id}/workflow/advance")
+def api_advance_stage(session_id: str, body: AdvanceBody):
+    if workflows.advance(session_id, body.delta) is None:
+        raise HTTPException(status_code=404, detail="no workflow assigned")
+    return _binding_view(session_id)
 
 
 @app.get("/")
