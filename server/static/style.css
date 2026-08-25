@@ -1216,3 +1216,17 @@ body.world-page { overflow: hidden; }
 
 /* ---- Workflows -------------------------------------------------------- */
 .modal-input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.wf-editor { padding: 12px 16px; display: flex; flex-direction: column; gap: 14px; }
+.wf-title-input { font-size: 20px; font-weight: 600; width: 100%; padding: 6px 8px;
+  background: transparent; color: var(--text); border: 1px solid transparent; border-radius: 6px; }
+.wf-title-input:focus { border-color: var(--accent); outline: none; }
+.wf-section { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; font-size: 15px; }
+.wf-agents, .wf-stages { display: flex; flex-direction: column; gap: 10px; }
+.wf-agent, .wf-stage { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; }
+.wf-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wf-input { padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font: inherit; }
+.wf-input.wide { width: 100%; }
+.wf-input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.wf-picks { display: flex; flex-wrap: wrap; gap: 10px; }
+.wf-pick { display: flex; align-items: center; gap: 4px; font-size: 13px; }
