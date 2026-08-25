@@ -18,6 +18,8 @@ server/.adopted.json
 server/.autonomy.json
 server/.projects.json
 server/.tasks.json
+server/.pins.json
+server/.workflows.json
 server/.ollama_usage.json
 server/.descriptions.json
 server/.*.tmp
@@ -39,3 +41,6 @@ graphify-out/
 
 # Claude Code local config (embeds absolute machine paths)
 .claude/
+
+# Playwright MCP scratch output (console/page dumps from browser debugging)
+.playwright-mcp/

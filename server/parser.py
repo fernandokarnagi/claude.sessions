@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from . import models
+from . import subagents
 
 # ---- Tunable constants -------------------------------------------------------
 
@@ -70,12 +71,24 @@ def _resolve_model(model, full_by_base, last_full):
     return models.canonical(model) or model
 
 # Status thresholds, in seconds, based on time since the file was last written.
+# "Written" means the session's freshest write anywhere — the transcript itself
+# OR one of its sub-agent transcripts, which live in a sibling directory and are
+# the only thing moving while the session delegates (see subagents.py).
 # Tiers (each is the UPPER bound of that status):
 THINKING_MAX_AGE = 30            # < 30s        -> THINKING (actively working)
 WAITING_MAX_AGE = 30 * 60        # 30s … 30min  -> WAITING
 SITTING_MAX_AGE = 2 * 3600       # 30min … 2h   -> SITTING
 SLEEPING_MAX_AGE = 24 * 3600     # 2h … 24h     -> SLEEPING
 # >= 24h -> ENDED (logs have no real end-marker; this is an idle assumption)
+
+# DELEGATING sits outside the age ladder: it is not an idle tier but a fact about
+# what the session is doing — one or more sub-agents are running right now. It
+# overrides THINKING and WAITING (see app._apply_delegating) so a board full of
+# "waiting" sessions no longer hides the ones that are busy in the background.
+# It deliberately does NOT override SITTING and below: an abandoned session whose
+# sub-agent call never got a result would otherwise be pinned as busy forever.
+DELEGATING = "DELEGATING"
+DELEGATABLE = {"THINKING", "WAITING"}
 
 PREVIEW_LEN = 160              # truncation for activity/result previews
 
@@ -248,6 +261,11 @@ def _build_summary(path: str) -> dict:
     last_has_text = False  # last assistant message has real text (a reply)
     tokens = Tokens()
     recent: list[dict] = []  # rolling list of rendered activities
+    # Agent/Task tool_use ids that have not been answered by a tool_result yet.
+    # Each one is a sub-agent still running: Claude Code writes the call here and
+    # nothing else until the run finishes, so this set — not the file's mtime —
+    # is what tells us the session is delegating rather than idle.
+    open_agents: dict[str, str] = {}   # tool_use_id -> description
 
     for evt in _iter_events(path):
         etype = evt.get("type")
@@ -306,6 +324,22 @@ def _build_summary(path: str) -> dict:
                     (isinstance(content, str) and bool(content.strip()))
                     or any(isinstance(b, dict) and b.get("type") == "text"
                            and (b.get("text") or "").strip() for b in blocks))
+            # Sub-agent bookkeeping, over the WHOLE transcript (the block
+            # above only tracks the last message). Sidechains are excluded for
+            # the same reason: a nested call belongs to its own run, not to the
+            # main thread's ledger of who it is waiting on.
+            if not evt.get("isSidechain"):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "tool_use" and b.get("name") in subagents.AGENT_TOOLS:
+                            inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                            open_agents[b.get("id") or ""] = str(inp.get("description") or "")
+                        elif b.get("type") == "tool_result":
+                            open_agents.pop(b.get("tool_use_id") or "", None)
+
             usage = msg.get("usage")
             if isinstance(usage, dict):
                 tokens.input += usage.get("input_tokens", 0) or 0
@@ -347,6 +381,10 @@ def _build_summary(path: str) -> dict:
         "updated_at": last_ts or _iso(mtime),
         "tokens": tokens.as_dict(),
         "last_activities": recent,
+        # {tool_use_id: description} for sub-agents with no result yet. Cached
+        # with the rest of the summary — resolving a call requires a write, so
+        # the cache invalidates exactly when this could change.
+        "open_agent_calls": {k: v for k, v in open_agents.items() if k},
     }
 
 
@@ -369,9 +407,28 @@ def _summary_for(path: str) -> Optional[dict]:
         _summary_cache[path] = (st.st_mtime, st.st_size, summary)
     # Age-based status; the live-tmux turn override (THINKING) is applied in
     # _decorate, which knows whether the session is live.
-    summary["status"] = compute_status(st.st_mtime)
+    #
+    # The age is measured from the freshest write ANYWHERE in the session, not
+    # just the transcript. While sub-agents run, the transcript is untouched and
+    # only their own files move — measuring the transcript alone is what made a
+    # delegating session decay to WAITING after 30s while it was hard at work.
     summary["mtime"] = st.st_mtime
+    open_calls = summary.get("open_agent_calls") or {}
+    sub_mtime = subagents.latest_mtime(path) if (open_calls or _has_subagents(path)) else 0.0
+    summary["subagent_mtime"] = sub_mtime or None
+    summary["status"] = compute_status(max(st.st_mtime, sub_mtime))
+    # Authoritative from the transcript, not the directory: a run that was just
+    # spawned has an open call before its files exist.
+    summary["subagents_running"] = len(open_calls)
+    # Descriptions of the runs in flight — the board badge's tooltip, so you can
+    # see WHAT is being delegated without opening the session.
+    summary["subagents_active"] = [v for v in open_calls.values() if v][:8]
     return summary
+
+
+def _has_subagents(path: str) -> bool:
+    """Cheap existence check so the common (no sub-agents) session costs one stat."""
+    return os.path.isdir(subagents.dir_for(path))
 
 
 def list_sessions(limit: Optional[int] = 10, offset: int = 0,
@@ -547,6 +604,11 @@ def get_session(session_id: str) -> Optional[dict]:
 
     detail = dict(summary)
     detail["activities"] = activities
+    # Full sub-agent roster (finished runs included) — the detail page lists
+    # them. The board only ever gets the running count, because parsing every
+    # session's meta files on a 1.5s poll is not worth a badge.
+    detail["subagents"] = subagents.for_session(
+        path, set(summary.get("open_agent_calls") or {}), deep=True)
     try:
         detail["file_size"] = os.path.getsize(path)  # tail starting offset
     except OSError:

@@ -97,7 +97,7 @@ pytest), and starts uvicorn. Open the URL in your browser. Stop with **Ctrl+C**.
 
 ## Status model
 
-Status is inferred from **time since the transcript was last written** (logs have no explicit
+Status is inferred from **time since the session was last written** (logs have no explicit
 "ended" marker). Tunable constants live at the top of `server/parser.py`:
 
 | Status     | Idle time        | Constant            |
@@ -111,6 +111,28 @@ Status is inferred from **time since the transcript was last written** (logs hav
 The THINKING grace window smooths over pauses between tool calls so the badge doesn't flicker.
 This is a recency heuristic, **not semantic** — a session that printed "Session saved" still
 shows by elapsed time, not by reading the message.
+
+### DELEGATING
+
+**DELEGATING** sits outside that ladder. It means one or more sub-agents are running right
+now, and it overrides THINKING and WAITING (never SITTING or below — an unanswered sub-agent
+call that old is an abandoned run, not live work).
+
+It exists because every runtime parks sub-agent turns somewhere other than the session's own
+transcript, which then goes untouched for the whole run:
+
+| Runtime     | Where sub-agent turns go                             | Still running when…                    |
+|-------------|------------------------------------------------------|----------------------------------------|
+| Claude Code | `<projects>/<cwd>/<session-id>/subagents/agent-*.jsonl` | an `Agent`/`Task` `tool_use` has no `tool_result` yet |
+| grok        | `subagent_spawned` / `subagent_finished` in `updates.jsonl` | spawned with no matching finish        |
+| opencode    | a child session (`session.parent_id`) per run          | the parent's `task` part is not `completed`/`error` |
+
+"Idle time" is therefore measured from the session's freshest write **anywhere** — sub-agent
+files included. Before this, a session delegating an hour of work aged to WAITING after 30
+seconds and sat on the board looking like it needed you.
+
+Sub-agent runs surface as a `⚡ n` badge on the card and a roster on the session page (type,
+what was delegated, running/done, turns, elapsed).
 
 ---
 
@@ -126,6 +148,102 @@ subprocess `cwd` set to the session's project, streaming events back over SSE. P
   the session init event. A session can switch backends across a resume.
 - Tool permissions use a **mode dropdown** (acceptEdits / plan / bypassPermissions / default),
   since headless mode can't show the interactive TUI prompt.
+
+---
+
+## Workflows
+
+A **workflow** is a stored blueprint, not a running process: a titled agent
+roster plus an ordered list of stages. Defining or assigning one never spawns
+a session, routes a hand-off, or auto-advances anything — a human drives every
+step by hand.
+
+- **Agents** — each has an id, a name, a model, a role, and a system prompt.
+  Reusable across stages: a stage names which agents take part by id.
+- **Stages** — each has a name, a goal, exit criteria, a coordination **mode**,
+  and the agent ids assigned to it.
+
+### Coordination modes
+
+Mode is set per stage, not per workflow — a real procedure researches in
+parallel and then writes solo. Sending a stage composes it into one markdown
+prompt; the mode decides the line that tells the session how its agents work
+together:
+
+| Mode | What it renders |
+|------|------------------|
+| `solo` (default) | One agent runs the stage alone. |
+| `coordinator` | The first agent leads and delegates to the rest; it owns the final answer. |
+| `handoff` | Agents run in listed order, each taking the previous agent's output as its input. |
+| `parallel` | All agents work the same input independently; merge the results at the end. |
+
+### Assigning and driving a workflow
+
+Assign a workflow to a session from the **workflow panel** on its detail page
+(`/session.html?id=…`) — pick one from the dropdown. This creates a
+**binding**: which workflow, which stage index, nothing more. One workflow per
+session; assigning a new one replaces the binding.
+
+From there, everything is manual, one stage at a time:
+
+- **▶ Send stage** composes the current stage's prompt (goal, exit criteria,
+  the mode sentence, and each participating agent's role/model/prompt) and
+  types it into the session's live tmux pane — the same as typing it yourself.
+- **✓ Advance** moves the stage pointer forward. It does not send anything.
+
+Sending never advances the pointer; advancing never sends a prompt. A `/clear`
+on a bound session carries the binding onto the new session id, so the
+workflow and stage survive.
+
+### YAML import / export
+
+Workflows export to a small YAML file you can review, diff, and keep in git.
+Importing always creates a **new** workflow — it never overwrites one that
+already exists. Ids are optional on import, and the two kinds are filled in
+differently when left blank: an agent id is slugified from the agent's name,
+while a stage id is the next free `s<n>` — `s1`, `s2`, … — which owes nothing
+to the stage's name. Stage numbers are never recycled, because a binding
+remembers by id which stages it has already sent.
+
+```yaml
+title: Feature delivery
+description: Design, implement, and review one feature end to end.
+agents:
+  - id: architect
+    name: Architect
+    role: Designs the approach before code is written
+    model: opus
+    prompt: You design before you code. Produce a short plan and call out risks.
+  - id: builder
+    name: Builder
+    role: Implements the plan
+    model: sonnet
+    prompt: You implement the architect's plan. Keep diffs small and tested.
+  - id: reviewer
+    name: Reviewer
+    role: Checks the diff for correctness and style
+    model: sonnet
+    prompt: You review the builder's diff. Be specific — cite file and line.
+stages:
+  - id: s1
+    name: Design
+    goal: Agree on the approach before touching code.
+    mode: solo
+    agent_ids: [architect]
+    exit_criteria: A short written plan exists.
+  - id: s2
+    name: Build
+    goal: Implement the plan.
+    mode: solo
+    agent_ids: [builder]
+    exit_criteria: Tests pass locally.
+  - id: s3
+    name: Review
+    goal: Catch problems before merge.
+    mode: handoff
+    agent_ids: [builder, reviewer]
+    exit_criteria: Reviewer approves or lists required changes.
+```
 
 ---
 
@@ -146,7 +264,7 @@ claude.sessions/
 │   ├── summaries.py         # persisted "what's expected" summaries (keyed by mtime)
 │   ├── summarizer.py        # generates summaries via `claude --print` (isolated + cleaned up)
 │   └── static/              # index.html, session.html, search.html, app.js, style.css
-└── tests/                   # pytest suite (55 tests)
+└── tests/                   # pytest suite (298 tests)
 ```
 
 - **`parser.py`** is pure/file-based and independently testable. Summaries are cached per file
@@ -171,6 +289,7 @@ claude.sessions/
 - `server/.web_sessions.json` — per-session mtime of the last web-driven turn (WEB/CLI origin).
 - `server/.title_overrides.json` — your custom session titles.
 - `server/.waiting_summaries.json` — cached "what's expected" summaries.
+- `server/.workflows.json` — workflow blueprints (agent rosters, stages) and their per-session bindings.
 
 These hold per-user runtime data. Back them up if you want to preserve renames across machines.
 
@@ -193,7 +312,7 @@ These hold per-user runtime data. Back them up if you want to preserve renames a
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # run the test suite (55 tests)
+.venv/bin/python -m pytest tests/ -q     # run the test suite (298 tests)
 ```
 
 Static assets are referenced with a `?v=N` query; bump it (and rely on the `no-store` header)

@@ -413,13 +413,16 @@ def _watch() -> None:
 
             gated = tmuxio.pending_ids()
             for sid in gated - set(_gates):
-                # Sessions on auto-safe/yolo are handled by the autonomy
-                # watcher; only post a manual gate for the human to answer.
-                if autonomy.get(sid) != "manual":
-                    continue
                 p = tmuxio.pending(sid)
-                if p:
-                    _post_gate(sid, p)
+                if not p:
+                    continue
+                # Sessions on auto-safe/yolo are handled by the autonomy
+                # watcher — except for a multiple-choice question, which no
+                # level answers. That one still needs a human, so it gets
+                # posted whatever the level says.
+                if autonomy.get(sid) != "manual" and not autonomy.is_choice(p):
+                    continue
+                _post_gate(sid, p)
             for sid in set(_gates) - gated:
                 _resolve_gate(sid, "answered / dismissed in terminal")
 

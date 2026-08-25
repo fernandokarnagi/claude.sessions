@@ -280,7 +280,7 @@ def build() -> Any:
     # one through the closure and recurse into itself.
     @mcp.tool(name="fleet_status")
     def fleet_status_tool(live_only: bool = True, limit: int = MAX_SESSIONS) -> dict:
-        """List the other Claude Code / agy / grok sessions running on this
+        """List the other Claude Code / agy / grok / opencode sessions on this
         machine right now: title, status, model, working directory, whether one
         is blocked on a permission prompt.
 
