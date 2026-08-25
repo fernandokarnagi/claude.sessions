@@ -6,11 +6,14 @@ tokens are spent. What is checked is that the composed prompt is what
 reaches say, and that a dead pane reports 409.
 """
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
+from server import agyparser, grokparser, opencodeparser
 from server import app as app_module
-from server import tmuxio, workflows
+from server import parser, tmuxio, workflows
 from server.app import app
 
 SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -104,6 +107,9 @@ def test_send_without_a_binding_is_409(client, sent):
 
 def test_advance_and_clamp(client, wid):
     client.post(f"/api/sessions/{SID}/workflow", json={"workflow_id": wid})
+    # The lower clamp: a negative delta from stage 0 must not go negative.
+    r = client.post(f"/api/sessions/{SID}/workflow/advance", json={"delta": -1})
+    assert r.json()["stage_index"] == 0
     r = client.post(f"/api/sessions/{SID}/workflow/advance", json={"delta": 1})
     assert r.json()["stage_index"] == 1 and r.json()["stage_name"] == "Review"
     r = client.post(f"/api/sessions/{SID}/workflow/advance", json={"delta": 1})
@@ -123,11 +129,32 @@ def test_unassign(client, wid):
     assert client.get(f"/api/sessions/{SID}/workflow").json() == {"bound": False}
 
 
-def test_sessions_list_carries_the_binding(client, wid, monkeypatch):
+def test_sessions_list_carries_the_binding(client, wid, monkeypatch, tmp_path):
     """The board badge reads this field, so it must survive the decorate pass."""
+    monkeypatch.setattr(parser, "PROJECTS_DIR", str(tmp_path))
+    parser._summary_cache.clear()
+    p = tmp_path / "-proj"; p.mkdir()
+    (p / f"{SID}.jsonl").write_text(json.dumps({
+        "type": "user", "timestamp": "2026-05-31T10:00:00.000Z", "cwd": "/proj",
+        "message": {"role": "user", "content": "hi"}}) + "\n")
+
+    # api_sessions also merges in agy/grok/opencode sessions, each backed by its
+    # own real directory on disk (and agy's reconcile pass captures real tmux
+    # panes) — point every one of them away from the operator's machine too.
+    monkeypatch.setattr(agyparser, "CONV_DIR", str(tmp_path / "agy"))
+    monkeypatch.setattr(agyparser, "reconcile_tmux_names", lambda: {})
+    agyparser._SUMM_CACHE.clear()
+    monkeypatch.setattr(grokparser, "SESS_ROOT", str(tmp_path / "grok"))
+    grokparser._DIR_CACHE.clear()
+    grokparser._SUMM_CACHE.clear()
+    grokparser._TS_CACHE.clear()
+    monkeypatch.setattr(opencodeparser, "DATA_DIR", str(tmp_path / "opencode"))
+    opencodeparser._SUMM_CACHE.clear()
+
     workflows.bind(SID, wid)
     rows = client.get("/api/sessions?limit=all&archived=all").json()["sessions"]
     for row in rows:
         assert "workflow" in row
-        if row["session_id"] == SID:
-            assert row["workflow"]["title"] == "Feature delivery"
+    matches = [row for row in rows if row["session_id"] == SID]
+    assert matches, "seeded session did not come back in the list"
+    assert matches[0]["workflow"]["title"] == "Feature delivery"
