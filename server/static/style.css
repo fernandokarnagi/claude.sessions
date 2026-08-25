@@ -1213,3 +1213,6 @@ body.world-page { overflow: hidden; }
 .pin-row .task-text .md { font: 13px/1.6 -apple-system, BlinkMacSystemFont,
   "Segoe UI", Roboto, sans-serif; }
 .pin-badge { color: var(--accent); border-color: rgba(88,166,255,.5) !important; font-weight: 600; }
+
+/* ---- Workflows -------------------------------------------------------- */
+.modal-input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }

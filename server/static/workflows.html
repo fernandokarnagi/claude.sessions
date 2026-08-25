@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Projects · Agent OS</title>
+  <title>Workflows · Agent OS</title>
   <link rel="icon" href="/static/favicon.svg?v=1" type="image/svg+xml" />
   <link rel="stylesheet" href="/static/style.css?v=169" />
 </head>
@@ -11,11 +11,12 @@
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
-    <button class="toggle" id="newProjectBtn" title="Create a new project">✨ New project</button>
+    <button class="toggle" id="importWfBtn" title="Create a workflow from a YAML file">⬆ Import YAML</button>
+    <button class="toggle" id="newWorkflowBtn" title="Create a new workflow">✨ New workflow</button>
     <span class="meta" id="meta"></span>
   </header>
   <div id="view"></div>
   <script src="/static/app.js?v=169"></script>
-  <script>renderTopNav("projects"); Projects.init();</script>
+  <script>renderTopNav("workflows"); Workflows.init();</script>
 </body>
 </html>

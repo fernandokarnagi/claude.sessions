@@ -1765,6 +1765,11 @@ def projects_page():
     return FileResponse(os.path.join(STATIC_DIR, "projects.html"))
 
 
+@app.get("/workflows.html")
+def workflows_page():
+    return FileResponse(os.path.join(STATIC_DIR, "workflows.html"))
+
+
 @app.get("/favicon.ico")
 def favicon():
     # Browsers ask for /favicon.ico even when a page links an SVG icon.
