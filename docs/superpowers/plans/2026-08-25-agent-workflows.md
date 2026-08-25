@@ -737,7 +737,7 @@ git commit -m "feat(workflows): compose a stage into one prompt per coordination
 - Consumes: `_load`, `_save`, `_lock`, `_now`, `get_workflow` from Task 1.
 - Produces: `bind(session_id: str, wid: str) -> dict | None`; `unbind(session_id: str) -> bool`; `get_binding(session_id: str) -> dict | None`; `advance(session_id: str, delta: int) -> dict | None`; `mark_sent(session_id: str, stage_id: str) -> None`; `bindings_by_session() -> dict[str, dict]`; `rekey(old_id: str, new_id: str) -> None`.
 
-Binding record shape returned by `get_binding`: `{"workflow_id", "title", "stage_index", "stage_count", "assigned_at", "sent": [stage ids]}`.
+Binding record shape returned by `get_binding`: `{"session_id", "workflow_id", "title", "stage_index", "stage_count", "stage_name", "assigned_at", "sent": [stage ids]}`.
 
 - [ ] **Step 1: Write the failing tests**
 
