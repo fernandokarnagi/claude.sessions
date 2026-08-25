@@ -71,6 +71,18 @@ def test_stage_ids_are_never_reused():
     assert [s["id"] for s in wf["stages"]] == ["s2", "s3"]
 
 
+def test_duplicate_stage_ids_are_repaired_not_rejected():
+    """A well-formed but duplicate id is bookkeeping, not operator content —
+    validate() mints a fresh one instead of raising, the same way it repairs
+    a missing or malformed id."""
+    wid = workflows.create_workflow("W")["id"]
+    wf = workflows.update_workflow(wid, agents=AGENTS, stages=[
+        {"id": "s1", "name": "One", "mode": "solo", "agent_ids": ["researcher"]},
+        {"id": "s1", "name": "Two", "mode": "solo", "agent_ids": ["builder"]},
+    ])
+    assert [s["id"] for s in wf["stages"]] == ["s1", "s2"]
+
+
 def test_stage_ids_survive_deleting_the_last_stage():
     """The high-water mark comes from what is stored, not from what the
     caller sent — otherwise deleting the newest stage and adding one in the

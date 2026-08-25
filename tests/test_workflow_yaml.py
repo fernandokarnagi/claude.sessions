@@ -47,6 +47,22 @@ def test_export_unknown_workflow():
     assert workflows.to_yaml("deadbeef0000") is None
 
 
+def test_export_with_shared_default_model_round_trips():
+    """to_yaml must never emit an anchor: PyYAML's SafeRepresenter only
+    shares references for containers, and to_yaml builds four distinct ones
+    for title/description/agents/stages, so two agents sharing the default
+    model should still export as two independent maps and re-import clean."""
+    wid = workflows.create_workflow("W")["id"]
+    workflows.update_workflow(wid, agents=[
+        {"name": "A", "prompt": "do a"},
+        {"name": "B", "prompt": "do b"},
+    ], stages=[])
+    text = workflows.to_yaml(wid)
+    assert "&" not in text and "*" not in text
+    copy = workflows.from_yaml(text)
+    assert [a["model"] for a in copy["agents"]] == ["opus", "opus"]
+
+
 def test_round_trip_makes_an_equal_copy_with_a_new_id(wid):
     copy = workflows.from_yaml(workflows.to_yaml(wid))
     assert copy["id"] != wid

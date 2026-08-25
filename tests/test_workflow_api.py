@@ -97,6 +97,64 @@ def test_import_oversized_yaml_is_413(client):
     assert r.json()["detail"] == "workflow file too large"
 
 
+def test_import_rejects_alias_amplification(client):
+    """yaml.safe_load resolves aliases by sharing references, so a handful
+    of bytes can expand into megabytes once the parsed result is str()'d.
+    Refusing any alias at parse time closes this off at the root, and must
+    leave no partial workflow behind."""
+    text = (
+        "title: W\n"
+        "a: &a [x, x, x, x, x, x, x, x, x]\n"
+        "b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]\n"
+        "c: [*b, *b, *b, *b, *b, *b, *b, *b, *b]\n"
+    )
+    r = client.post("/api/workflows/import", json={"yaml": text})
+    assert r.status_code == 400
+    assert "alias" in r.json()["detail"].lower()
+    assert client.get("/api/workflows").json()["workflows"] == []
+
+
+def test_import_rejects_deep_nesting(client):
+    """A document well inside the byte guard can still blow the recursion
+    limit in PyYAML's constructor; that must come back as 400, not 500."""
+    depth = 20000
+    text = "title: W\nx: " + "[" * depth + "]" * depth
+    r = client.post("/api/workflows/import", json={"yaml": text})
+    assert r.status_code == 400
+    assert "nested" in r.json()["detail"].lower()
+    assert client.get("/api/workflows").json()["workflows"] == []
+
+
+def test_import_rejects_non_mapping_agent(client):
+    text = "title: W\nagents: [just-a-string]\nstages: []\n"
+    r = client.post("/api/workflows/import", json={"yaml": text})
+    assert r.status_code == 400
+    assert "agents[0]" in r.json()["detail"]
+
+
+def test_import_rejects_non_mapping_stage(client):
+    text = "title: W\nagents: []\nstages: [42]\n"
+    r = client.post("/api/workflows/import", json={"yaml": text})
+    assert r.status_code == 400
+    assert "stages[0]" in r.json()["detail"]
+
+
+def test_duplicate_agent_id_in_a_stage_is_rejected(client):
+    """Not reachable from the UI (checkboxes are set-semantics) but
+    reachable from YAML and PUT; parallel mode doesn't catch this by
+    accident the way solo's len(ids) > 1 rule does."""
+    wid = client.post("/api/workflows", json={"title": "W"}).json()["id"]
+    body = {
+        "title": "W",
+        "agents": AGENTS,
+        "stages": [{"name": "X", "mode": "parallel",
+                    "agent_ids": ["builder", "builder"]}],
+    }
+    r = client.put(f"/api/workflows/{wid}", json=body)
+    assert r.status_code == 400
+    assert "duplicate agent id" in r.json()["detail"]
+
+
 def test_preview(client):
     wid = client.post("/api/workflows", json={"title": "W"}).json()["id"]
     client.put(f"/api/workflows/{wid}",

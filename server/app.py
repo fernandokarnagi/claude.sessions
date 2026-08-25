@@ -1675,8 +1675,14 @@ def _binding_view(session_id: str) -> dict:
     wf = workflows.get_workflow(b["workflow_id"])
     stages = (wf or {}).get("stages", [])
     if stages:
-        stage_id = stages[b["stage_index"]]["id"]
-        out["prompt"] = workflows.compose_stage(b["workflow_id"], b["stage_index"])
+        # get_binding() and get_workflow() are two separate locked reads, so
+        # a concurrent PUT that shrinks the workflow between them can leave
+        # stage_index pointing past the stages list actually in hand here.
+        # Clamp against that list, not the one get_binding() saw.
+        idx = min(b["stage_index"], len(stages) - 1)
+        stage_id = stages[idx]["id"]
+        out["stage_index"] = idx
+        out["prompt"] = workflows.compose_stage(b["workflow_id"], idx)
     else:
         out["prompt"] = ""
     out["stage_id"] = stage_id

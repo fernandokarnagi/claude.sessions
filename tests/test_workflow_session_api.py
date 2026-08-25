@@ -123,6 +123,27 @@ def test_advance_without_a_binding_is_404(client):
     assert r.status_code == 404
 
 
+def test_binding_view_survives_a_shrink_between_reads(client, wid, monkeypatch):
+    """_binding_view reads the binding and the workflow as two separate
+    locked calls (get_binding, then get_workflow). A concurrent PUT that
+    shrinks the workflow in between used to raise IndexError -> 500. Drive
+    it through the store functions: hand back a stage_index that no longer
+    fits the workflow the second read actually returns, the way a real
+    shrink landing in the gap would."""
+    client.post(f"/api/sessions/{SID}/workflow", json={"workflow_id": wid})
+    stale = dict(workflows.get_binding(SID))
+    stale["stage_index"] = 99
+    monkeypatch.setattr(workflows, "get_binding", lambda sid: stale)
+
+    view = app_module._binding_view(SID)
+
+    assert view["bound"] is True
+    assert view["stage_id"] == "s2"
+    # the whole view describes one stage, index included
+    assert view["stage_index"] == 1
+    assert "## Stage 2/2: Review" in view["prompt"]
+
+
 def test_unassign(client, wid):
     client.post(f"/api/sessions/{SID}/workflow", json={"workflow_id": wid})
     assert client.delete(f"/api/sessions/{SID}/workflow").status_code == 200

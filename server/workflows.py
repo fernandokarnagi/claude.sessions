@@ -57,6 +57,27 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _STAGE_ID_RE = re.compile(r"^s(\d+)$")
 
 
+class _AliasNotAllowed(yaml.YAMLError):
+    """Raised by _NoAliasSafeLoader when the document uses an anchor/alias."""
+
+
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """A SafeLoader that refuses anchors/aliases instead of resolving them.
+
+    yaml.safe_load resolves aliases by sharing references, so the parse
+    itself stays cheap and small even when the document is an amplification
+    bomb (`a: &a [x]*9` chained a few levels deep into gigabytes). The
+    blow-up happens afterwards, in every str() call this module makes on the
+    parsed result. Refusing aliases outright means the parsed result is
+    bounded by the input bytes, which the byte-size guard already covers.
+    """
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise _AliasNotAllowed("YAML anchors and aliases are not supported")
+        return super().compose_node(parent, index)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -88,9 +109,14 @@ def _next_stage_n(stages: list[dict]) -> int:
 
     Ids are never recycled: a binding remembers which stages it has already
     sent by id, and reusing s1 for a brand-new stage would mark it sent.
+
+    Runs ahead of validate()'s own element type-check (it needs the
+    high-water mark before it starts minting ids), so a non-mapping element
+    is skipped here rather than raised on — the main loop below still
+    rejects it, in order, with a message that names the position.
     """
-    used = [int(m.group(1)) for s in stages
-            if (m := _STAGE_ID_RE.match(str(s.get("id") or "")))]
+    used = [int(m.group(1)) for s in stages if isinstance(s, dict)
+            and (m := _STAGE_ID_RE.match(str(s.get("id") or "")))]
     return max(used, default=0) + 1
 
 
@@ -116,7 +142,9 @@ def validate(agents: list[dict], stages: list[dict],
     prev_stages = (previous or {}).get("stages", [])
     clean_agents: list[dict] = []
     seen: set[str] = set()
-    for a in agents:
+    for i, a in enumerate(agents):
+        if not isinstance(a, dict):
+            raise ValueError(f"agents[{i}] must be a mapping")
         name = str(a.get("name") or "").strip()
         if not name:
             raise ValueError("every agent needs a name")
@@ -137,8 +165,11 @@ def validate(agents: list[dict], stages: list[dict],
 
     known = {a["id"] for a in clean_agents}
     clean_stages: list[dict] = []
+    seen_stage_ids: set[str] = set()
     next_n = max(_next_stage_n(stages), _next_stage_n(prev_stages))
-    for s in stages:
+    for i, s in enumerate(stages):
+        if not isinstance(s, dict):
+            raise ValueError(f"stages[{i}] must be a mapping")
         name = str(s.get("name") or "").strip()
         if not name:
             raise ValueError("every stage needs a name")
@@ -150,12 +181,22 @@ def validate(agents: list[dict], stages: list[dict],
         if unknown:
             raise ValueError(f"stage {name!r}: unknown agent id {unknown[0]!r}")
         ids = [i for i in ids if i in known]
+        dup_seen: set[str] = set()
+        for aid in ids:
+            if aid in dup_seen:
+                raise ValueError(f"stage {name!r}: duplicate agent id {aid!r}")
+            dup_seen.add(aid)
         if mode == "solo" and len(ids) > 1:
             raise ValueError(f"stage {name!r}: a solo stage takes one agent")
+        # Stage ids are machine-minted bookkeeping, never operator-authored,
+        # so a missing, malformed, or duplicate id is repaired rather than
+        # rejected — unlike a duplicate agent id above, which is content the
+        # operator typed on purpose and so is a real validation error.
         sid = str(s.get("id") or "").strip()
-        if not _STAGE_ID_RE.match(sid):
+        if not _STAGE_ID_RE.match(sid) or sid in seen_stage_ids:
             sid = f"s{next_n}"
             next_n += 1
+        seen_stage_ids.add(sid)
         clean_stages.append({
             "id": sid,
             "name": name,
@@ -466,21 +507,18 @@ def rekey(old_id: str, new_id: str) -> None:
 # makes them unreadable; YAML block scalars keep them legible.
 # ---------------------------------------------------------------------------
 
-# Fields that describe *this install's* copy, not the procedure itself. They
-# are stripped on export so two exports of the same procedure diff clean.
-_LOCAL_FIELDS = ("id", "created_at", "updated_at")
-
-
 def to_yaml(wid: str) -> str | None:
     wf = get_workflow(wid)
     if wf is None:
         return None
-    doc = {k: v for k, v in wf.items() if k not in _LOCAL_FIELDS}
+    # id/created_at/updated_at describe *this install's* copy, not the
+    # procedure itself, so this whitelist leaves them out — two exports of
+    # the same procedure diff clean.
     ordered = {
-        "title": doc.get("title", ""),
-        "description": doc.get("description", ""),
-        "agents": doc.get("agents", []),
-        "stages": doc.get("stages", []),
+        "title": wf.get("title", ""),
+        "description": wf.get("description", ""),
+        "agents": wf.get("agents", []),
+        "stages": wf.get("stages", []),
     }
     return yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True,
                           default_flow_style=False, width=100)
@@ -489,7 +527,11 @@ def to_yaml(wid: str) -> str | None:
 def from_yaml(text: str) -> dict:
     """Create a NEW workflow from YAML. Never overwrites an existing one."""
     try:
-        doc = yaml.safe_load(text)
+        doc = yaml.load(text, Loader=_NoAliasSafeLoader)
+    except _AliasNotAllowed as e:
+        raise ValueError(str(e)) from e
+    except RecursionError as e:
+        raise ValueError("workflow file is too deeply nested") from e
     except yaml.YAMLError as e:
         raise ValueError(f"could not parse YAML: {e}") from e
     if not isinstance(doc, dict):
