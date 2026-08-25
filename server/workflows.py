@@ -336,3 +336,123 @@ def compose_stage(wid: str, stage_index: int) -> str:
         if a.get("prompt"):
             lines.append(a["prompt"])
     return "\n".join(lines).strip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Bindings — which workflow a session is running, and where it has got to.
+#
+# One workflow per session. The stage pointer only ever moves because a human
+# pressed Advance; nothing in this module watches a session.
+# ---------------------------------------------------------------------------
+
+def _binding_pub(data: dict, sid: str, rec: dict) -> dict | None:
+    wf = data["workflows"].get(rec.get("workflow_id"))
+    if wf is None:
+        return None
+    stages = wf.get("stages", [])
+    # Clamped on read, not on write: the workflow can be edited down to fewer
+    # stages long after the binding was made, and a stored pointer past the
+    # end would 500 the session page rather than just showing the last stage.
+    idx = max(0, min(int(rec.get("stage_index", 0)), max(len(stages) - 1, 0)))
+    return {
+        "session_id": sid,
+        "workflow_id": rec["workflow_id"],
+        "title": wf.get("title", ""),
+        "stage_index": idx,
+        "stage_count": len(stages),
+        "stage_name": stages[idx]["name"] if stages else "",
+        "assigned_at": rec.get("assigned_at", ""),
+        "sent": list(rec.get("sent", [])),
+    }
+
+
+def bind(session_id: str, wid: str) -> dict | None:
+    """Assign a workflow to a session, starting at its first stage."""
+    with _lock:
+        data = _load()
+        if wid not in data["workflows"]:
+            return None
+        data["bindings"][session_id] = {
+            "workflow_id": wid,
+            "stage_index": 0,
+            "assigned_at": _now(),
+            "sent": [],
+        }
+        _save(data)
+        return _binding_pub(data, session_id, data["bindings"][session_id])
+
+
+def unbind(session_id: str) -> bool:
+    with _lock:
+        data = _load()
+        if data["bindings"].pop(session_id, None) is None:
+            return False
+        _save(data)
+    return True
+
+
+def get_binding(session_id: str) -> dict | None:
+    with _lock:
+        data = _load()
+        rec = data["bindings"].get(session_id)
+        return _binding_pub(data, session_id, rec) if rec else None
+
+
+def advance(session_id: str, delta: int) -> dict | None:
+    """Move the stage pointer, clamped to the workflow's stages."""
+    with _lock:
+        data = _load()
+        rec = data["bindings"].get(session_id)
+        if rec is None:
+            return None
+        wf = data["workflows"].get(rec.get("workflow_id"))
+        if wf is None:
+            return None
+        last = max(len(wf.get("stages", [])) - 1, 0)
+        rec["stage_index"] = max(0, min(int(rec.get("stage_index", 0)) + delta, last))
+        _save(data)
+        return _binding_pub(data, session_id, rec)
+
+
+def mark_sent(session_id: str, stage_id: str) -> None:
+    """Remember that this stage has been typed into the session at least once,
+    so the UI can offer "Re-send" instead of "Send"."""
+    with _lock:
+        data = _load()
+        rec = data["bindings"].get(session_id)
+        if rec is None:
+            return
+        sent = rec.setdefault("sent", [])
+        if stage_id not in sent:
+            sent.append(stage_id)
+            _save(data)
+
+
+def bindings_by_session() -> dict[str, dict]:
+    """{session_id: binding} in one file read — for the board and triage
+    badges, which decorate many sessions at once."""
+    with _lock:
+        data = _load()
+        out = {}
+        for sid, rec in data["bindings"].items():
+            pub = _binding_pub(data, sid, rec)
+            if pub:
+                out[sid] = pub
+        return out
+
+
+def rekey(old_id: str, new_id: str) -> None:
+    """Carry a binding onto a new session id (see tmuxio.reset).
+
+    Which procedure you are running is about the work, not the conversation,
+    so a /clear shouldn't drop it. A binding already on the new id wins.
+    """
+    if old_id == new_id:
+        return
+    with _lock:
+        data = _load()
+        rec = data["bindings"].pop(old_id, None)
+        if rec is None:
+            return
+        data["bindings"].setdefault(new_id, rec)
+        _save(data)
