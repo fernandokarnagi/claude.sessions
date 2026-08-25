@@ -41,6 +41,7 @@ import os
 import re
 import threading
 import uuid
+import yaml
 from datetime import datetime, timezone
 
 _PATH = os.path.join(os.path.dirname(__file__), ".workflows.json")
@@ -456,3 +457,51 @@ def rekey(old_id: str, new_id: str) -> None:
             return
         data["bindings"].setdefault(new_id, rec)
         _save(data)
+
+
+# ---------------------------------------------------------------------------
+# YAML — a workflow as a file you can diff, review, and keep in git.
+#
+# Long system prompts are the bulk of a workflow, and JSON string escaping
+# makes them unreadable; YAML block scalars keep them legible.
+# ---------------------------------------------------------------------------
+
+# Fields that describe *this install's* copy, not the procedure itself. They
+# are stripped on export so two exports of the same procedure diff clean.
+_LOCAL_FIELDS = ("id", "created_at", "updated_at")
+
+
+def to_yaml(wid: str) -> str | None:
+    wf = get_workflow(wid)
+    if wf is None:
+        return None
+    doc = {k: v for k, v in wf.items() if k not in _LOCAL_FIELDS}
+    ordered = {
+        "title": doc.get("title", ""),
+        "description": doc.get("description", ""),
+        "agents": doc.get("agents", []),
+        "stages": doc.get("stages", []),
+    }
+    return yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True,
+                          default_flow_style=False, width=100)
+
+
+def from_yaml(text: str) -> dict:
+    """Create a NEW workflow from YAML. Never overwrites an existing one."""
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"could not parse YAML: {e}") from e
+    if not isinstance(doc, dict):
+        raise ValueError("a workflow file must be a mapping with a title")
+    title = str(doc.get("title") or "").strip()
+    if not title:
+        raise ValueError("a workflow file needs a title")
+    agents = doc.get("agents") or []
+    stages = doc.get("stages") or []
+    if not isinstance(agents, list) or not isinstance(stages, list):
+        raise ValueError("agents and stages must be lists")
+    # Validate before creating, so a bad file leaves nothing behind.
+    validate(agents, stages)
+    wf = create_workflow(title, str(doc.get("description") or ""))
+    return update_workflow(wf["id"], agents=agents, stages=stages)
