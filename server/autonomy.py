@@ -6,7 +6,9 @@ Levels (per session, persisted to server/.autonomy.json; absence == manual):
   manual      every permission gate waits for a human (dashboard / Slack).
   auto-safe   auto-approve read-only / low-risk gates; escalate writes &
               shell commands to a human.
-  yolo        auto-approve every gate (pick the affirmative option).
+  yolo        auto-approve every permission gate (pick the affirmative
+              option). A multiple-choice question is not a permission gate:
+              it still waits for a human at every level (see is_choice).
 
 A background watcher (start_watcher) scans live tmux gates and applies the
 policy. It is the *single* authority for auto-answering — the Slack watcher
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -166,16 +169,60 @@ _SAFE = (
 )
 
 
+# Words that make an option read as "yes, go ahead" / "no, don't".
+_AFFIRM_WORDS = ("yes", "proceed", "allow", "trust", "approve", "confirm")
+_DENY_WORDS = ("no", "don't", "dont", "do not", "reject", "deny", "cancel",
+               "abort", "stop", "skip")
+
+
+def _label(o: dict) -> str:
+    """An option label with leading glyphs/punctuation stripped, lowercased.
+
+    Menus decorate their labels ("✓ Approve (ctrl+k)", "✕ Reject (esc)"), so a
+    bare startswith on the raw text misses the word that matters.
+    """
+    return re.sub(r"^[^0-9a-z]+", "", (o.get("label") or "").lower())
+
+
+def _word(lab: str, words: tuple) -> bool:
+    """True if the label uses one of these words (whole word, anywhere)."""
+    return any(re.search(r"\b" + re.escape(w), lab) for w in words)
+
+
+def _has(opts: list, words: tuple) -> bool:
+    return any(_word(_label(o), words) for o in opts)
+
+
+def is_choice(prompt: dict) -> bool:
+    """True when this is an open multiple-choice question, not a yes/no gate.
+
+    Autonomy can answer a *permission* gate because "yes" is a decision about
+    risk, and the level says how much risk the human already accepted. It
+    cannot answer "which of these four approaches do you want?" — that is a
+    decision about the work itself, and nothing in the level implies an answer.
+    Picking option 1 by convention (what the old fallback did) is a guess the
+    human never authorised, so these escalate at every level, yolo included.
+    """
+    if prompt.get("multi"):
+        return True              # checkbox widget — a digit toggles, never submits
+    if prompt.get("stage") == "ask":
+        return True              # opencode's `question` dialog
+    if prompt.get("custom") is not None:
+        return True              # has a "type your own answer" row
+    opts = prompt.get("options") or []
+    # A permission gate always offers both directions: some way to say yes and
+    # some way to say no. A menu of alternatives offers neither.
+    return not (_has(opts, _AFFIRM_WORDS) and _has(opts, _DENY_WORDS))
+
+
 def _affirmative(prompt: dict) -> Optional[int]:
     """The option number that means 'yes/proceed/allow', or None."""
-    opts = prompt.get("options") or []
-    for o in opts:
-        lab = (o.get("label") or "").lower()
-        if lab.startswith("yes") or "proceed" in lab or lab.startswith("allow") \
-           or "trust" in lab or "approve" in lab:
+    if is_choice(prompt):
+        return None
+    for o in prompt.get("options") or []:
+        if _word(_label(o), _AFFIRM_WORDS):
             return o.get("num")
-    # Claude Code's first option is the affirmative one by convention.
-    return opts[0]["num"] if opts else None
+    return None
 
 
 def _blob(prompt: dict) -> str:

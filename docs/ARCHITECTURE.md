@@ -65,7 +65,7 @@ The `ix` auto-clustering splits the repo into 14 generic regions all labelled `S
 
 **The gate loop (what makes it a control plane).** `capture_pane` screenshots a live pane; a regex over numbered `❯ N.` rows detects a pending permission prompt and rejects idle/running screens. `pending_ids()` caches a full-fleet scan with a 1s TTL. Three consumers race for that result and they are deliberately not symmetric:
 
-- the **autonomy watcher** applies policy first — `yolo` approves everything, `auto-safe` approves read-only gates and escalates writes and shell commands, `manual` never acts;
+- the **autonomy watcher** applies policy first — `yolo` approves every permission gate, `auto-safe` approves read-only gates and escalates writes and shell commands, `manual` never acts. No level answers a multiple-choice question (a numbered menu with no yes/no in it): that is a decision about the work, not about risk, so it always waits for a human and is posted to Slack even on a `yolo` session;
 - **Slack** posts a gate only for sessions still on `manual`, so a gate is never double-handled;
 - the **browser** shows the gate in the To-do rail and the detail approval panel.
 
