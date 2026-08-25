@@ -1384,6 +1384,9 @@ class WorkflowDocBody(BaseModel):
     stages: list[dict] | None = None
 
 
+_MAX_YAML_BYTES = 1024 * 1024
+
+
 class ImportBody(BaseModel):
     yaml: str = ""
 
@@ -1445,6 +1448,8 @@ def api_export_workflow(wid: str):
 
 @app.post("/api/workflows/import")
 def api_import_workflow(body: ImportBody):
+    if len(body.yaml.encode("utf-8")) > _MAX_YAML_BYTES:
+        raise HTTPException(status_code=413, detail="workflow file too large")
     try:
         return workflows.from_yaml(body.yaml)
     except ValueError as e:
