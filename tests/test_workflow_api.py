@@ -90,6 +90,13 @@ def test_import_bad_yaml_is_400(client):
     assert r.status_code == 400 and "mapping" in r.json()["detail"]
 
 
+def test_import_oversized_yaml_is_413(client):
+    text = "title: W\n" + ("x" * (1024 * 1024 + 1))
+    r = client.post("/api/workflows/import", json={"yaml": text})
+    assert r.status_code == 413
+    assert r.json()["detail"] == "workflow file too large"
+
+
 def test_preview(client):
     wid = client.post("/api/workflows", json={"title": "W"}).json()["id"]
     client.put(f"/api/workflows/{wid}",
