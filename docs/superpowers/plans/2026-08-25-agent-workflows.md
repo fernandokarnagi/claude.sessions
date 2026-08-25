@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Python runs from the repo venv. The repo's documented test command is `.venv/bin/python -m pytest` (README.md:196, docs/ARCHITECTURE.md:131) — `-m` is what puts the repo root on `sys.path` so `from server import ...` resolves. Never invoke the bare `.venv/bin/python -m pytest` shim, and never add a `conftest.py` to work around it.
+- Python runs from the repo venv. The repo's documented test command is `.venv/bin/python -m pytest` (README.md:196, docs/ARCHITECTURE.md:131) — `-m` is what puts the repo root on `sys.path` so `from server import ...` resolves. Never invoke the bare `.venv/bin/pytest` shim, and never add a `conftest.py` to work around it.
 - Store file is `server/.workflows.json`, gitignored like `.projects.json` — never commit it, never `rm` a real one during testing. Tests always `monkeypatch.setattr(workflows, "_PATH", str(tmp_path / "workflows.json"))`.
 - Store module writes atomically: `json.dump` to `_PATH + ".tmp"`, then `os.replace`. Guard every read/write with a module-level `threading.RLock()`.
 - New dependencies: `pyyaml>=6.0` (the feature) and `httpx>=0.27` (what `fastapi.testclient` imports; absent from the venv today, which is why `tests/test_pins.py` currently fails to collect). Both added in Task 4.
