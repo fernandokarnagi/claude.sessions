@@ -799,6 +799,476 @@ def grok_usage(session_id: str, timeout: float = 8.0) -> dict:
     return {"ok": True, "text": "\n".join(cleaned).strip()}
 
 
+# ---- opencode -----------------------------------------------------------
+# opencode's TUI swaps its footer hint while a turn runs: at idle it reads
+# "ctrl+p commands", mid-turn a dot spinner and "esc interrupt" appear beside it.
+_OPENCODE_BUSY_RE = re.compile(r"esc\s+interrupt", re.I)
+
+# Its permission gate is a horizontal option row ("Allow once  Allow always
+# Reject") under a "△ Permission required" header — no numbered menu, so
+# parse_prompt (which wants "1. Yes") never sees it.
+#
+# The header is the marker to key on. The row's own key hints ("⇆ select  enter
+# confirm") get truncated at the pane's right edge — in an 80-column pane it
+# arrives as "enter con" — so keying on those would miss the gate on any narrow
+# pane, which is most of them.
+#
+# The dialog is also a three-stage machine, not one screen: "Allow once" answers
+# the request, but "Allow always" and "Reject" only swap it for a follow-up with
+# its own header — Confirm/Cancel for the always-list, a free-text reason box for
+# the rejection. Keying on the first header alone left the pane at stage two
+# reading as an idle session while it was in fact blocked.
+_OPENCODE_STAGE_RES = (
+    ("permission", re.compile(r"Permission required", re.I)),
+    ("always", re.compile(r"Always allow", re.I)),
+    ("reject", re.compile(r"Reject permission", re.I)),
+)
+_OPENCODE_GATE_HEAD_RE = re.compile(
+    "|".join(r.pattern for _, r in _OPENCODE_STAGE_RES), re.I)
+# Case-sensitive on purpose: the row's own key hints read "enter confirm" and
+# "esc cancel" in lower case, and on a narrow pane they share the option row.
+_OPENCODE_OPTION_RE = re.compile(
+    r"(Allow once|Allow always|Reject|Allow|Deny|Confirm|Cancel)")
+# The reject stage has no ⇆ row at all — its two actions are the footer's key
+# hints, so they are the options we offer for it.
+_OPENCODE_REJECT_OPTIONS = ("Confirm", "Cancel")
+# Footer/key-hint text, which is not part of what the gate is asking.
+_OPENCODE_HINT_RE = re.compile(
+    r"⇆\s*select|enter\s+conf|esc\s+(cancel|reject)|ctrl\+", re.I)
+# In a colour capture the highlighted option is dark-on-accent; the others are
+# rendered grey. Grey foreground is the reliable "not selected" marker.
+_OPENCODE_DIM_FG = "38;2;128;128;128"
+
+
+def capture_pane_ansi(session_id: str) -> Optional[str]:
+    """The visible pane *with* SGR escape sequences (`capture-pane -e`).
+
+    Only the opencode gate needs this: which option is highlighted is carried
+    purely by colour, so the plain text capture can't tell them apart.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-e", "-t", session_id],
+            capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def opencode_working(session_id: str) -> bool:
+    """True when the live opencode REPL is mid-turn, read from its footer."""
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    if _OPENCODE_GATE_HEAD_RE.search(screen) \
+            or _OPENCODE_ASK_FOOT_RE.search(screen):
+        return False                      # sitting at a gate, not generating
+    tail = "\n".join(screen.splitlines()[-6:])
+    return bool(_OPENCODE_BUSY_RE.search(tail))
+
+
+# Box borders and the arrow opencode puts in front of the gate's subject line.
+_OPENCODE_BOX_CHARS = "┃│┆╎╹╻▀▄─━╭╮╰╯┌┐└┘ \t←→△"
+
+
+def _opencode_unbox(line: str) -> str:
+    """A gate body line with its panel border and lead-in glyphs stripped."""
+    return _strip(line).strip(_OPENCODE_BOX_CHARS)
+
+
+def _opencode_option_row(lines: list[str], head: int = 0) -> Optional[int]:
+    """Index of the line holding the gate's option row, or None.
+
+    The row is the lowest line below the header carrying more than one option
+    label — "Allow once   Allow always   Reject" — which is what separates it
+    from a body line that merely mentions one of those words.
+    """
+    for i in range(len(lines) - 1, head - 1, -1):
+        if len(_OPENCODE_OPTION_RE.findall(lines[i])) > 1:
+            return i
+    return None
+
+
+def _opencode_head(lines: list[str]) -> tuple[Optional[int], str]:
+    """(index, stage) of the gate's header line, scanning up from the bottom."""
+    for i in range(len(lines) - 1, -1, -1):
+        for stage, rx in _OPENCODE_STAGE_RES:
+            if rx.search(lines[i]):
+                return i, stage
+    return None, ""
+
+
+def _opencode_question(lines: list[str], head: int, end: int) -> str:
+    """What the gate is asking, from the body lines between header and footer.
+
+    opencode draws the panel inside a box, so the border glyphs come off too —
+    otherwise a blank line reads as "┃" — and the footer's key hints are dropped
+    because they say how to answer, not what is being asked.
+    """
+    body = [_opencode_unbox(l) for l in lines[head + 1:end]]
+    body = [b for b in body if b and not _OPENCODE_HINT_RE.search(b)]
+    return " — ".join(body[:3])
+
+
+def parse_opencode_gate(screen: Optional[str],
+                        ansi: Optional[str] = None) -> Optional[dict]:
+    """A pending opencode permission gate from a captured screen, or None.
+
+    Returns the same shape parse_prompt does — {question, options:[{num, label,
+    selected}], raw} — so the dashboard's approval UI needs no special case,
+    plus `stage` ("permission", "always" or "reject") because answering the
+    follow-up stages takes different keys.
+    Options are numbered 1..N left-to-right to match that contract; opencode
+    itself selects them with ⇆.
+
+    `ansi` is the same frame captured with -e. Without it every option comes
+    back selected=False, which is honest: the highlight is colour-only.
+    """
+    if not screen:
+        return None
+    lines = screen.splitlines()
+    # The header is what says this is a gate at all, and which stage it is; the
+    # option row is the one below it. Anchoring this way round keeps an
+    # "Allow"/"Reject" in ordinary transcript output from being mistaken for the
+    # widget.
+    head, stage = _opencode_head(lines)
+    if head is None:
+        return None
+
+    if stage == "reject":
+        # A reason box, not a row: Enter submits the rejection, Escape backs out
+        # to the first stage. Enter is the default, so it reads as selected.
+        return {
+            "question": _opencode_question(lines, head, len(lines))
+                        or "Reject permission",
+            "options": [{"num": i + 1, "label": l, "selected": i == 0}
+                        for i, l in enumerate(_OPENCODE_REJECT_OPTIONS)],
+            "stage": stage,
+            "raw": "\n".join(lines[head:]),
+        }
+
+    row = _opencode_option_row(lines, head)
+    if row is None:
+        return None
+
+    labels = _OPENCODE_OPTION_RE.findall(lines[row])
+    if not labels:
+        return None
+
+    # Which one is highlighted — from the colour capture's matching row.
+    selected = -1
+    if ansi:
+        alines = ansi.splitlines()
+        arow = _opencode_option_row(alines)
+        if arow is not None:
+            ln = alines[arow]
+            for idx, label in enumerate(labels):
+                at = ln.find(label)
+                if at < 0:
+                    continue
+                # The SGR run immediately preceding this label decides it.
+                if _OPENCODE_DIM_FG not in ln[max(0, at - 24):at]:
+                    selected = idx
+
+    # The gate's subject: the lines between the header and the option row (the
+    # tool and what it wants to touch, or what an always-rule would cover).
+    question = _opencode_question(lines, head, row) \
+        or _opencode_unbox(lines[head]) or "Permission required"
+
+    return {
+        "question": question,
+        "options": [{"num": i + 1, "label": l, "selected": i == selected}
+                    for i, l in enumerate(labels)],
+        "stage": stage,
+        "raw": "\n".join(lines[head:row + 1]),
+    }
+
+
+# opencode's `question` tool is a *different* widget from the permission gate: a
+# numbered list with a description under each row, ending in a "Type your own
+# answer" row, under a "↑↓ select  enter submit  esc dismiss" footer. The footer
+# is the anchor — a transcript can easily hold a numbered list of its own.
+_OPENCODE_ASK_FOOT_RE = re.compile(r"↑↓\s*select")
+_OPENCODE_ASK_OPTION_RE = re.compile(r"^(\d+)\.\s+(.+?)\s*$")
+_OPENCODE_ASK_CUSTOM_RE = re.compile(r"^(\[.\]\s*)?Type your own answer$", re.I)
+# A background colour run. The whole dialog is painted with theme.surface, so
+# "has a background" means nothing — the *odd one out* is the highlighted row.
+_OPENCODE_BG_RE = re.compile(r"\x1b\[[0-9;]*?(48;(?:2;\d+;\d+;\d+|5;\d+))")
+# Colour runs have to come off before a -e capture's rows can be matched as text.
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _opencode_ask_rows(lines: list[str], foot: int) -> list[tuple[int, int, str]]:
+    """The dialog's numbered rows above `foot`, as (line index, number, label).
+
+    Read bottom-up and kept only while the numbering steps down by one to 1, so
+    a stray "1." in the transcript above the dialog can't extend the list. The
+    per-option description lines carry no number and are skipped on the way.
+    """
+    found = []
+    for i in range(foot - 1, -1, -1):
+        m = _OPENCODE_ASK_OPTION_RE.match(_opencode_unbox(lines[i]))
+        if m:
+            found.append((i, int(m.group(1)), m.group(2)))
+    run: list[tuple[int, int, str]] = []
+    expect = None
+    for i, num, label in found:
+        if expect is None:
+            expect = num                  # the last row, nearest the footer
+        if num != expect:
+            break
+        run.append((i, num, label))
+        expect -= 1
+        if expect == 0:
+            break
+    run.reverse()
+    return run if len(run) > 1 and run[0][1] == 1 else []
+
+
+def _opencode_ask_selected(ansi: Optional[str], count: int) -> int:
+    """Index of the highlighted row, or -1.
+
+    Rows differ only by background: the selected one gets theme.line where the
+    rest get the dialog's theme.surface. So the answer is whichever background
+    is in the minority — which needs no knowledge of the user's theme.
+    """
+    if not ansi:
+        return -1
+    alines = ansi.splitlines()
+    afoot = next((i for i in range(len(alines) - 1, -1, -1)
+                  if _OPENCODE_ASK_FOOT_RE.search(alines[i])), None)
+    if afoot is None:
+        return -1
+    rows = _opencode_ask_rows([_SGR_RE.sub("", l) for l in alines], afoot)
+    if len(rows) != count:
+        return -1
+    bgs = []
+    for i, _, _ in rows:
+        m = _OPENCODE_BG_RE.search(alines[i])
+        bgs.append(m.group(1) if m else "")
+    odd = [b for b in set(bgs) if bgs.count(b) == 1]
+    if len(odd) != 1:
+        return -1                          # nothing differs, or nothing agrees
+    return bgs.index(odd[0])
+
+
+def parse_opencode_ask(screen: Optional[str],
+                       ansi: Optional[str] = None) -> Optional[dict]:
+    """A pending opencode `question` dialog from a captured screen, or None.
+
+    Same shape as parse_opencode_gate, plus `custom`: the number of the "Type
+    your own answer" row, which opens a textarea instead of replying.
+    """
+    if not screen:
+        return None
+    lines = screen.splitlines()
+    foot = next((i for i in range(len(lines) - 1, -1, -1)
+                 if _OPENCODE_ASK_FOOT_RE.search(lines[i])), None)
+    if foot is None:
+        return None
+    rows = _opencode_ask_rows(lines, foot)
+    if not rows:
+        return None
+
+    # The question sits directly above the first row, one blank line up, and
+    # wraps across as many lines as it needs.
+    head = rows[0][0] - 1
+    while head >= 0 and not _opencode_unbox(lines[head]):
+        head -= 1
+    top = head
+    while top >= 0 and _opencode_unbox(lines[top]):
+        top -= 1
+    question = " ".join(_opencode_unbox(l) for l in lines[top + 1:head + 1])
+
+    selected = _opencode_ask_selected(ansi, len(rows))
+    custom = next((n for _, n, label in rows
+                   if _OPENCODE_ASK_CUSTOM_RE.match(label)), None)
+    return {
+        "question": question or "Question",
+        "options": [{"num": n, "label": label, "selected": i == selected}
+                    for i, (_, n, label) in enumerate(rows)],
+        "stage": "ask",
+        "custom": custom,
+        "raw": "\n".join(lines[top + 1:foot + 1]),
+    }
+
+
+def _opencode_ask_answer(session_id: str, ask: dict, choice: int,
+                         text: Optional[str]) -> dict:
+    """Answer a question dialog. opencode's key handler maps 1..9 to "select
+    this row and act on it", so the digit is the whole answer — except on the
+    free-text row, where it opens a textarea we then have to fill and submit.
+    """
+    label = next(o["label"] for o in ask["options"] if o["num"] == choice)
+    if choice > 9:
+        return {"ok": False,
+                "error": f"option {choice} is past the digit keys opencode binds"}
+    if choice == ask.get("custom") and not (text and text.strip()):
+        return {"ok": False,
+                "error": f"option {choice} opens a free-text box — pass `text`"}
+    _send_keys(session_id, str(choice))
+    if choice == ask.get("custom"):
+        time.sleep(0.3)                   # let the textarea take focus
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.3)
+        _send_keys(session_id, "Enter")
+    return {"ok": True, "choice": choice, "label": label}
+
+
+def opencode_pending(session_id: str) -> Optional[dict]:
+    """The pending opencode permission gate for a live session, or None."""
+    screen = capture_pane(session_id, history=0)
+    if screen is None:
+        return None
+    # Two unrelated widgets can be waiting on the user: the permission gate and
+    # the `question` tool's dialog. Cheap-reject both before the -e capture.
+    is_gate = bool(_OPENCODE_GATE_HEAD_RE.search(screen))
+    if not is_gate and not _OPENCODE_ASK_FOOT_RE.search(screen):
+        return None
+    ansi = capture_pane_ansi(session_id)
+    if is_gate:
+        return parse_opencode_gate(screen, ansi)
+    return parse_opencode_ask(screen, ansi)
+
+
+def _opencode_pick(session_id: str, gate: dict, choice: int,
+                   tries: int = 3) -> dict:
+    """Move the ⇆ highlight onto option `choice` (1-based) and press Enter.
+
+    The row wraps, so there's no "press Left until it stops" home position — we
+    read where the highlight currently is, step the shortest way to the wanted
+    option, re-read, and only then confirm.
+    """
+    opts = gate["options"]
+    want = choice - 1
+
+    for _ in range(tries):
+        cur = next((i for i, o in enumerate(opts) if o["selected"]), None)
+        if cur is None:
+            return {"ok": False, "error": "could not read the gate's selection"}
+        if cur == want:
+            break
+        step = "Right" if want > cur else "Left"
+        for _ in range(abs(want - cur)):
+            _send_keys(session_id, step)
+            time.sleep(0.1)
+        time.sleep(0.3)
+        gate = opencode_pending(session_id)
+        if gate is None:
+            return {"ok": False, "error": "gate disappeared mid-answer"}
+        opts = gate["options"]
+    else:
+        return {"ok": False, "error": "could not move the gate's selection"}
+
+    _send_keys(session_id, "Enter")
+    return {"ok": True, "choice": choice, "label": opts[want]["label"]}
+
+
+def _opencode_reject(session_id: str, choice: int,
+                     text: Optional[str] = None) -> dict:
+    """Answer the reason box: Enter submits the rejection, Escape backs out."""
+    if choice == 2:
+        _send_keys(session_id, "Escape")
+        return {"ok": True, "choice": 2, "label": "Cancel"}
+    if text and text.strip():
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.3)
+    _send_keys(session_id, "Enter")
+    return {"ok": True, "choice": 1, "label": "Confirm"}
+
+
+def _opencode_follow_up(session_id: str, label: str, text: Optional[str],
+                        tries: int) -> Optional[dict]:
+    """Drive the second dialog "Allow always"/"Reject" opens, if one appeared.
+
+    Neither of those answers the request by itself, so stopping at the first
+    Enter parks the session on a dialog nobody is watching.
+    """
+    if label not in ("Allow always", "Reject"):
+        return None
+    time.sleep(0.4)
+    nxt = opencode_pending(session_id)
+    if nxt is None:
+        return None              # nothing followed — the gate is already gone
+    stage = nxt.get("stage")
+    if stage == "always":
+        done = _opencode_pick(session_id, nxt, 1, tries)    # "Confirm"
+        if not done["ok"]:
+            return {"ok": False,
+                    "error": f"could not confirm allow-always: {done['error']}"}
+        return {"followed_up": "always"}
+    if stage == "reject":
+        _opencode_reject(session_id, 1, text)
+        return {"followed_up": "reject"}
+    return None
+
+
+def opencode_answer(session_id: str, choice: int, text: Optional[str] = None,
+                    tries: int = 3) -> dict:
+    """Answer a live opencode gate by option number (1-based, left to right).
+
+    The gate is three dialogs, not one. "Allow once" answers the request, but
+    "Allow always" and "Reject" only open a follow-up — Confirm/Cancel, or a box
+    asking what to do instead — so this drives that one too and a single call
+    finishes the gate. `text` is the reason to type into a rejection box.
+    """
+    gate = opencode_pending(session_id)
+    if gate is None:
+        return {"ok": False, "error": "no opencode permission gate on screen"}
+    opts = gate["options"]
+    if not 1 <= choice <= len(opts):
+        return {"ok": False,
+                "error": f"choice {choice} out of range (1..{len(opts)})"}
+
+    if gate.get("stage") == "ask":
+        return _opencode_ask_answer(session_id, gate, choice, text)
+    if gate.get("stage") == "reject":
+        return _opencode_reject(session_id, choice, text)
+
+    picked = _opencode_pick(session_id, gate, choice, tries)
+    if not picked["ok"]:
+        return picked
+    follow = _opencode_follow_up(session_id, picked["label"], text, tries)
+    if follow:
+        picked.update(follow)
+    return picked
+
+
+def _opencode_input_pending(session_id: str, snippet: str) -> bool:
+    """True if `snippet` still sits in opencode's composer (not yet submitted)."""
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    key = snippet.strip()[:24]
+    if not key:
+        return False
+    return any(key in l for l in screen.splitlines()[-8:])
+
+
+def opencode_say(session_id: str, text: str, tries: int = 4) -> dict:
+    """Type `text` into a live opencode REPL and submit it.
+
+    opencode's editor takes a literal paste + Enter cleanly, but we verify the
+    same way as claude and grok rather than trusting it — a swallowed Enter
+    leaves the message sitting unsent in the composer, which looks identical to
+    a session that simply hasn't replied yet.
+    """
+    if not text.strip():
+        return {"ok": False, "error": "empty message"}
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    _send_keys(session_id, "-l", "--", text)
+    time.sleep(0.5)                       # let the editor ingest the paste
+    for attempt in range(1, tries + 1):
+        _send_keys(session_id, "Enter")
+        time.sleep(0.6)
+        if opencode_working(session_id) \
+                or not _opencode_input_pending(session_id, text):
+            return {"ok": True, "attempts": attempt}
+        time.sleep(0.4)
+    return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
+
+
 def agy_answer(session_id: str, action: str) -> dict:
     """Answer an agy approval gate: 'approve' → C-k, 'manage' → M-j (Alt+j),
     'reject' → Escape. (agy gates use key chords, not a numbered menu.)"""
