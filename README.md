@@ -153,15 +153,21 @@ subprocess `cwd` set to the session's project, streaming events back over SSE. P
 
 ## Workflows
 
-A **workflow** is a stored blueprint, not a running process: a titled agent
-roster plus an ordered list of stages. Defining or assigning one never spawns
-a session, routes a hand-off, or auto-advances anything — a human drives every
-step by hand.
+A **workflow** is a stored blueprint, not a running process: an ordered list of
+stages, each naming the agents that work it. Defining or assigning one never
+spawns a session, routes a hand-off, or auto-advances anything — a human drives
+every step by hand.
 
-- **Agents** — each has an id, a name, a model, a role, and a system prompt.
-  Reusable across stages: a stage names which agents take part by id.
+- **Agents** come from `~/.claude/agents` — the same markdown files Claude Code
+  itself loads, one definition per agent on the machine. The dashboard reads
+  that folder and never writes it: add, edit, or remove an agent by editing the
+  files. Set `CLAUDE_AGENTS_DIR` to point somewhere else. An agent's frontmatter
+  `name` is its id; a file with no frontmatter is still listed, keyed on its
+  filename.
 - **Stages** — each has a name, a goal, exit criteria, a coordination **mode**,
-  and the agent ids assigned to it.
+  and the agent ids assigned to it. An id whose file has since been renamed or
+  deleted is kept, flagged in the editor, and named in the composed prompt
+  rather than silently dropped.
 
 ### Coordination modes
 
@@ -179,17 +185,24 @@ together:
 
 ### Assigning and driving a workflow
 
-Assign a workflow to a session from the **workflow panel** on its detail page
-(`/session.html?id=…`) — pick one from the dropdown. This creates a
+Assign a workflow to a session from its detail page (`/session.html?id=…`):
+the **🧩 Assign workflow** button in the header row opens the list. This creates a
 **binding**: which workflow, which stage index, nothing more. One workflow per
 session; assigning a new one replaces the binding.
 
 From there, everything is manual, one stage at a time:
 
 - **▶ Send stage** composes the current stage's prompt (goal, exit criteria,
-  the mode sentence, and each participating agent's role/model/prompt) and
-  types it into the session's live tmux pane — the same as typing it yourself.
+  the mode sentence, and each participating agent's description and prompt) and
+  opens it in an editor. Edit it or send it as composed; either way it goes into
+  the session's live tmux pane as one bracketed paste, the same as typing it
+  yourself. An edit applies to that send only — the blueprint is untouched.
 - **✓ Advance** moves the stage pointer forward. It does not send anything.
+- **🕘 Runs** is the log of what this session was actually sent: which stage,
+  which model answered, which agents took part, when it started, and how long
+  the turn took. A run closes when the transcript stops moving, so the duration
+  is the session's own, not the dashboard's polling interval. Sending again
+  while a turn is in flight marks the earlier run `superseded`.
 
 Sending never advances the pointer; advancing never sends a prompt. A `/clear`
 on a bound session carries the binding onto the new session id, so the
@@ -200,30 +213,16 @@ workflow and stage survive.
 Workflows export to a small YAML file you can review, diff, and keep in git.
 Importing always creates a **new** workflow — it never overwrites one that
 already exists. Ids are optional on import, and the two kinds are filled in
-differently when left blank: an agent id is slugified from the agent's name,
-while a stage id is the next free `s<n>` — `s1`, `s2`, … — which owes nothing
-to the stage's name. Stage numbers are never recycled, because a binding
-remembers by id which stages it has already sent.
+differently when left blank: a stage id is the next free `s<n>` — `s1`, `s2`, …
+— which owes nothing to the stage's name. Stage numbers are never recycled,
+because a binding remembers by id which stages it has already sent. The file
+carries stages only; agents are referenced by id and resolved against
+`~/.claude/agents` on whichever machine reads it. An `agents:` block from a file
+written before the central roster is ignored, not rejected.
 
 ```yaml
 title: Feature delivery
 description: Design, implement, and review one feature end to end.
-agents:
-  - id: architect
-    name: Architect
-    role: Designs the approach before code is written
-    model: opus
-    prompt: You design before you code. Produce a short plan and call out risks.
-  - id: builder
-    name: Builder
-    role: Implements the plan
-    model: sonnet
-    prompt: You implement the architect's plan. Keep diffs small and tested.
-  - id: reviewer
-    name: Reviewer
-    role: Checks the diff for correctness and style
-    model: sonnet
-    prompt: You review the builder's diff. Be specific — cite file and line.
 stages:
   - id: s1
     name: Design
@@ -264,7 +263,7 @@ claude.sessions/
 │   ├── summaries.py         # persisted "what's expected" summaries (keyed by mtime)
 │   ├── summarizer.py        # generates summaries via `claude --print` (isolated + cleaned up)
 │   └── static/              # index.html, session.html, search.html, app.js, style.css
-└── tests/                   # pytest suite (298 tests)
+└── tests/                   # pytest suite (391 tests)
 ```
 
 - **`parser.py`** is pure/file-based and independently testable. Summaries are cached per file
@@ -289,7 +288,7 @@ claude.sessions/
 - `server/.web_sessions.json` — per-session mtime of the last web-driven turn (WEB/CLI origin).
 - `server/.title_overrides.json` — your custom session titles.
 - `server/.waiting_summaries.json` — cached "what's expected" summaries.
-- `server/.workflows.json` — workflow blueprints (agent rosters, stages) and their per-session bindings.
+- `server/.workflows.json` — workflow blueprints (stages) plus their per-session bindings and stage run logs.
 
 These hold per-user runtime data. Back them up if you want to preserve renames across machines.
 
@@ -312,7 +311,7 @@ These hold per-user runtime data. Back them up if you want to preserve renames a
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # run the test suite (298 tests)
+.venv/bin/python -m pytest tests/ -q     # run the test suite (391 tests)
 ```
 
 Static assets are referenced with a `?v=N` query; bump it (and rely on the `no-store` header)

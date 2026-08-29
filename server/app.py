@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (agyparser, archives, attention, autonomy, descriptions,
+from . import (agents, agyparser, archives, attention, autonomy, descriptions,
                grokparser, models, ollamausage, opencodeparser, overrides,
                parser, pins, projects, registry, runner, slackbot,
                subagents, summaries, summarizer, tasks, tmuxio, workflows)
@@ -312,12 +312,11 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
         s["description"] = descs.get(sid)
         s["attention"] = sid in marked
         s["autonomy"] = autonomy.get(sid)
-        # grok is read-only (no send/gate/kill), but a tmux named after its id
-        # means a live REPL is running — flag it live so the board shows it.
+        # A tmux named after its id means a live REPL is running — flag it live
+        # so the board shows it.
         if sid in live_ids:
             s["live_tmux"] = s["live"] = True
-            # mid-turn (grok pane shows "Esc to stop") → THINKING, else WAITING.
-            s["status"] = "THINKING" if tmuxio.grok_working(sid) else "WAITING"
+            _apply_grok_live(s, sid)
             s["error"] = errs.get(sid)
         else:
             s["live_tmux"] = s["live"] = False
@@ -364,6 +363,23 @@ def _opencode_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None)
                 s["status"] = "WAITING"      # not live → never surface THINKING
         out.append(_apply_delegating(s))
     return out
+
+
+def _apply_grok_live(s: dict, session_id: str) -> None:
+    """Status + gate flag for a live grok pane.
+
+    grok's `ask_user_question` card stops the agent dead until the human picks
+    an answer, and nothing in the transcript says so — the card lives on the
+    pane. Without this a session parked on a question read as WAITING like any
+    other idle one and never reached the To-do inbox.
+    """
+    if tmuxio.grok_pending(session_id) is not None:
+        s["status"] = "WAITING"
+        s["pending_approval"] = True
+        return
+    s["pending_approval"] = False
+    # mid-turn (grok pane shows "Esc to stop") → THINKING, else WAITING.
+    s["status"] = "THINKING" if tmuxio.grok_working(session_id) else "WAITING"
 
 
 def _apply_opencode_live(s: dict, session_id: str) -> None:
@@ -591,6 +607,23 @@ def api_status(session_id: str):
     return s
 
 
+@app.get("/api/sessions/{session_id}/subagents/{agent_id}")
+def api_subagent_transcript(session_id: str, agent_id: str):
+    """One sub-agent run in full: what it was told, what it did, what it found.
+
+    The roster answers "what did it farm out?"; this answers "what did that one
+    actually do?" — which the main transcript cannot, because it only ever sees
+    the one-line report the run handed back.
+    """
+    path = parser.session_path(session_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    run = subagents.transcript(path, agent_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="sub-agent run not found")
+    return run
+
+
 @app.get("/api/sessions/{session_id}/tail")
 def api_tail(session_id: str, offset: int = Query(0)):
     """Incremental history: events written after byte `offset`. For live
@@ -730,7 +763,7 @@ def _summary_by_id(session_id: str, titles: dict, arch_ids: set, marked: set,
         s["autonomy"] = autonomy.get(sid)
         if sid in live_ids:
             s["live_tmux"] = True
-            s["status"] = "WAITING"
+            _apply_grok_live(s, sid)
             s["error"] = tmuxio.error_lines().get(sid)
         else:
             s["live_tmux"] = False
@@ -1058,6 +1091,7 @@ def api_tmux(session_id: str):
     """
     is_agy = agyparser.has_conversation(session_id)
     is_opencode = not is_agy and opencodeparser.has_session(session_id)
+    is_grok = not is_agy and not is_opencode and grokparser.has_session(session_id)
     # For agy, the console pane IS the conversation view (its .db store is lossy),
     # so capture full scrollback once and slice the visible frame from its tail
     # (gate/spinner/input live at the bottom) — one capture, not two.
@@ -1078,9 +1112,11 @@ def api_tmux(session_id: str):
         prompt = agyparser.parse_gate(screen)
     elif is_opencode:
         prompt = tmuxio.opencode_pending(session_id)
+    elif is_grok:
+        prompt = tmuxio.parse_grok_ask(screen)
     else:
         prompt = None
-    if prompt is None and not is_opencode:
+    if prompt is None and not is_opencode and not is_grok:
         prompt = tmuxio.parse_prompt(screen)
     # opencode's spinner is bare animated dots — no "what it's thinking" text to
     # lift out of it, so it stays empty rather than showing noise.
@@ -1295,9 +1331,15 @@ def api_answer(session_id: str, body: AnswerBody):
 
     opencode's gate is a horizontal row of options; picking "Reject" there opens
     a box asking what to do instead, and `text` is typed into it.
+
+    grok's `ask_user_question` card is not a permission gate but the same shape:
+    each row has its own key (1-9 then a-f, `z` for the free-text row), so the
+    choice number is mapped back to that key. `text` fills the free-text row.
     """
     if opencodeparser.has_session(session_id):
         result = tmuxio.opencode_answer(session_id, body.choice, body.text)
+    elif grokparser.has_session(session_id):
+        result = tmuxio.grok_answer(session_id, body.choice, body.text)
     else:
         result = tmuxio.answer(session_id, body.choice, body.text)
     if not result.get("ok"):
@@ -1469,9 +1511,13 @@ def api_triage():
         out.append(s)
 
     # Include grok sessions that are live (tmux running) or manually pinned.
+    # _grok_summaries already set pending_approval off the live pane, so a
+    # session parked on a question card only needs the card read out.
     for s in _grok_summaries(titles, arch_ids, marked, "exclude", live_tmux):
         if not (s["live_tmux"] or s["attention"]):
             continue
+        if s.get("pending_approval"):
+            s["prompt"] = tmuxio.grok_pending(s["session_id"])
         s["projects"] = proj_map.get(s["session_id"], [])
         s["task_count"] = task_counts.get(s["session_id"], 0)
         s["workflow"] = wf_map.get(s["session_id"])
@@ -1599,7 +1645,6 @@ class WorkflowBody(BaseModel):
 class WorkflowDocBody(BaseModel):
     title: str | None = None
     description: str | None = None
-    agents: list[dict] | None = None
     stages: list[dict] | None = None
 
 
@@ -1612,6 +1657,20 @@ class ImportBody(BaseModel):
 
 class PreviewBody(BaseModel):
     stage_index: int = 0
+    # The stage as it stands in the editor, unsaved. Without it preview falls
+    # back to the stored stage at stage_index.
+    stage: dict | None = None
+    title: str | None = None
+
+
+@app.get("/api/agents")
+def api_agents():
+    """The agent roster, read from Claude's own agents folder.
+
+    Read-only on purpose: agents are defined by the files in ~/.claude/agents,
+    so the dashboard shows them and never becomes a second place to edit them.
+    """
+    return {"agents": agents.list_agents(), "dir": agents.AGENTS_DIR}
 
 
 @app.get("/api/workflows")
@@ -1642,7 +1701,7 @@ def api_update_workflow(wid: str, body: WorkflowDocBody):
     try:
         wf = workflows.update_workflow(wid, title=body.title,
                                        description=body.description,
-                                       agents=body.agents, stages=body.stages)
+                                       stages=body.stages)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if wf is None:
@@ -1677,13 +1736,64 @@ def api_import_workflow(body: ImportBody):
 
 @app.post("/api/workflows/{wid}/preview")
 def api_preview_stage(wid: str, body: PreviewBody):
-    """Exactly what a send would type — shown before anything is sent."""
-    if workflows.get_workflow(wid) is None:
+    """Exactly what a send would type — shown before anything is sent.
+
+    With a `stage` in the body this composes what is on screen, so ticking an
+    agent and pressing preview shows that agent. Saving is still what makes it
+    real: the send path reads the stored workflow, never this.
+    """
+    wf = workflows.get_workflow(wid)
+    if wf is None:
         raise HTTPException(status_code=404, detail="workflow not found")
     try:
-        return {"prompt": workflows.compose_stage(wid, body.stage_index)}
+        if body.stage is not None:
+            stage = workflows.validate([body.stage])[0]
+            return {"prompt": workflows.compose(body.title or wf["title"], stage),
+                    "saved": False}
+        return {"prompt": workflows.compose_stage(wid, body.stage_index), "saved": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# A stage prompt is a prompt, not a payload. The composed one is ~1KB; this
+# leaves generous room to edit before sending and still refuses a paste of
+# something that was never meant to be typed into a REPL.
+_MAX_STAGE_PROMPT = 100_000
+
+
+def _session_pulse(session_id: str) -> dict:
+    """(model, mtime) for a session, whatever produced it.
+
+    Every parser publishes the same two fields on its summary, so one helper
+    covers Claude, grok, agy and opencode without the caller caring which.
+    Returns {} when nothing knows the session.
+    """
+    for fn in (parser.get_summary, grokparser.get_session,
+               opencodeparser.get_session, agyparser.get_conversation):
+        try:
+            rec = fn(session_id)
+        except Exception:          # a read-only store that isn't there
+            rec = None
+        if rec:
+            return {"model": rec.get("model") or "",
+                    "mtime": rec.get("mtime"),
+                    "updated_at": rec.get("updated_at") or ""}
+    return {}
+
+
+def _settle_runs(session_id: str) -> None:
+    """Close the open run once the session has gone quiet.
+
+    A run ends when the session stops writing, so the end time is the
+    transcript's last write — not the moment the dashboard happened to look.
+    THINKING_MAX_AGE is the same threshold the status pill uses, so a run
+    closes exactly when the session stops reading as busy.
+    """
+    pulse = _session_pulse(session_id)
+    mtime = pulse.get("mtime")
+    if not mtime or time.time() - mtime < parser.THINKING_MAX_AGE:
+        return
+    workflows.close_open_run(session_id, pulse.get("updated_at") or "")
 
 
 class AssignBody(BaseModel):
@@ -1692,6 +1802,13 @@ class AssignBody(BaseModel):
 
 class AdvanceBody(BaseModel):
     delta: int = 1
+
+
+class SendStageBody(BaseModel):
+    # The composed stage is a starting point, not a contract: the operator gets
+    # to say what actually goes in. Omitted (or blank) means send what the
+    # workflow composed.
+    prompt: str | None = None
 
 
 def _binding_view(session_id: str) -> dict:
@@ -1714,8 +1831,13 @@ def _binding_view(session_id: str) -> dict:
         stage_id = stages[idx]["id"]
         out["stage_index"] = idx
         out["prompt"] = workflows.compose_stage(b["workflow_id"], idx)
+        found, missing = agents.get_many(stages[idx].get("agent_ids", []))
+        out["stage_agents"] = [a["name"] for a in found]
+        out["missing_agents"] = missing
     else:
         out["prompt"] = ""
+        out["stage_agents"] = []
+        out["missing_agents"] = []
     out["stage_id"] = stage_id
     out["sent"] = stage_id in b.get("sent", [])
     return out
@@ -1723,7 +1845,15 @@ def _binding_view(session_id: str) -> dict:
 
 @app.get("/api/sessions/{session_id}/workflow")
 def api_session_workflow(session_id: str):
-    return _binding_view(session_id)
+    _settle_runs(session_id)      # the panel polls this; it is where a finished
+    return _binding_view(session_id)   # run gets its end time written down
+
+
+@app.get("/api/sessions/{session_id}/workflow/runs")
+def api_workflow_runs(session_id: str):
+    """Every stage this session has actually been sent, newest first."""
+    _settle_runs(session_id)
+    return {"session_id": session_id, "runs": workflows.list_runs(session_id)}
 
 
 @app.post("/api/sessions/{session_id}/workflow")
@@ -1742,21 +1872,41 @@ def api_unassign_workflow(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/workflow/send")
-def api_send_stage(session_id: str):
-    """Type the current stage's composed prompt into the live REPL.
+def api_send_stage(session_id: str, body: SendStageBody | None = None):
+    """Type the current stage's prompt into the live REPL.
 
     Sending is always a button press: assigning a workflow costs nothing, and
-    the operator decides when a stage actually runs.
+    the operator decides when a stage actually runs — and, with `prompt`, what
+    it says. The run log records which of the two went out.
     """
     view = _binding_view(session_id)
     if not view.get("bound"):
         raise HTTPException(status_code=409, detail="no workflow assigned")
-    if not view.get("prompt"):
+    composed = view.get("prompt") or ""
+    if not composed:
         raise HTTPException(status_code=409, detail="this workflow has no stages")
-    result = tmuxio.say(session_id, view["prompt"])
+    text = (body.prompt if body and body.prompt is not None else "") or ""
+    edited = bool(text.strip()) and text.strip() != composed.strip()
+    prompt = text if text.strip() else composed
+    if len(prompt.encode("utf-8")) > _MAX_STAGE_PROMPT:
+        raise HTTPException(status_code=413, detail="stage prompt too large")
+
+    result = tmuxio.say(session_id, prompt)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "send failed"))
     workflows.mark_sent(session_id, view["stage_id"])
+    workflows.start_run(
+        session_id,
+        stage_id=view["stage_id"],
+        stage_name=view.get("stage_name", ""),
+        stage_index=view.get("stage_index", 0),
+        model=_session_pulse(session_id).get("model", ""),
+        # Names for the agents that resolved, raw ids for the ones that did
+        # not — the log should show what the prompt was actually built from.
+        agent_ids=view.get("stage_agents", []) + view.get("missing_agents", []),
+        chars=len(prompt),
+        edited=edited,
+    )
     return _binding_view(session_id)
 
 
