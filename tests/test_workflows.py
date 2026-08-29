@@ -1,8 +1,9 @@
 """
 Workflows — the blueprint store.
 
-A workflow is a roster of agents plus an ordered list of stages that reference
-them. Nothing here talks to tmux: this file is the store's contract only.
+A workflow is an ordered list of stages, each naming agents by id. The agents
+themselves live in ~/.claude/agents and are not stored here: see test_agents.py
+for the roster, and conftest.py for the scratch folder these tests read.
 
 Every test points the store at a tmp file, so the real state under server/ is
 never touched.
@@ -11,11 +12,6 @@ never touched.
 import pytest
 
 from server import workflows
-
-AGENTS = [
-    {"name": "Researcher", "role": "Find prior art", "prompt": "You research."},
-    {"name": "Builder", "role": "Write the code", "model": "sonnet", "prompt": "You build."},
-]
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +23,8 @@ def test_create_defaults():
     wf = workflows.create_workflow("  Feature delivery  ", "  research then build  ")
     assert wf["title"] == "Feature delivery"          # stored trimmed
     assert wf["description"] == "research then build"
-    assert wf["agents"] == [] and wf["stages"] == []
+    assert wf["stages"] == []
+    assert "agents" not in wf                         # the roster is not ours
     assert len(wf["id"]) == 12
     assert wf["created_at"] and wf["updated_at"]
 
@@ -36,37 +33,39 @@ def test_create_blank_title_falls_back():
     assert workflows.create_workflow("   ")["title"] == "Untitled workflow"
 
 
-def test_update_assigns_agent_and_stage_ids():
+def test_update_assigns_stage_ids_and_keeps_agent_ids():
     wid = workflows.create_workflow("W")["id"]
-    wf = workflows.update_workflow(wid, agents=AGENTS, stages=[
+    wf = workflows.update_workflow(wid, stages=[
         {"name": "Discovery", "goal": "look around", "mode": "parallel",
-         "agent_ids": ["researcher", "builder"], "exit_criteria": "a list"},
+         "agent_ids": ["Researcher", "Builder"], "exit_criteria": "a list"},
     ])
-    assert [a["id"] for a in wf["agents"]] == ["researcher", "builder"]
-    assert wf["agents"][0]["model"] == "opus"          # default
-    assert wf["agents"][1]["model"] == "sonnet"
     assert [s["id"] for s in wf["stages"]] == ["s1"]
+    assert wf["stages"][0]["agent_ids"] == ["Researcher", "Builder"]
 
 
-def test_duplicate_agent_names_get_distinct_ids():
+def test_saving_drops_a_legacy_agent_roster():
+    """Workflows written before the central roster carried their own agents.
+    The first save after upgrading is where that copy goes."""
     wid = workflows.create_workflow("W")["id"]
-    wf = workflows.update_workflow(wid, agents=[
-        {"name": "Reviewer", "prompt": "a"},
-        {"name": "Reviewer", "prompt": "b"},
-    ], stages=[])
-    assert [a["id"] for a in wf["agents"]] == ["reviewer", "reviewer-2"]
+    with workflows._lock:
+        data = workflows._load()
+        data["workflows"][wid]["agents"] = [{"id": "builder", "name": "Builder"}]
+        workflows._save(data)
+    wf = workflows.update_workflow(wid, title="W")
+    assert "agents" not in wf
+    assert "agents" not in workflows.get_workflow(wid)
 
 
 def test_stage_ids_are_never_reused():
     wid = workflows.create_workflow("W")["id"]
-    workflows.update_workflow(wid, agents=AGENTS, stages=[
-        {"name": "One", "mode": "solo", "agent_ids": ["researcher"]},
-        {"name": "Two", "mode": "solo", "agent_ids": ["builder"]},
+    workflows.update_workflow(wid, stages=[
+        {"name": "One", "mode": "solo", "agent_ids": ["Researcher"]},
+        {"name": "Two", "mode": "solo", "agent_ids": ["Builder"]},
     ])
     # Drop the first stage, then add another: the new one must not be s1.
     wf = workflows.update_workflow(wid, stages=[
-        {"id": "s2", "name": "Two", "mode": "solo", "agent_ids": ["builder"]},
-        {"name": "Three", "mode": "solo", "agent_ids": ["builder"]},
+        {"id": "s2", "name": "Two", "mode": "solo", "agent_ids": ["Builder"]},
+        {"name": "Three", "mode": "solo", "agent_ids": ["Builder"]},
     ])
     assert [s["id"] for s in wf["stages"]] == ["s2", "s3"]
 
@@ -76,9 +75,9 @@ def test_duplicate_stage_ids_are_repaired_not_rejected():
     validate() mints a fresh one instead of raising, the same way it repairs
     a missing or malformed id."""
     wid = workflows.create_workflow("W")["id"]
-    wf = workflows.update_workflow(wid, agents=AGENTS, stages=[
-        {"id": "s1", "name": "One", "mode": "solo", "agent_ids": ["researcher"]},
-        {"id": "s1", "name": "Two", "mode": "solo", "agent_ids": ["builder"]},
+    wf = workflows.update_workflow(wid, stages=[
+        {"id": "s1", "name": "One", "mode": "solo", "agent_ids": ["Researcher"]},
+        {"id": "s1", "name": "Two", "mode": "solo", "agent_ids": ["Builder"]},
     ])
     assert [s["id"] for s in wf["stages"]] == ["s1", "s2"]
 
@@ -88,80 +87,72 @@ def test_stage_ids_survive_deleting_the_last_stage():
     caller sent — otherwise deleting the newest stage and adding one in the
     same save would hand the new stage the id that was just freed."""
     wid = workflows.create_workflow("W")["id"]
-    workflows.update_workflow(wid, agents=AGENTS, stages=[
-        {"name": "One", "mode": "solo", "agent_ids": ["builder"]},
-        {"name": "Two", "mode": "solo", "agent_ids": ["builder"]},
+    workflows.update_workflow(wid, stages=[
+        {"name": "One", "mode": "solo", "agent_ids": ["Builder"]},
+        {"name": "Two", "mode": "solo", "agent_ids": ["Builder"]},
     ])
     wf = workflows.update_workflow(wid, stages=[
-        {"id": "s1", "name": "One", "mode": "solo", "agent_ids": ["builder"]},
-        {"name": "Fresh", "mode": "solo", "agent_ids": ["builder"]},
+        {"id": "s1", "name": "One", "mode": "solo", "agent_ids": ["Builder"]},
+        {"name": "Fresh", "mode": "solo", "agent_ids": ["Builder"]},
     ])
     assert [s["id"] for s in wf["stages"]] == ["s1", "s3"]
 
 
-def test_deleting_an_agent_strips_it_from_stages():
+def test_an_agent_id_with_no_file_is_kept():
+    """The roster is a folder that changes without this module watching. A
+    renamed or deleted agent file must not make the workflow unsavable — the
+    id stays, and compose_stage is where the operator hears about it."""
     wid = workflows.create_workflow("W")["id"]
-    workflows.update_workflow(wid, agents=AGENTS, stages=[
-        {"name": "Both", "mode": "parallel", "agent_ids": ["researcher", "builder"]},
+    wf = workflows.update_workflow(wid, stages=[
+        {"name": "X", "mode": "solo", "agent_ids": ["ghost"]},
     ])
-    wf = workflows.update_workflow(wid, agents=[AGENTS[0]])
-    assert [a["id"] for a in wf["agents"]] == ["researcher"]
-    assert wf["stages"][0]["agent_ids"] == ["researcher"]
+    assert wf["stages"][0]["agent_ids"] == ["ghost"]
 
 
-def test_a_stage_left_with_no_agents_is_still_kept():
-    """Editing is iterative — losing the stage as a side effect of removing an
-    agent would delete work the operator never asked to delete."""
+def test_duplicate_agent_id_in_one_stage_rejected():
     wid = workflows.create_workflow("W")["id"]
-    workflows.update_workflow(wid, agents=AGENTS, stages=[
-        {"name": "Solo", "mode": "solo", "agent_ids": ["builder"]},
-    ])
-    wf = workflows.update_workflow(wid, agents=[AGENTS[0]])
-    assert wf["stages"][0]["agent_ids"] == []
-
-
-def test_unknown_agent_id_rejected():
-    wid = workflows.create_workflow("W")["id"]
-    with pytest.raises(ValueError, match="unknown agent"):
-        workflows.update_workflow(wid, agents=AGENTS, stages=[
-            {"name": "X", "mode": "solo", "agent_ids": ["nobody"]},
+    with pytest.raises(ValueError, match="duplicate agent"):
+        workflows.update_workflow(wid, stages=[
+            {"name": "X", "mode": "parallel", "agent_ids": ["Builder", "Builder"]},
         ])
 
 
 def test_bad_mode_rejected():
     wid = workflows.create_workflow("W")["id"]
     with pytest.raises(ValueError, match="mode"):
-        workflows.update_workflow(wid, agents=AGENTS, stages=[
-            {"name": "X", "mode": "swarm", "agent_ids": ["builder"]},
+        workflows.update_workflow(wid, stages=[
+            {"name": "X", "mode": "swarm", "agent_ids": ["Builder"]},
         ])
 
 
 def test_solo_stage_needs_exactly_one_agent():
     wid = workflows.create_workflow("W")["id"]
     with pytest.raises(ValueError, match="solo"):
-        workflows.update_workflow(wid, agents=AGENTS, stages=[
-            {"name": "X", "mode": "solo", "agent_ids": ["researcher", "builder"]},
+        workflows.update_workflow(wid, stages=[
+            {"name": "X", "mode": "solo", "agent_ids": ["Researcher", "Builder"]},
         ])
 
 
-def test_nameless_agent_rejected():
+def test_nameless_stage_rejected():
     wid = workflows.create_workflow("W")["id"]
     with pytest.raises(ValueError, match="name"):
-        workflows.update_workflow(wid, agents=[{"name": "  ", "prompt": "x"}], stages=[])
+        workflows.update_workflow(wid, stages=[{"name": "  ", "mode": "solo"}])
 
 
 def test_list_counts_and_persistence():
     a = workflows.create_workflow("A")
-    workflows.update_workflow(a["id"], agents=AGENTS, stages=[
-        {"name": "One", "mode": "solo", "agent_ids": ["builder"]},
+    workflows.update_workflow(a["id"], stages=[
+        {"name": "One", "mode": "solo", "agent_ids": ["Builder"]},
+        {"name": "Two", "mode": "parallel", "agent_ids": ["Builder", "Researcher"]},
     ])
     workflows.create_workflow("B")
     rows = workflows.list_workflows()
     assert [r["title"] for r in rows] == ["B", "A"]        # newest first
     row = next(r for r in rows if r["id"] == a["id"])
-    assert row["agent_count"] == 2 and row["stage_count"] == 1
+    # Distinct agents across stages, not the sum per stage.
+    assert row["agent_count"] == 2 and row["stage_count"] == 2
     assert row["session_count"] == 0
-    assert "agents" not in row                             # list stays light
+    assert "stages" not in row                             # list stays light
 
 
 def test_update_unknown_workflow_returns_none():
