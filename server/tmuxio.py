@@ -456,6 +456,42 @@ def _send_keys(session_id: str, *keys: str) -> None:
     )
 
 
+def _paste(session_id: str, text: str) -> None:
+    """Deliver `text` to the pane as ONE bracketed paste.
+
+    `send-keys -l` writes the raw bytes with no paste wrapper, and tmux drains
+    them to the pty in 1022-byte writes. Every newline that arrives outside a
+    paste bracket is an Enter, so a multi-line message submits itself in pieces
+    and only the tail survives as the "real" turn. Going through a buffer and
+    pasting with -p wraps the payload in ESC[200~ … ESC[201~, so the REPL takes
+    it as one paste and the newlines stay newlines wherever the chunk
+    boundaries happen to fall.
+    """
+    buf = f"agentos-{uuid.uuid4().hex[:8]}"
+    subprocess.run(["tmux", "load-buffer", "-b", buf, "-"],
+                   input=text.encode(), capture_output=True, timeout=5)
+    subprocess.run(["tmux", "paste-buffer", "-d", "-p", "-b", buf, "-t", session_id],
+                   capture_output=True, text=True, timeout=5)
+
+
+def _composer_has_text(session_id: str) -> bool:
+    """True if the REPL composer still holds anything at all.
+
+    The pasted-message counterpart to _input_pending: after a bracketed paste
+    the REPL shows a "[Pasted text +N lines]" placeholder instead of the text,
+    so there is no snippet to look for. What still holds is that a submitted
+    composer is empty.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    for line in screen.splitlines()[-8:]:
+        stripped = _strip(line)
+        if stripped.startswith(("❯", ">")) and stripped[1:].strip():
+            return True
+    return False
+
+
 def has_session(session_id: str) -> bool:
     return capture_pane(session_id) is not None
 
@@ -580,15 +616,21 @@ def say(session_id: str, text: str, tries: int = 4) -> dict:
         return {"ok": False, "error": "empty message"}
     if capture_pane(session_id) is None:
         return {"ok": False, "error": "no live tmux session"}
-    # -l = literal, so a word like "Enter" inside the text isn't taken as a key.
-    _send_keys(session_id, "-l", "--", text)
-    time.sleep(0.5)                       # let the editor ingest the paste
+    multiline = "\n" in text.strip()
+    if multiline:
+        _paste(session_id, text.rstrip("\n"))
+        time.sleep(1.0)                   # a big paste takes longer to render
+    else:
+        # -l = literal, so a word like "Enter" inside the text isn't a keypress.
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.5)                   # let the editor ingest the paste
     for attempt in range(1, tries + 1):
         _send_keys(session_id, "Enter")
         time.sleep(0.6)
-        # Submitted if the turn started OR the composer no longer holds the text.
-        if spinner_line(capture_pane(session_id, history=0)) \
-                or not _input_pending(session_id, text):
+        # Submitted if the turn started OR the composer no longer holds it.
+        pending = (_composer_has_text(session_id) if multiline
+                   else _input_pending(session_id, text))
+        if spinner_line(capture_pane(session_id, history=0)) or not pending:
             return {"ok": True, "attempts": attempt}
         time.sleep(0.4)                   # editor still settling — retry Enter
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
@@ -756,13 +798,20 @@ def grok_say(session_id: str, text: str, tries: int = 4) -> dict:
         return {"ok": False, "error": "empty message"}
     if capture_pane(session_id) is None:
         return {"ok": False, "error": "no live tmux session"}
-    _send_keys(session_id, "-l", "--", text)
-    time.sleep(0.5)                       # let the editor ingest the paste
+    multiline = "\n" in text.strip()
+    if multiline:
+        _paste(session_id, text.rstrip("\n"))   # see _paste: newlines would submit
+        time.sleep(1.0)
+    else:
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.5)                   # let the editor ingest the paste
     for attempt in range(1, tries + 1):
         _send_keys(session_id, "Enter")
         time.sleep(0.6)
         # Submitted if the turn started OR the composer no longer holds the text.
-        if grok_working(session_id) or not _grok_input_pending(session_id, text):
+        pending = (_composer_has_text(session_id) if multiline
+                   else _grok_input_pending(session_id, text))
+        if grok_working(session_id) or not pending:
             return {"ok": True, "attempts": attempt}
         time.sleep(0.4)                   # editor still settling — retry Enter
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
@@ -797,6 +846,199 @@ def grok_usage(session_id: str, timeout: float = 8.0) -> dict:
         if l:
             cleaned.append(l)
     return {"ok": True, "text": "\n".join(cleaned).strip()}
+
+
+# ---- grok's question card (`ask_user_question`) --------------------------
+# A different widget from a permission gate: the agent stops and asks the human
+# to *choose*, and the answer is a decision about the work rather than about
+# risk. grok draws it as keyed radio rows with the description in a second
+# column, and a free-text row keyed `z`:
+#
+#     When a workflow node fails, what happens?
+#
+#     1 (○) Fail-fast (Recommended)      Job status failed. Remaining nodes skipped.
+#     2 (○) Skip and continue            Failed node records an error; downstream …
+#     z (○) Type your answer here
+#
+#     ↑/↓ navigate · y copy
+#
+# Rows are keyed, not numbered: 1-9 then a-f, and `z` is always the free-text
+# row (grok's own key table). The key is the keystroke that picks the row, so
+# it is carried alongside a 1..N `num` the dashboard can count on.
+_GROK_ASK_ROW_RE = re.compile(
+    r"^([0-9a-z])\s+([(\[])\s*([^)\]\s]?)\s*([)\]])\s+(\S.*)$")
+# The card's own footer. grok renders the same pair of hints under every
+# question card, and nothing else in its TUI draws keyed radio rows under it.
+_GROK_ASK_FOOT_RE = re.compile(r"navigate\b.{0,12}\bcopy\b|Tab/Space:\s*question")
+_GROK_ASK_CUSTOM_RE = re.compile(r"^type your (own )?answer( here)?$", re.I)
+# A ticked radio or checkbox. grok degrades these to ASCII on terminals that
+# cannot draw them (its own glyph fallback table), so both spellings count.
+_GROK_FILLED = "●◉◎x✕✓✔*"
+# Label and description share a row, separated by the gap that aligns the
+# description column.
+_GROK_ASK_GAP_RE = re.compile(r"\s{2,}")
+
+
+# How far above a footer the answer rows may start. The card's own footer sits
+# one blank line under the last row; the shortcuts bar sits a couple of lines
+# further down again, and either one can be the match we found first.
+_GROK_ASK_LEAD = 4
+
+
+def _grok_ask_rows(lines: list[str], foot: int) -> list[tuple[int, str, str, bool]]:
+    """The card's answer rows above `foot`, as (line index, key, rest, filled).
+
+    Read bottom-up and stopped at the first line that is not a row, so a keyed
+    line sitting in the scrollback above the card cannot join the run.
+
+    A description too wide for its row wraps onto the next line, indented under
+    the description column and carrying no key. Read bottom-up it arrives
+    before the row it belongs to, so it is held and folded into the next row
+    matched. Without that the run stopped at the wrap: the row above it was
+    dropped, its text was read as the question, and a card left with fewer than
+    two rows disappeared from the dashboard entirely.
+    """
+    out: list[tuple[int, str, str, bool]] = []
+    wrapped: list[str] = []
+    indent = 0
+    for i in range(foot - 1, -1, -1):
+        text = _unbox(lines[i])
+        m = _GROK_ASK_ROW_RE.match(text.strip())
+        if m:
+            tick = m.group(3)
+            indent = len(text) - len(text.lstrip())
+            # An empty box is not a ticked one; `in` on "" says otherwise.
+            out.append((i, m.group(1), " ".join([m.group(5), *wrapped]),
+                        bool(tick) and tick in _GROK_FILLED))
+            wrapped = []
+            continue
+        if out and text.strip() and len(text) - len(text.lstrip()) > indent:
+            wrapped.insert(0, text.strip())
+            continue
+        if out or foot - i > _GROK_ASK_LEAD:
+            break
+    out.reverse()
+    return out
+
+
+def parse_grok_ask(screen: Optional[str]) -> Optional[dict]:
+    """A pending grok question card from a captured screen, or None.
+
+    Same shape as the other gates — question, numbered options, `stage` and
+    `custom` — so the dashboard's answer UI and autonomy both read it without
+    knowing which CLI drew it. `custom` marks the free-text row, which is what
+    makes autonomy treat the whole card as a choice it must not answer.
+
+    Each option also carries `press`: the literal keystroke grok binds to it,
+    which is what actually gets sent. `num` stays a plain 1..N so the UI can
+    number the rows the way every other gate is numbered. (Not `key` — agy's
+    gate already uses that field for its own option ids, and the dashboard
+    routes an answer on it.)
+    """
+    if not screen:
+        return None
+    lines = screen.splitlines()
+    # grok shows two footers under a live card — the card's own "↑/↓ navigate"
+    # hints and the shortcuts bar below them. Either can be the lower match, so
+    # try them bottom-up and keep the first that actually has rows above it.
+    foot, rows = None, []
+    for i in range(len(lines) - 1, -1, -1):
+        if not _GROK_ASK_FOOT_RE.search(lines[i]):
+            continue
+        found = _grok_ask_rows(lines, i)
+        if len(found) >= 2:
+            foot, rows = i, found
+            break
+    if foot is None:
+        return None
+
+    # The question sits above the rows, past one or more blank lines, and wraps
+    # across as many lines as it needs.
+    head = rows[0][0] - 1
+    while head >= 0 and not _unbox(lines[head]).strip():
+        head -= 1
+    top = head
+    while top >= 0 and _unbox(lines[top]).strip():
+        top -= 1
+    question = " ".join(_unbox(l).strip() for l in lines[top + 1:head + 1]).strip()
+
+    options, custom = [], None
+    for n, (_, key, rest, filled) in enumerate(rows, 1):
+        parts = _GROK_ASK_GAP_RE.split(rest, 1)
+        label = parts[0].strip()
+        desc = parts[1].strip() if len(parts) > 1 else ""
+        if _GROK_ASK_CUSTOM_RE.match(label):
+            custom = n
+        options.append({"num": n, "press": key, "label": label, "desc": desc,
+                        "selected": filled})
+    return {
+        "question": question or "Question",
+        "context": "",
+        "options": options,
+        "stage": "ask",
+        "custom": custom,
+        "raw": "\n".join(lines[top + 1:foot + 1]),
+    }
+
+
+def grok_pending(session_id: str) -> Optional[dict]:
+    """The pending grok question card for a live session, or None."""
+    screen = capture_pane(session_id, history=0)
+    if screen is None:
+        return None
+    return parse_grok_ask(screen)
+
+
+def grok_answer(session_id: str, choice: int, text: str = "",
+                verify: float = 4.0) -> dict:
+    """Answer a live grok question card by picking option `choice`.
+
+    grok binds one key per row (1-9, then a-f, `z` for free text), so the key
+    is the whole answer — except that picking a row selects it and only Enter
+    submits. Which of the two a given card needs depends on how many questions
+    it is carrying, so this presses the key, looks, and only sends Enter if the
+    card is still up. Reporting honestly matters here: the autonomy watcher
+    records an answered card and never comes back to it.
+    """
+    screen = capture_pane(session_id)
+    if screen is None:
+        return {"ok": False, "error": "no live tmux session"}
+    ask = parse_grok_ask(screen)
+    if ask is None:
+        return {"ok": False, "error": "no question card on screen"}
+    opt = next((o for o in ask["options"] if o["num"] == choice), None)
+    if opt is None:
+        return {"ok": False, "error": f"option {choice} is not on this card"}
+    if choice == ask.get("custom") and not text.strip():
+        return {"ok": False,
+                "error": f"option {choice} is the free-text row — pass `text`"}
+
+    before = prompt_sig(ask)
+    _send_keys(session_id, "--", opt["press"])
+    if choice == ask.get("custom"):
+        time.sleep(0.3)                   # let the text field take focus
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.3)
+        _send_keys(session_id, "Enter")
+        return {"ok": True, "choice": choice, "label": opt["label"]}
+
+    if verify <= 0:
+        return {"ok": True, "choice": choice, "label": opt["label"]}
+
+    waited, pressed_enter = 0.0, False
+    while waited < verify:
+        time.sleep(0.4)
+        waited += 0.4
+        now = prompt_sig(parse_grok_ask(capture_pane(session_id, history=0) or ""))
+        if now != before:
+            return {"ok": True, "choice": choice, "label": opt["label"]}
+        if not pressed_enter:
+            # The key selected the row without submitting — that is what Enter
+            # is for on the last (or only) question of a card.
+            _send_keys(session_id, "Enter")
+            pressed_enter = True
+    return {"ok": False,
+            "error": "the question card is still on screen — the keypress didn't take"}
 
 
 # ---- opencode -----------------------------------------------------------
