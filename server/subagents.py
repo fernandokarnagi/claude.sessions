@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+
+from . import parser
 
 # meta.json cache: path -> (mtime, parsed dict). The file is written once when
 # the run starts and never touched again, so this effectively never re-reads.
@@ -38,6 +41,15 @@ _meta_cache: dict[str, tuple[float, dict]] = {}
 AGENT_TOOLS = {"Agent", "Task"}
 
 _MAX_DESC = 120
+
+# An agent id addresses a file inside the session's own subagents folder, and it
+# arrives from a URL. Anything outside this alphabet is not an id — refusing it
+# is what keeps the path from being steered somewhere else.
+_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
+
+# A sub-agent run is minutes of work, not a session's worth. This caps what one
+# request renders; the newest turns are the ones being asked about.
+_MAX_ACTIVITIES = 600
 
 
 def dir_for(transcript_path: str) -> str:
@@ -166,3 +178,58 @@ def latest_mtime(transcript_path: str) -> float:
     except OSError:
         return 0.0
     return newest
+
+
+def transcript(transcript_path: str, agent_id: str,
+               limit: int = _MAX_ACTIVITIES) -> dict | None:
+    """One sub-agent run, expanded into activities the detail view can render.
+
+    Same shape as the main history — kind/ts/text, tool calls with their input,
+    results with their output — because a sub-agent transcript is a transcript.
+    None when there is no such run.
+
+    Oldest first: this is read as the story of one run, not as a live tail.
+    """
+    if not _ID_RE.match(agent_id or "") or ".." in agent_id:
+        return None
+    d = dir_for(transcript_path)
+    name = agent_id if agent_id.startswith("agent-") else "agent-" + agent_id
+    path = os.path.join(d, name + ".jsonl")
+    # The join is built from a validated id, and this pins it to the folder
+    # anyway — belt and braces, because the cost of being wrong is reading an
+    # arbitrary file off the operator's disk.
+    if os.path.dirname(os.path.abspath(path)) != os.path.abspath(d):
+        return None
+    if not os.path.isfile(path):
+        return None
+
+    meta = _read_meta(os.path.join(d, name + ".meta.json"))
+    acts: list[dict] = []
+    try:
+        for evt in parser._iter_events(path):
+            for block in parser.render_blocks(evt):
+                if block.get("text", "").strip() or block.get("name"):
+                    acts.append(block)
+    except OSError:
+        return None
+
+    total = len(acts)
+    truncated = total > limit
+    if truncated:
+        acts = acts[-limit:]
+    desc = (meta.get("description") or "").strip() or (_first_prompt(path) or "")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return {
+        "agent_id": agent_id.replace("agent-", "", 1),
+        "agent_type": meta.get("agentType") or "agent",
+        "description": desc[:_MAX_DESC],
+        "tool_use_id": meta.get("toolUseId"),
+        "activities": acts,
+        "total": total,
+        "truncated": truncated,
+        "mtime": mtime,
+    }
+
