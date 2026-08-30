@@ -19,17 +19,31 @@ in the live pane, so this module is the path for that.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Optional
 
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 READY_MARKER = "? for shortcuts"   # REPL idle-input footer (see runclaude_base.sh)
+
+# opencode's launcher and its own idle-input footer (see ccoe/runopencode_base.sh).
+# The footer reads "ctrl+p commands", but opencode wraps it in a narrow pane and
+# the two words land on different lines — so key on the hint alone, the way the
+# permission-gate parser keys on its header rather than its truncated key hints.
+OPENCODE_BIN = os.environ.get(
+    "OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
+OPENCODE_READY_MARKER = "ctrl+p"
 
 # The file-based message bus used for structured session-to-session relay.
 # Overridable so the path isn't hard-wired to one machine.
@@ -456,6 +470,42 @@ def _send_keys(session_id: str, *keys: str) -> None:
     )
 
 
+def _paste(session_id: str, text: str) -> None:
+    """Deliver `text` to the pane as ONE bracketed paste.
+
+    `send-keys -l` writes the raw bytes with no paste wrapper, and tmux drains
+    them to the pty in 1022-byte writes. Every newline that arrives outside a
+    paste bracket is an Enter, so a multi-line message submits itself in pieces
+    and only the tail survives as the "real" turn. Going through a buffer and
+    pasting with -p wraps the payload in ESC[200~ … ESC[201~, so the REPL takes
+    it as one paste and the newlines stay newlines wherever the chunk
+    boundaries happen to fall.
+    """
+    buf = f"agentos-{uuid.uuid4().hex[:8]}"
+    subprocess.run(["tmux", "load-buffer", "-b", buf, "-"],
+                   input=text.encode(), capture_output=True, timeout=5)
+    subprocess.run(["tmux", "paste-buffer", "-d", "-p", "-b", buf, "-t", session_id],
+                   capture_output=True, text=True, timeout=5)
+
+
+def _composer_has_text(session_id: str) -> bool:
+    """True if the REPL composer still holds anything at all.
+
+    The pasted-message counterpart to _input_pending: after a bracketed paste
+    the REPL shows a "[Pasted text +N lines]" placeholder instead of the text,
+    so there is no snippet to look for. What still holds is that a submitted
+    composer is empty.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return False
+    for line in screen.splitlines()[-8:]:
+        stripped = _strip(line)
+        if stripped.startswith(("❯", ">")) and stripped[1:].strip():
+            return True
+    return False
+
+
 def has_session(session_id: str) -> bool:
     return capture_pane(session_id) is not None
 
@@ -580,15 +630,21 @@ def say(session_id: str, text: str, tries: int = 4) -> dict:
         return {"ok": False, "error": "empty message"}
     if capture_pane(session_id) is None:
         return {"ok": False, "error": "no live tmux session"}
-    # -l = literal, so a word like "Enter" inside the text isn't taken as a key.
-    _send_keys(session_id, "-l", "--", text)
-    time.sleep(0.5)                       # let the editor ingest the paste
+    multiline = "\n" in text.strip()
+    if multiline:
+        _paste(session_id, text.rstrip("\n"))
+        time.sleep(1.0)                   # a big paste takes longer to render
+    else:
+        # -l = literal, so a word like "Enter" inside the text isn't a keypress.
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.5)                   # let the editor ingest the paste
     for attempt in range(1, tries + 1):
         _send_keys(session_id, "Enter")
         time.sleep(0.6)
-        # Submitted if the turn started OR the composer no longer holds the text.
-        if spinner_line(capture_pane(session_id, history=0)) \
-                or not _input_pending(session_id, text):
+        # Submitted if the turn started OR the composer no longer holds it.
+        pending = (_composer_has_text(session_id) if multiline
+                   else _input_pending(session_id, text))
+        if spinner_line(capture_pane(session_id, history=0)) or not pending:
             return {"ok": True, "attempts": attempt}
         time.sleep(0.4)                   # editor still settling — retry Enter
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
@@ -756,13 +812,20 @@ def grok_say(session_id: str, text: str, tries: int = 4) -> dict:
         return {"ok": False, "error": "empty message"}
     if capture_pane(session_id) is None:
         return {"ok": False, "error": "no live tmux session"}
-    _send_keys(session_id, "-l", "--", text)
-    time.sleep(0.5)                       # let the editor ingest the paste
+    multiline = "\n" in text.strip()
+    if multiline:
+        _paste(session_id, text.rstrip("\n"))   # see _paste: newlines would submit
+        time.sleep(1.0)
+    else:
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.5)                   # let the editor ingest the paste
     for attempt in range(1, tries + 1):
         _send_keys(session_id, "Enter")
         time.sleep(0.6)
         # Submitted if the turn started OR the composer no longer holds the text.
-        if grok_working(session_id) or not _grok_input_pending(session_id, text):
+        pending = (_composer_has_text(session_id) if multiline
+                   else _grok_input_pending(session_id, text))
+        if grok_working(session_id) or not pending:
             return {"ok": True, "attempts": attempt}
         time.sleep(0.4)                   # editor still settling — retry Enter
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
@@ -797,6 +860,199 @@ def grok_usage(session_id: str, timeout: float = 8.0) -> dict:
         if l:
             cleaned.append(l)
     return {"ok": True, "text": "\n".join(cleaned).strip()}
+
+
+# ---- grok's question card (`ask_user_question`) --------------------------
+# A different widget from a permission gate: the agent stops and asks the human
+# to *choose*, and the answer is a decision about the work rather than about
+# risk. grok draws it as keyed radio rows with the description in a second
+# column, and a free-text row keyed `z`:
+#
+#     When a workflow node fails, what happens?
+#
+#     1 (○) Fail-fast (Recommended)      Job status failed. Remaining nodes skipped.
+#     2 (○) Skip and continue            Failed node records an error; downstream …
+#     z (○) Type your answer here
+#
+#     ↑/↓ navigate · y copy
+#
+# Rows are keyed, not numbered: 1-9 then a-f, and `z` is always the free-text
+# row (grok's own key table). The key is the keystroke that picks the row, so
+# it is carried alongside a 1..N `num` the dashboard can count on.
+_GROK_ASK_ROW_RE = re.compile(
+    r"^([0-9a-z])\s+([(\[])\s*([^)\]\s]?)\s*([)\]])\s+(\S.*)$")
+# The card's own footer. grok renders the same pair of hints under every
+# question card, and nothing else in its TUI draws keyed radio rows under it.
+_GROK_ASK_FOOT_RE = re.compile(r"navigate\b.{0,12}\bcopy\b|Tab/Space:\s*question")
+_GROK_ASK_CUSTOM_RE = re.compile(r"^type your (own )?answer( here)?$", re.I)
+# A ticked radio or checkbox. grok degrades these to ASCII on terminals that
+# cannot draw them (its own glyph fallback table), so both spellings count.
+_GROK_FILLED = "●◉◎x✕✓✔*"
+# Label and description share a row, separated by the gap that aligns the
+# description column.
+_GROK_ASK_GAP_RE = re.compile(r"\s{2,}")
+
+
+# How far above a footer the answer rows may start. The card's own footer sits
+# one blank line under the last row; the shortcuts bar sits a couple of lines
+# further down again, and either one can be the match we found first.
+_GROK_ASK_LEAD = 4
+
+
+def _grok_ask_rows(lines: list[str], foot: int) -> list[tuple[int, str, str, bool]]:
+    """The card's answer rows above `foot`, as (line index, key, rest, filled).
+
+    Read bottom-up and stopped at the first line that is not a row, so a keyed
+    line sitting in the scrollback above the card cannot join the run.
+
+    A description too wide for its row wraps onto the next line, indented under
+    the description column and carrying no key. Read bottom-up it arrives
+    before the row it belongs to, so it is held and folded into the next row
+    matched. Without that the run stopped at the wrap: the row above it was
+    dropped, its text was read as the question, and a card left with fewer than
+    two rows disappeared from the dashboard entirely.
+    """
+    out: list[tuple[int, str, str, bool]] = []
+    wrapped: list[str] = []
+    indent = 0
+    for i in range(foot - 1, -1, -1):
+        text = _unbox(lines[i])
+        m = _GROK_ASK_ROW_RE.match(text.strip())
+        if m:
+            tick = m.group(3)
+            indent = len(text) - len(text.lstrip())
+            # An empty box is not a ticked one; `in` on "" says otherwise.
+            out.append((i, m.group(1), " ".join([m.group(5), *wrapped]),
+                        bool(tick) and tick in _GROK_FILLED))
+            wrapped = []
+            continue
+        if out and text.strip() and len(text) - len(text.lstrip()) > indent:
+            wrapped.insert(0, text.strip())
+            continue
+        if out or foot - i > _GROK_ASK_LEAD:
+            break
+    out.reverse()
+    return out
+
+
+def parse_grok_ask(screen: Optional[str]) -> Optional[dict]:
+    """A pending grok question card from a captured screen, or None.
+
+    Same shape as the other gates — question, numbered options, `stage` and
+    `custom` — so the dashboard's answer UI and autonomy both read it without
+    knowing which CLI drew it. `custom` marks the free-text row, which is what
+    makes autonomy treat the whole card as a choice it must not answer.
+
+    Each option also carries `press`: the literal keystroke grok binds to it,
+    which is what actually gets sent. `num` stays a plain 1..N so the UI can
+    number the rows the way every other gate is numbered. (Not `key` — agy's
+    gate already uses that field for its own option ids, and the dashboard
+    routes an answer on it.)
+    """
+    if not screen:
+        return None
+    lines = screen.splitlines()
+    # grok shows two footers under a live card — the card's own "↑/↓ navigate"
+    # hints and the shortcuts bar below them. Either can be the lower match, so
+    # try them bottom-up and keep the first that actually has rows above it.
+    foot, rows = None, []
+    for i in range(len(lines) - 1, -1, -1):
+        if not _GROK_ASK_FOOT_RE.search(lines[i]):
+            continue
+        found = _grok_ask_rows(lines, i)
+        if len(found) >= 2:
+            foot, rows = i, found
+            break
+    if foot is None:
+        return None
+
+    # The question sits above the rows, past one or more blank lines, and wraps
+    # across as many lines as it needs.
+    head = rows[0][0] - 1
+    while head >= 0 and not _unbox(lines[head]).strip():
+        head -= 1
+    top = head
+    while top >= 0 and _unbox(lines[top]).strip():
+        top -= 1
+    question = " ".join(_unbox(l).strip() for l in lines[top + 1:head + 1]).strip()
+
+    options, custom = [], None
+    for n, (_, key, rest, filled) in enumerate(rows, 1):
+        parts = _GROK_ASK_GAP_RE.split(rest, 1)
+        label = parts[0].strip()
+        desc = parts[1].strip() if len(parts) > 1 else ""
+        if _GROK_ASK_CUSTOM_RE.match(label):
+            custom = n
+        options.append({"num": n, "press": key, "label": label, "desc": desc,
+                        "selected": filled})
+    return {
+        "question": question or "Question",
+        "context": "",
+        "options": options,
+        "stage": "ask",
+        "custom": custom,
+        "raw": "\n".join(lines[top + 1:foot + 1]),
+    }
+
+
+def grok_pending(session_id: str) -> Optional[dict]:
+    """The pending grok question card for a live session, or None."""
+    screen = capture_pane(session_id, history=0)
+    if screen is None:
+        return None
+    return parse_grok_ask(screen)
+
+
+def grok_answer(session_id: str, choice: int, text: str = "",
+                verify: float = 4.0) -> dict:
+    """Answer a live grok question card by picking option `choice`.
+
+    grok binds one key per row (1-9, then a-f, `z` for free text), so the key
+    is the whole answer — except that picking a row selects it and only Enter
+    submits. Which of the two a given card needs depends on how many questions
+    it is carrying, so this presses the key, looks, and only sends Enter if the
+    card is still up. Reporting honestly matters here: the autonomy watcher
+    records an answered card and never comes back to it.
+    """
+    screen = capture_pane(session_id)
+    if screen is None:
+        return {"ok": False, "error": "no live tmux session"}
+    ask = parse_grok_ask(screen)
+    if ask is None:
+        return {"ok": False, "error": "no question card on screen"}
+    opt = next((o for o in ask["options"] if o["num"] == choice), None)
+    if opt is None:
+        return {"ok": False, "error": f"option {choice} is not on this card"}
+    if choice == ask.get("custom") and not text.strip():
+        return {"ok": False,
+                "error": f"option {choice} is the free-text row — pass `text`"}
+
+    before = prompt_sig(ask)
+    _send_keys(session_id, "--", opt["press"])
+    if choice == ask.get("custom"):
+        time.sleep(0.3)                   # let the text field take focus
+        _send_keys(session_id, "-l", "--", text)
+        time.sleep(0.3)
+        _send_keys(session_id, "Enter")
+        return {"ok": True, "choice": choice, "label": opt["label"]}
+
+    if verify <= 0:
+        return {"ok": True, "choice": choice, "label": opt["label"]}
+
+    waited, pressed_enter = 0.0, False
+    while waited < verify:
+        time.sleep(0.4)
+        waited += 0.4
+        now = prompt_sig(parse_grok_ask(capture_pane(session_id, history=0) or ""))
+        if now != before:
+            return {"ok": True, "choice": choice, "label": opt["label"]}
+        if not pressed_enter:
+            # The key selected the row without submitting — that is what Enter
+            # is for on the last (or only) question of a card.
+            _send_keys(session_id, "Enter")
+            pressed_enter = True
+    return {"ok": False,
+            "error": "the question card is still on screen — the keypress didn't take"}
 
 
 # ---- opencode -----------------------------------------------------------
@@ -1269,6 +1525,72 @@ def opencode_say(session_id: str, text: str, tries: int = 4) -> dict:
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
 
 
+# opencode's footer carries the live context size next to its percentage —
+# "33.4K (3%) · $0.00" — and prints nothing at all before the first turn.
+_OPENCODE_CTX_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KM]?)\s*\((\d+)%\)")
+_OPENCODE_CTX_MULT = {"": 1, "K": 1_000, "M": 1_000_000}
+
+
+def opencode_context_tokens(session_id: str) -> Optional[int]:
+    """Tokens currently held by the live opencode context, read off its footer.
+
+    None when the footer carries no figure at all, which is opencode's way of
+    saying the session has no turns yet — the state where compaction is a no-op.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return None
+    for line in reversed(screen.splitlines()[-4:]):
+        m = _OPENCODE_CTX_RE.search(_strip(line))
+        if m:
+            return int(float(m.group(1)) * _OPENCODE_CTX_MULT[m.group(2).upper()])
+    return None
+
+
+def opencode_compact(session_id: str, timeout: float = 90.0) -> dict:
+    """Run opencode's "Compact session" on the live REPL to shrink its context.
+
+    Driven by its key binding (ctrl+x c), not by typing `/compact`, and the
+    difference matters. opencode registers the slash command only once the
+    session has a turn behind it, and its composer popup fuzzy-matches on the
+    description as well as the name, so `/compact` alone lists `/review`
+    underneath it. Submit into that popup a beat early, or before the command
+    exists, and the text goes to the model as an ordinary prompt — the one
+    outcome worse than not compacting, since it grows the context it was meant
+    to shrink. The key binding runs the same command with no composer in the
+    path, and no-ops harmlessly when the command isn't available.
+
+    Unlike Claude Code's, opencode's compaction takes no focus instructions:
+    `/compact keep the auth details` matches no command and is sent as a prompt.
+    Callers must not pass any (see app.api_compact).
+
+    Waits for the context figure in the footer to actually drop, so the caller
+    learns whether compaction ran rather than just that a key was sent.
+    Returns {ok, before, after}.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+
+    before = opencode_context_tokens(session_id)
+    if before is None:
+        return {"ok": False,
+                "error": "nothing to compact — the session has no turns yet"}
+
+    _send_keys(session_id, "C-x", "c")
+
+    waited = 0.0
+    while waited < timeout:
+        time.sleep(0.5)
+        waited += 0.5
+        after = opencode_context_tokens(session_id)
+        if after is not None and after < before:
+            return {"ok": True, "before": before, "after": after}
+
+    return {"ok": False, "before": before,
+            "error": f"context never shrank within {timeout:.0f}s — "
+                     "compaction may still be running"}
+
+
 def agy_answer(session_id: str, action: str) -> dict:
     """Answer an agy approval gate: 'approve' → C-k, 'manage' → M-j (Alt+j),
     'reject' → Escape. (agy gates use key chords, not a numbered menu.)"""
@@ -1611,6 +1933,135 @@ def grok_reset(session_id: str, parent_dir: Optional[str],
     return {"ok": False, "old_id": session_id,
             "error": "/new was sent, but no new grok session appeared — "
                      "the tmux session is still named after the old one"}
+
+
+def _free_port() -> int:
+    """A port nothing is listening on, for a throwaway opencode server."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def opencode_new_session(cwd: str, timeout: float = 30.0) -> dict:
+    """Mint an empty opencode session rooted at `cwd` and return its id.
+
+    The TUI will not hand one out. /new starts a fresh conversation, but
+    opencode writes no session row until that conversation's *first turn*
+    lands, so at reset time there is nothing to read and nothing to rename the
+    tmux onto. Its headless server does write one straight away: POST /session
+    creates the row under the directory the server was started in.
+
+    So run a server for the two seconds it takes. It listens on 127.0.0.1 on a
+    port picked at random and behind a one-shot password (HTTP Basic, user
+    `opencode`) — without one the API is open to every process on the machine,
+    and that API can spend money.
+
+    Returns {ok, session_id} (ok False with `error`).
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {"ok": False, "error": f"project dir not found: {cwd}"}
+
+    port, password = _free_port(), secrets.token_urlsafe(24)
+    try:
+        proc = subprocess.Popen(
+            [OPENCODE_BIN, "serve", "--port", str(port),
+             "--hostname", "127.0.0.1"],
+            cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, OPENCODE_SERVER_PASSWORD=password))
+    except (FileNotFoundError, OSError) as e:
+        return {"ok": False, "error": f"could not start opencode serve: {e}"}
+
+    auth = base64.b64encode(f"opencode:{password}".encode()).decode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/session", data=b"{}",
+        headers={"content-type": "application/json",
+                 "authorization": f"Basic {auth}"})
+    try:
+        waited, last = 0.0, "server never answered"
+        while waited < timeout:
+            if proc.poll() is not None:
+                return {"ok": False,
+                        "error": f"opencode serve exited ({proc.returncode})"}
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    body = json.loads(r.read().decode())
+                sid = body.get("id")
+                if not sid:
+                    return {"ok": False, "error": "server returned no session id"}
+                return {"ok": True, "session_id": sid}
+            except urllib.error.HTTPError as e:
+                # A real answer with a bad status — retrying won't fix it.
+                return {"ok": False, "error": f"POST /session -> HTTP {e.code}"}
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                last = str(e)          # still booting; try again
+            time.sleep(0.5)
+            waited += 0.5
+        return {"ok": False, "error": f"opencode serve not ready in "
+                                      f"{timeout:.0f}s ({last})"}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def opencode_reset(session_id: str, cwd: Optional[str], model: Optional[str],
+                   ready_timeout: float = 90.0) -> dict:
+    """Start a fresh opencode conversation, under an id the caller can follow.
+
+    Unlike reset() and grok_reset() this does not drive the live REPL. Sending
+    /new would work for the human at the keyboard and be useless here: the new
+    conversation stays anonymous until its first turn, so the tmux would keep
+    the old name for as long as the session sat idle — and the dashboard's one
+    invariant, tmux name == session id, would be a lie the whole time.
+
+    Mint the session first instead (opencode_new_session), then relaunch the
+    pane onto it. That costs a process restart, which /new would not, and buys
+    a new id that is known before anything is torn down: if minting fails, the
+    old session is still sitting there untouched.
+
+    Returns {ok, session_id (the new one), old_id}.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    if not model:
+        return {"ok": False, "error": "session records no model to relaunch with"}
+
+    minted = opencode_new_session(cwd or "")
+    if not minted.get("ok"):
+        return {"ok": False, "old_id": session_id,
+                "error": minted.get("error", "could not create a new session")}
+    new_id = minted["session_id"]
+
+    kill(session_id)
+    try:
+        r = subprocess.run(["tmux", "new-session", "-d", "-s", new_id, "-c", cwd],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "old_id": session_id, "session_id": new_id,
+                    "error": r.stderr.strip() or "tmux new-session failed"}
+        time.sleep(1.0)   # let the shell prompt settle before send-keys
+        # cd explicitly: `-c cwd` sets only the shell's *initial* directory, and
+        # a login profile that cds away would put opencode in another project.
+        _send_keys(new_id, "-l", "--",
+                   f"cd {shlex.quote(cwd or '.')} && "
+                   f"{shlex.quote(OPENCODE_BIN)} --model {shlex.quote(model)} "
+                   f"--session {new_id}")
+        _send_keys(new_id, "Enter")
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "old_id": session_id, "session_id": new_id,
+                "error": str(e)}
+
+    waited = 0.0
+    while waited < ready_timeout:
+        if OPENCODE_READY_MARKER in (capture_pane(new_id) or ""):
+            return {"ok": True, "old_id": session_id, "session_id": new_id}
+        time.sleep(1.0)
+        waited += 1.0
+    # The pane exists and the id is real, so the reset stands — opencode was
+    # just slow to paint. Say so rather than failing a move already made.
+    return {"ok": True, "old_id": session_id, "session_id": new_id, "ready": False}
 
 
 def relay(from_id: str, to_id: str, message: str) -> dict:

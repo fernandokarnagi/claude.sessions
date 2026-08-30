@@ -18,10 +18,9 @@ from server.app import app
 
 SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
-AGENTS = [{"name": "Builder", "role": "Write it", "prompt": "You build."}]
 STAGES = [
-    {"name": "Build", "mode": "solo", "agent_ids": ["builder"], "goal": "ship"},
-    {"name": "Review", "mode": "solo", "agent_ids": ["builder"], "goal": "check"},
+    {"name": "Build", "mode": "solo", "agent_ids": ["Builder"], "goal": "ship"},
+    {"name": "Review", "mode": "solo", "agent_ids": ["Builder"], "goal": "check"},
 ]
 
 
@@ -41,7 +40,7 @@ def client():
 @pytest.fixture
 def wid():
     w = workflows.create_workflow("Feature delivery")["id"]
-    workflows.update_workflow(w, agents=AGENTS, stages=STAGES)
+    workflows.update_workflow(w, stages=STAGES)
     return w
 
 
@@ -86,7 +85,7 @@ def test_send_types_the_composed_prompt(client, wid, sent):
     assert len(sent) == 1
     to, text = sent[0]
     assert to == SID
-    assert "## Stage 1/2: Build" in text
+    assert "## Stage: Build" in text
     # Sending is recorded, so the button can offer a re-send next time.
     assert client.get(f"/api/sessions/{SID}/workflow").json()["sent"] is True
 
@@ -141,7 +140,7 @@ def test_binding_view_survives_a_shrink_between_reads(client, wid, monkeypatch):
     assert view["stage_id"] == "s2"
     # the whole view describes one stage, index included
     assert view["stage_index"] == 1
-    assert "## Stage 2/2: Review" in view["prompt"]
+    assert "## Stage: Review" in view["prompt"]
 
 
 def test_unassign(client, wid):
