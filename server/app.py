@@ -1016,10 +1016,35 @@ def api_pins(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/pins")
-def api_add_pin(session_id: str, body: PinBody):
+async def api_add_pin(session_id: str, body: PinBody):
+    """Pin a message and queue the task that goes with it.
+
+    A pin on its own is a bookmark you still have to act on, so pinning also
+    writes a task: summarizer turns the pinned text into the follow-up message
+    to send back, and the two records point at each other (pin.task_id /
+    task.pin_id). The pin keeps the message verbatim — only the task is
+    rewritten.
+
+    The summarizer is best-effort. If it is unavailable or times out the task
+    is queued with the pinned text itself, because a pin that silently produced
+    nothing is worse than one that produced a task you have to edit.
+
+    Re-pinning is still a no-op: an existing pin that already has a live task
+    comes back untouched rather than stacking a second one.
+    """
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="text is required")
-    return pins.add_pin(session_id, body.text, kind=body.kind, ts=body.ts)
+    rec = pins.add_pin(session_id, body.text, kind=body.kind, ts=body.ts)
+
+    tid = rec.get("task_id")
+    if tid and any(t.get("id") == tid
+                   for t in tasks.list_tasks(session_id)
+                   + tasks.list_tasks(session_id, archived=True)):
+        return rec
+
+    text = await summarizer.as_pin_task(rec["text"], rec["kind"]) or rec["text"]
+    task = tasks.add_task(session_id, text, pin_id=rec["id"])
+    return pins.set_task(session_id, rec["id"], task["id"]) or rec
 
 
 # Declared before /pins/{pid} — routes match in order, so the other way round

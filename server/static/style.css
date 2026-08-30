@@ -1246,6 +1246,16 @@ body.world-page { overflow: hidden; }
 }
 .pin-kind.user { color: var(--accent); border-color: rgba(88,166,255,.5); }
 .pin-kind.assistant { color: var(--result); border-color: rgba(188,140,255,.5); }
+
+/* A pin and the task it queued point at each other: the pin row names its task,
+   the task row names its pin and opens it. */
+.pin-task { color: var(--accent); }
+.task-pinlink { color: var(--accent); cursor: pointer; }
+.task-pinlink:hover { text-decoration: underline; }
+.task-pinlink.gone { color: var(--muted); cursor: default; text-decoration: none; }
+
+/* The pin a task row just jumped to. */
+.pin-row.hi { outline: 1px solid var(--accent); border-radius: 6px; }
 .pin-row .task-text .md { font: 13px/1.6 -apple-system, BlinkMacSystemFont,
   "Segoe UI", Roboto, sans-serif; }
 .pin-badge { color: var(--accent); border-color: rgba(88,166,255,.5) !important; font-weight: 600; }

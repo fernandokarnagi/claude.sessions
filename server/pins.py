@@ -3,8 +3,8 @@ pins.py — per-session pinned messages.
 
 A pin is a snapshot of one message from the history (user or assistant) that
 you want to keep at hand: the decision, the command, the error you keep
-scrolling back to. Unlike a task it is never sent anywhere — it is a bookmark,
-so the only things you can do to it are read it and delete it.
+scrolling back to. The pin itself is never sent anywhere; pinning does queue a
+task alongside it (see app.api_add_pin), and `task_id` is that link.
 
 The text is copied, not referenced. History is filtered, capped and re-fetched
 on every poll, so a pin that pointed at an event index would drift; a copy is
@@ -15,7 +15,8 @@ Shape of .pins.json:
       "pins": {
         "<session_id>": [
           {"id": "<pid>", "text": "...", "kind": "user|assistant",
-           "ts": "<iso of the original message>|null", "created_at": "<iso>"}
+           "ts": "<iso of the original message>|null", "created_at": "<iso>",
+           "task_id": "<tid>|null"}
         ]
       }
     }
@@ -84,6 +85,7 @@ def add_pin(session_id: str, text: str, kind: str = "assistant",
         "kind": kind if kind in KINDS else "assistant",
         "ts": ts or None,
         "created_at": _now(),
+        "task_id": None,
     }
     with _lock:
         data = _load()
@@ -94,6 +96,20 @@ def add_pin(session_id: str, text: str, kind: str = "assistant",
         items.append(rec)
         _save(data)
     return rec
+
+
+def set_task(session_id: str, pid: str, tid: str | None) -> dict | None:
+    """Record which task this pin spawned. None if the pin is gone (it can be:
+    the task is written after the pin, and unpinning in between is legal)."""
+    with _lock:
+        data = _load()
+        for rec in data["pins"].get(session_id, []):
+            if rec.get("id") != pid:
+                continue
+            rec["task_id"] = tid
+            _save(data)
+            return rec
+    return None
 
 
 def delete_pin(session_id: str, pid: str) -> bool:

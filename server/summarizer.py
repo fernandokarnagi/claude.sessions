@@ -50,6 +50,19 @@ Assistant's last message:
 \"\"\""""
 
 
+PIN_TASK_PROMPT = """Below is a message pinned out of an AI coding session — \
+it may be something the user said or something the assistant replied. Write the \
+follow-up message the user should send to that session to act on what was pinned: \
+the instruction, question, or decision it implies. Reply with that message only — \
+no preamble, heading, quotes, or explanation. Keep it under 40 words, imperative, \
+and specific to the pinned text.
+
+Pinned message (from the {kind}):
+\"\"\"
+{msg}
+\"\"\""""
+
+
 def _delete_throwaway(session_id: str) -> None:
     for p in glob.glob(os.path.join(parser.PROJECTS_DIR, "*", f"{session_id}.jsonl")):
         try:
@@ -70,6 +83,17 @@ async def as_task(last_assistant_text: str) -> Optional[str]:
     Same throwaway run as generate(); only the prompt differs.
     """
     return await _run(TASK_PROMPT, last_assistant_text)
+
+
+async def as_pin_task(text: str, kind: str = "assistant") -> Optional[str]:
+    """Return the task text for a pinned message — the follow-up to send back.
+
+    Pins are taken from both sides of the conversation, so this can't reuse
+    as_task's prompt: that one assumes the text is the assistant's last turn.
+    None on failure, and the caller falls back to the pinned text itself.
+    """
+    who = "user" if kind == "user" else "assistant"
+    return await _run(PIN_TASK_PROMPT.replace("{kind}", who), text)
 
 
 async def _run(prompt_tmpl: str, last_assistant_text: str) -> Optional[str]:
