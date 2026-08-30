@@ -266,6 +266,12 @@ def _build_summary(path: str) -> dict:
     # nothing else until the run finishes, so this set — not the file's mtime —
     # is what tells us the session is delegating rather than idle.
     open_agents: dict[str, str] = {}   # tool_use_id -> description
+    # Agent/Task calls dispatched since the last user prompt, and when that
+    # prompt landed. Together they say which runs belong to the task in hand —
+    # the roster is scoped to those, so it answers "what is it farming out
+    # now?" rather than listing every run the session ever made.
+    turn_agents: set[str] = set()
+    turn_started = None
 
     for evt in _iter_events(path):
         etype = evt.get("type")
@@ -330,6 +336,12 @@ def _build_summary(path: str) -> dict:
             # main thread's ledger of who it is waiting on.
             if not evt.get("isSidechain"):
                 content = msg.get("content")
+                # A new user prompt starts a new task. Claude files tool
+                # results as user messages too — those continue the turn they
+                # answer, so only a real instruction resets the ledger.
+                if role == "user" and not evt.get("isMeta") and _is_prompt(content):
+                    turn_agents = set()
+                    turn_started = ts or turn_started
                 if isinstance(content, list):
                     for b in content:
                         if not isinstance(b, dict):
@@ -337,6 +349,8 @@ def _build_summary(path: str) -> dict:
                         if b.get("type") == "tool_use" and b.get("name") in subagents.AGENT_TOOLS:
                             inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                             open_agents[b.get("id") or ""] = str(inp.get("description") or "")
+                            if b.get("id"):
+                                turn_agents.add(b["id"])
                         elif b.get("type") == "tool_result":
                             open_agents.pop(b.get("tool_use_id") or "", None)
 
@@ -385,7 +399,36 @@ def _build_summary(path: str) -> dict:
         # with the rest of the summary — resolving a call requires a write, so
         # the cache invalidates exactly when this could change.
         "open_agent_calls": {k: v for k, v in open_agents.items() if k},
+        # The current task: the Agent/Task ids dispatched since the last user
+        # prompt, and when that prompt landed (epoch, for runs whose meta file
+        # carries no tool id). See subagents.current_task.
+        "current_agent_calls": sorted(turn_agents),
+        "turn_started_at": _epoch(turn_started),
     }
+
+
+def _is_prompt(content) -> bool:
+    """True for a user message that is an instruction, not a tool result.
+
+    Claude writes tool results as user-role messages, so role alone cannot mark
+    a task boundary — a run answering its own tool call would retire itself.
+    """
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "text"
+                   and (b.get("text") or "").strip() for b in content)
+    return False
+
+
+def _epoch(ts: Optional[str]) -> Optional[float]:
+    """One of Claude's ISO timestamps as seconds, None if it isn't one."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def _iso(epoch: float) -> str:
@@ -607,8 +650,11 @@ def get_session(session_id: str) -> Optional[dict]:
     # Full sub-agent roster (finished runs included) — the detail page lists
     # them. The board only ever gets the running count, because parsing every
     # session's meta files on a 1.5s poll is not worth a badge.
-    detail["subagents"] = subagents.for_session(
-        path, set(summary.get("open_agent_calls") or {}), deep=True)
+    detail["subagents"] = subagents.current_task(
+        subagents.for_session(
+            path, set(summary.get("open_agent_calls") or {}), deep=True),
+        since=summary.get("turn_started_at"),
+        current_ids=set(summary.get("current_agent_calls") or []))
     try:
         detail["file_size"] = os.path.getsize(path)  # tail starting offset
     except OSError:

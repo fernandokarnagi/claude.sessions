@@ -22,6 +22,7 @@ import json
 import os
 
 from . import parser as claude_parser   # reuse status thresholds + iso helper
+from . import subagents as claude_subagents   # reuse the current-task scope
 
 GROK_DIR = os.path.expanduser(os.environ.get("GROK_CLI_DIR", "~/.grok"))
 SESS_ROOT = os.path.join(GROK_DIR, "sessions")
@@ -360,7 +361,10 @@ def _apply_subagents(s: dict, session_dir: str) -> None:
 # updates.jsonl is append-only and can reach tens of thousands of lines, so the
 # scan is incremental: parse only the bytes appended since the last look and
 # fold them into the records already held.
-_SUB_CACHE: dict[str, tuple[int, dict]] = {}   # session_dir -> (bytes read, {id: record})
+# session_dir -> (bytes read, {id: record}, last prompt ts). The prompt time
+# rides along because it comes off the same scan: updates.jsonl narrates the
+# user's turns too, and it is what scopes the roster to the task in hand.
+_SUB_CACHE: dict[str, tuple[int, dict, float | None]] = {}
 
 
 def _updates_path(session_dir: str) -> str:
@@ -368,8 +372,23 @@ def _updates_path(session_dir: str) -> str:
 
 
 def _subagents(session_dir: str) -> list[dict]:
-    """Sub-agent runs for a grok session, oldest first."""
-    return sorted(_subagent_map(session_dir).values(), key=lambda r: r["started_at"] or 0)
+    """Sub-agent runs of the session's current task, oldest first.
+
+    Scoped to what was spawned since the last user prompt, plus anything still
+    going: updates.jsonl holds every run the session ever made, and listing all
+    of them turned a live-delegation panel into a log (see
+    subagents.current_task).
+    """
+    runs = sorted(_subagent_map(session_dir).values(),
+                  key=lambda r: r["started_at"] or 0)
+    return claude_subagents.current_task(runs, since=_last_prompt(session_dir))
+
+
+def _last_prompt(session_dir: str) -> float | None:
+    """When this session's last user prompt landed, in seconds."""
+    _subagent_map(session_dir)                # fills the cache this reads
+    cached = _SUB_CACHE.get(session_dir)
+    return cached[2] if cached else None
 
 
 def _subagent_map(session_dir: str) -> dict:
@@ -378,11 +397,11 @@ def _subagent_map(session_dir: str) -> dict:
         size = os.path.getsize(path)
     except OSError:
         return {}
-    offset, records = _SUB_CACHE.get(session_dir, (0, {}))
+    offset, records, prompt_ts = _SUB_CACHE.get(session_dir, (0, {}, None))
     if offset == size:
         return records
     if offset > size:                    # truncated / rotated — start over
-        offset, records = 0, {}
+        offset, records, prompt_ts = 0, {}, None
     records = dict(records)
     # Binary mode: the cursor is a byte count, and text-mode seek() only accepts
     # opaque cookies from tell(), not a byte offset.
@@ -409,6 +428,11 @@ def _subagent_map(session_dir: str) -> dict:
             continue
         upd = ((evt.get("params") or {}).get("update") or {})
         kind = upd.get("sessionUpdate")
+        if kind == "user_message_chunk":
+            ts = evt.get("timestamp")
+            if isinstance(ts, (int, float)) and (prompt_ts is None or ts > prompt_ts):
+                prompt_ts = float(ts)
+            continue
         if kind not in ("subagent_spawned", "subagent_finished"):
             continue
         aid = upd.get("subagent_id") or upd.get("child_session_id")
@@ -433,7 +457,7 @@ def _subagent_map(session_dir: str) -> dict:
             rec["turns"] = upd.get("turns")
             rec["duration_ms"] = upd.get("duration_ms")
             rec["mtime"] = ts
-    _SUB_CACHE[session_dir] = (consumed, records)
+    _SUB_CACHE[session_dir] = (consumed, records, prompt_ts)
     return records
 
 
@@ -473,12 +497,20 @@ def get_summary(sid: str) -> dict | None:
     return _summarize(d) if d else None
 
 
-def list_sessions() -> list[dict]:
-    """All grok sessions as dashboard summaries, newest activity first."""
+def list_sessions(keep_empty=frozenset()) -> list[dict]:
+    """All grok sessions as dashboard summaries, newest activity first.
+
+    Empty sessions are hidden — grok writes a session directory before the
+    conversation, so an abandoned launch leaves one with no turns in it. Ids in
+    `keep_empty` are shown anyway: the caller knows they are in use (a live
+    REPL, a pin in the To-do inbox). That is the state /new leaves behind, and
+    hiding it would take the session off the board along with the to-dos and
+    pins reset just carried over to it.
+    """
     out = []
     for sid, d in _session_dirs().items():
         s = _summarize(d)
-        if s and s["step_count"] > 0:      # skip empty/never-used sessions
+        if s and (s["step_count"] > 0 or sid in keep_empty):
             out.append(s)
     out.sort(key=lambda x: x.get("mtime") or 0, reverse=True)
     return out

@@ -299,7 +299,9 @@ def _grok_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None):
     errs = tmuxio.error_lines()      # cached sweep — no extra tmux calls here
     descs = descriptions.all_descriptions()
     out = []
-    for s in grokparser.list_sessions():
+    # A session in use is worth showing even before its first turn — see
+    # grokparser.list_sessions.
+    for s in grokparser.list_sessions(keep_empty=set(live_ids) | set(marked)):
         sid = s["session_id"]
         s["archived"] = sid in arch_ids
         if mode == "exclude" and s["archived"]:
@@ -339,7 +341,9 @@ def _opencode_summaries(titles, arch_ids, marked, mode="exclude", live_ids=None)
     errs = tmuxio.error_lines()      # cached sweep — no extra tmux calls here
     descs = descriptions.all_descriptions()
     out = []
-    for s in opencodeparser.list_sessions():
+    # A session in use is worth showing even before its first turn — see
+    # opencodeparser.list_sessions.
+    for s in opencodeparser.list_sessions(keep_empty=set(live_ids) | set(marked)):
         sid = s["session_id"]
         s["archived"] = sid in arch_ids
         if mode == "exclude" and s["archived"]:
@@ -600,8 +604,11 @@ def api_status(session_id: str):
     # the board deliberately gets the count only.
     path = parser.session_path(session_id)
     if path:
-        s["subagents"] = subagents.for_session(
-            path, set(s.get("open_agent_calls") or {}), deep=True)
+        s["subagents"] = subagents.current_task(
+            subagents.for_session(
+                path, set(s.get("open_agent_calls") or {}), deep=True),
+            since=s.get("turn_started_at"),
+            current_ids=set(s.get("current_agent_calls") or []))
     s["autonomy"] = autonomy.get(session_id)
     s["projects"] = projects.projects_for(session_id)
     return s
@@ -614,7 +621,17 @@ def api_subagent_transcript(session_id: str, agent_id: str):
     The roster answers "what did it farm out?"; this answers "what did that one
     actually do?" — which the main transcript cannot, because it only ever sees
     the one-line report the run handed back.
+
+    opencode stores a run as a child session rather than as a file beside the
+    parent's transcript, so it needs its own lookup. Without one every opencode
+    run 404'd here and the detail view reported the transcript as gone, when in
+    fact it had never been looked for in the right place.
     """
+    if opencodeparser.has_session(session_id):
+        run = opencodeparser.subagent_transcript(session_id, agent_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="sub-agent run not found")
+        return run
     path = parser.session_path(session_id)
     if path is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1378,12 +1395,24 @@ def api_compact(session_id: str, body: CompactBody = CompactBody()):
     grok submit path — its editor debounces keystrokes and swallows an Enter
     sent too soon after the text (see tmuxio.grok_say).
 
-    opencode 1.18 has no /compact — it isn't in the command palette — so there
-    is nothing to run there.
+    opencode compacts too, but on its own terms. It takes no focus
+    instructions — `/compact keep the auth details` matches no command there and
+    is sent to the model as an ordinary prompt, growing the context this was
+    called to shrink — so instructions are refused rather than silently dropped.
+    And it is driven by its key binding instead of the composer, for the reasons
+    in tmuxio.opencode_compact.
     """
     if opencodeparser.has_session(session_id):
-        raise HTTPException(status_code=400,
-                            detail="opencode has no /compact command")
+        if body.instructions.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="opencode's compaction takes no instructions — "
+                       "call compact with none to shrink the context")
+        result = tmuxio.opencode_compact(session_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=409,
+                                detail=result.get("error", "compact failed"))
+        return result
     if grokparser.has_session(session_id):
         cmd = "/compact"
         if body.instructions.strip():
@@ -1414,23 +1443,23 @@ def api_reset(session_id: str):
     continuation is how you end up driving the dead half of a session. The
     caller gets the new id and should navigate there.
 
+    opencode takes the same trip by a different road. Its /new writes no
+    session row until the new conversation's first turn lands, so there is no
+    id to follow at reset time; we mint the session up front through opencode's
+    own server and relaunch the pane onto it instead (tmuxio.opencode_reset).
+    The one visible difference is that opencode's REPL restarts.
+
     Not available for agy: its conversations aren't identified by anything it
     creates on reset, so there'd be no new id to follow.
-
-    Not available for opencode either, for the mirror-image reason: it does have
-    /new, but it doesn't write the session row until the first turn of that new
-    conversation lands, so there is no new id to follow at reset time — we'd
-    rename nothing and strand the tmux under the old name.
     """
     if agyparser.has_conversation(session_id):
-        raise HTTPException(status_code=400,
-                            detail="reset is Claude Code and grok only")
+        raise HTTPException(status_code=400, detail="reset is not available for agy")
     if opencodeparser.has_session(session_id):
-        raise HTTPException(
-            status_code=400,
-            detail="reset is Claude Code and grok only — opencode does not "
-                   "register a new session until its first turn")
-    if grokparser.has_session(session_id):
+        spec = opencodeparser.launch_spec(session_id)
+        if not spec:
+            raise HTTPException(status_code=404, detail="session not found")
+        result = tmuxio.opencode_reset(session_id, spec["cwd"], spec["model"])
+    elif grokparser.has_session(session_id):
         # grok keys sessions by directory, so the thing to watch is the
         # project's folder — the parent of this session's own.
         sdir = grokparser.session_dir(session_id)

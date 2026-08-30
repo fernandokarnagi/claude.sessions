@@ -342,8 +342,11 @@ body.embed .attn-rail { display: none; }
 /* Live state is glanceable status, not an action — it sits in the panel's top
    right corner rather than in the button row. The title reserves room for it so
    a long name wraps instead of running underneath. */
-.detail-header .live-tmux { position: absolute; top: 12px; right: 14px; }
-.detail-header h2 { margin: 0 0 6px; font-size: 18px; padding-right: 64px; }
+.hdr-live {
+  position: absolute; top: 10px; right: 14px;
+  display: flex; align-items: center; gap: 6px;
+}
+.detail-header h2 { margin: 0 0 6px; font-size: 18px; padding-right: 92px; }
 .sess-title { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .icon-btn {
   background: var(--panel-2); color: var(--muted);
@@ -531,15 +534,34 @@ body.embed .attn-rail { display: none; }
 .event.flash { animation: flashIn 1.6s ease-out; }
 
 /* ---- origin badge + live dot ---- */
-.origin {
-  font-size: 10px; font-weight: 700; letter-spacing: .05em;
-  padding: 3px 8px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px;
+/* Which agent drives the session: one glyph beside the live badge. The tint
+   still carries the old per-origin colour, so the row stays scannable at a
+   glance without spending the width a word costs. */
+.origin-icon {
+  font-size: 11px; line-height: 1; font-style: normal;
+  padding: 3px 5px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); background: rgba(139,148,158,.15);
 }
-.origin.web { background: rgba(63,185,80,.18); color: var(--assistant); border: 1px solid rgba(63,185,80,.4); }
-.origin.cli { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid var(--border); }
-.origin.agy { background: rgba(188,140,255,.18); color: #bc8cff; border: 1px solid rgba(188,140,255,.45); }
-.origin.grok { background: rgba(29,161,242,.16); color: #1da1f2; border: 1px solid rgba(29,161,242,.45); }
-.origin.opencode { background: rgba(245,167,66,.16); color: #f5a742; border: 1px solid rgba(245,167,66,.45); }
+.origin-icon.web { background: rgba(63,185,80,.18); border-color: rgba(63,185,80,.4); }
+.origin-icon.agy { background: rgba(188,140,255,.18); border-color: rgba(188,140,255,.45); }
+.origin-icon.grok { background: rgba(29,161,242,.16); border-color: rgba(29,161,242,.45); }
+.origin-icon.claude-vscode { background: rgba(139,148,158,.15); }
+/* Claude Code and opencode draw text glyphs, not emoji, so they take a colour.
+   Claude's is its own terracotta; opencode's is the pale prompt chevron its TUI
+   paints on black. Both need the weight — a bare ✳ or ❯ at 11px is too thin to
+   read beside the emoji ones. */
+.origin-icon.cli {
+  color: #d97757; font-weight: 700; font-size: 12px;
+  background: rgba(217,119,87,.16); border-color: rgba(217,119,87,.45);
+}
+/* opencode draws its own tile, so the pill behind it stays out of the way — no
+   fill, and just enough padding that the mark lines up with the glyphs beside it. */
+.origin-icon.opencode {
+  font-size: 12px; padding: 3px 4px;
+  background: none; border-color: rgba(139,148,158,.35);
+}
+.origin-icon.opencode svg { display: block; }
 .live-dot {
   width: 7px; height: 7px; border-radius: 50%; background: currentColor;
   animation: pulse 1.1s ease-in-out infinite;
@@ -1262,6 +1284,9 @@ body.world-page { overflow: hidden; }
   background: var(--bg); color: var(--text); font: inherit; }
 .wf-input.wide { width: 100%; }
 .wf-input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+/* Goal and exit criteria run to a few sentences, so they get a resizable box
+   instead of a one-line field that hides everything past the first clause. */
+.wf-text { resize: vertical; min-height: 56px; line-height: 1.4; }
 .wf-picks { display: flex; flex-wrap: wrap; gap: 10px; }
 .wf-pick { display: flex; align-items: center; gap: 4px; font-size: 13px; }
 .wf-pick input { accent-color: var(--accent); }
@@ -1329,19 +1354,18 @@ table.wf-runs tr:last-child td { border-bottom: 0; }
                   border: 1px solid var(--border); border-radius: 8px;
                   background: var(--bg); }
 
-/* Assign-a-workflow picker: one row per blueprint, the whole row clickable. */
+/* Assign-a-workflow picker: pick one from the dropdown, then confirm. The
+   shape of the chosen blueprint (stages, agents) sits under it, so the operator
+   sees what they are about to bind without leaving the modal. */
 .wf-assign-modal { min-width: min(520px, 90vw); }
-.wf-choice-list { list-style: none; margin: 4px 0 12px; padding: 0;
-                max-height: 60vh; overflow: auto; display: flex;
-                flex-direction: column; gap: 6px; }
-.wf-choice { width: 100%; text-align: left; cursor: pointer;
-           display: flex; flex-direction: column; gap: 2px;
-           padding: 9px 11px; border-radius: 8px;
-           border: 1px solid var(--border); background: var(--panel);
-           color: var(--text); font: inherit; }
-.wf-choice:hover { border-color: rgba(188,140,255,.5); background: var(--panel-2, var(--panel)); }
-.wf-choice-title { font-weight: 600; font-size: 13px; }
-.wf-choice .muted { font-size: 12px; }
+.wf-assign-row { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; }
+.wf-assign-row label { font-size: 12px; flex: 0 0 auto; }
+.wf-assign-select { flex: 1 1 auto; min-width: 0; font: inherit; font-size: 13px;
+                  padding: 7px 9px; border-radius: 8px;
+                  border: 1px solid var(--border); background: var(--panel);
+                  color: var(--text); }
+.wf-assign-select:focus { outline: none; border-color: rgba(188,140,255,.5); }
+.wf-assign-meta { font-size: 12px; margin: 0 0 12px; min-height: 1em; }
 
 
 /* ---- sub-agents -------------------------------------------------------------

@@ -156,6 +156,40 @@ def for_session(transcript_path: str, open_ids: set[str] | None = None,
     return out
 
 
+def current_task(runs: list[dict], since: float | None = None,
+                 current_ids: set[str] | None = None) -> list[dict]:
+    """The subset of `runs` that belongs to the session's newest task.
+
+    A session lives for days and every run it ever spawned stays on disk, so an
+    unscoped roster reads as a log: a finished run from yesterday's question
+    sitting under a button that asks "what is it delegating now?". The task
+    boundary is the last user prompt — `since` is when that landed, and
+    `current_ids` the Agent/Task calls dispatched after it (Claude Code knows
+    those exactly; the other backends only have the clock).
+
+    A still-running run is always in scope: it is live work regardless of which
+    turn spawned it. Nothing is deleted — an older run stays readable by id.
+    """
+    if since is None and current_ids is None:
+        return list(runs)
+    out = []
+    for r in runs:
+        if r.get("running"):
+            out.append(r)
+            continue
+        tid = r.get("tool_use_id")
+        if current_ids is not None and tid:
+            if tid in current_ids:
+                out.append(r)
+            continue
+        # No id to match on (an older run, or a backend that has none): fall
+        # back to when it last wrote.
+        when = r.get("started_at") or r.get("mtime") or 0
+        if since is None or when >= since:
+            out.append(r)
+    return out
+
+
 def latest_mtime(transcript_path: str) -> float:
     """Freshest write across a session's sub-agent transcripts, 0 if there are none.
 

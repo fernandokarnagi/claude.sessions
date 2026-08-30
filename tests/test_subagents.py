@@ -175,6 +175,59 @@ def test_active_descriptions_ride_along_for_the_badge(session):
     assert parser.get_summary("sess1")["subagents_active"] == ["probe call_a"]
 
 
+def test_the_roster_is_scoped_to_the_current_task(session):
+    """A run answering yesterday's question is not what the panel is opened for.
+
+    Every run a session ever spawned lives beside its transcript, so an
+    unscoped roster grew into a log: one finished run from a task hours old
+    sat under a button that reads as "what is it doing now?".
+    """
+    path, plant = session
+    events = _main_events(agent_calls=["call_a"], resolved=["call_a"])
+    events.append({"type": "user", "timestamp": "2026-08-25T11:00:00.000Z",
+                   "message": {"role": "user", "content": "now do something else"}})
+    _write(path, events)
+    plant("agent-a", "call_a")
+    assert parser.get_session("sess1")["subagents"] == []
+
+
+def test_runs_dispatched_since_the_last_prompt_stay(session):
+    path, plant = session
+    events = _main_events(agent_calls=["call_a"], resolved=["call_a"])
+    events.append({"type": "user", "timestamp": "2026-08-25T11:00:00.000Z",
+                   "message": {"role": "user", "content": "now do something else"}})
+    events.append({"type": "assistant", "timestamp": "2026-08-25T11:00:01.000Z",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "tool_use", "id": "call_b", "name": "Agent",
+                        "input": {"description": "probe again"}}]}})
+    events.append({"type": "user", "timestamp": "2026-08-25T11:05:00.000Z",
+                   "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "call_b", "content": "done"}]}})
+    _write(path, events)
+    plant("agent-a", "call_a")
+    plant("agent-b", "call_b")
+    assert [r["agent_id"] for r in parser.get_session("sess1")["subagents"]] == ["b"]
+
+
+def test_a_tool_result_does_not_start_a_new_task(session):
+    """Claude files tool results as user messages — they are not prompts."""
+    path, plant = session
+    _write(path, _main_events(agent_calls=["call_a"], resolved=["call_a"]))
+    plant("agent-a", "call_a")
+    assert [r["agent_id"] for r in parser.get_session("sess1")["subagents"]] == ["a"]
+
+
+def test_a_run_still_going_survives_the_next_prompt(session):
+    """It is still working; the turn it was spawned in doesn't retire it."""
+    path, plant = session
+    events = _main_events(agent_calls=["call_a"])
+    events.append({"type": "user", "timestamp": "2026-08-25T11:00:00.000Z",
+                   "message": {"role": "user", "content": "and this too"}})
+    _write(path, events)
+    plant("agent-a", "call_a")
+    assert [r["agent_id"] for r in parser.get_session("sess1")["subagents"]] == ["a"]
+
+
 def test_latest_mtime_is_zero_without_a_subagents_dir(session):
     path, _ = session
     _write(path, _main_events())

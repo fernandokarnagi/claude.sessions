@@ -19,17 +19,31 @@ in the live pane, so this module is the path for that.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Optional
 
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 READY_MARKER = "? for shortcuts"   # REPL idle-input footer (see runclaude_base.sh)
+
+# opencode's launcher and its own idle-input footer (see ccoe/runopencode_base.sh).
+# The footer reads "ctrl+p commands", but opencode wraps it in a narrow pane and
+# the two words land on different lines — so key on the hint alone, the way the
+# permission-gate parser keys on its header rather than its truncated key hints.
+OPENCODE_BIN = os.environ.get(
+    "OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
+OPENCODE_READY_MARKER = "ctrl+p"
 
 # The file-based message bus used for structured session-to-session relay.
 # Overridable so the path isn't hard-wired to one machine.
@@ -1511,6 +1525,72 @@ def opencode_say(session_id: str, text: str, tries: int = 4) -> dict:
     return {"ok": True, "attempts": tries, "warning": "submit unconfirmed"}
 
 
+# opencode's footer carries the live context size next to its percentage —
+# "33.4K (3%) · $0.00" — and prints nothing at all before the first turn.
+_OPENCODE_CTX_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KM]?)\s*\((\d+)%\)")
+_OPENCODE_CTX_MULT = {"": 1, "K": 1_000, "M": 1_000_000}
+
+
+def opencode_context_tokens(session_id: str) -> Optional[int]:
+    """Tokens currently held by the live opencode context, read off its footer.
+
+    None when the footer carries no figure at all, which is opencode's way of
+    saying the session has no turns yet — the state where compaction is a no-op.
+    """
+    screen = capture_pane(session_id, history=0)
+    if not screen:
+        return None
+    for line in reversed(screen.splitlines()[-4:]):
+        m = _OPENCODE_CTX_RE.search(_strip(line))
+        if m:
+            return int(float(m.group(1)) * _OPENCODE_CTX_MULT[m.group(2).upper()])
+    return None
+
+
+def opencode_compact(session_id: str, timeout: float = 90.0) -> dict:
+    """Run opencode's "Compact session" on the live REPL to shrink its context.
+
+    Driven by its key binding (ctrl+x c), not by typing `/compact`, and the
+    difference matters. opencode registers the slash command only once the
+    session has a turn behind it, and its composer popup fuzzy-matches on the
+    description as well as the name, so `/compact` alone lists `/review`
+    underneath it. Submit into that popup a beat early, or before the command
+    exists, and the text goes to the model as an ordinary prompt — the one
+    outcome worse than not compacting, since it grows the context it was meant
+    to shrink. The key binding runs the same command with no composer in the
+    path, and no-ops harmlessly when the command isn't available.
+
+    Unlike Claude Code's, opencode's compaction takes no focus instructions:
+    `/compact keep the auth details` matches no command and is sent as a prompt.
+    Callers must not pass any (see app.api_compact).
+
+    Waits for the context figure in the footer to actually drop, so the caller
+    learns whether compaction ran rather than just that a key was sent.
+    Returns {ok, before, after}.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+
+    before = opencode_context_tokens(session_id)
+    if before is None:
+        return {"ok": False,
+                "error": "nothing to compact — the session has no turns yet"}
+
+    _send_keys(session_id, "C-x", "c")
+
+    waited = 0.0
+    while waited < timeout:
+        time.sleep(0.5)
+        waited += 0.5
+        after = opencode_context_tokens(session_id)
+        if after is not None and after < before:
+            return {"ok": True, "before": before, "after": after}
+
+    return {"ok": False, "before": before,
+            "error": f"context never shrank within {timeout:.0f}s — "
+                     "compaction may still be running"}
+
+
 def agy_answer(session_id: str, action: str) -> dict:
     """Answer an agy approval gate: 'approve' → C-k, 'manage' → M-j (Alt+j),
     'reject' → Escape. (agy gates use key chords, not a numbered menu.)"""
@@ -1853,6 +1933,135 @@ def grok_reset(session_id: str, parent_dir: Optional[str],
     return {"ok": False, "old_id": session_id,
             "error": "/new was sent, but no new grok session appeared — "
                      "the tmux session is still named after the old one"}
+
+
+def _free_port() -> int:
+    """A port nothing is listening on, for a throwaway opencode server."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def opencode_new_session(cwd: str, timeout: float = 30.0) -> dict:
+    """Mint an empty opencode session rooted at `cwd` and return its id.
+
+    The TUI will not hand one out. /new starts a fresh conversation, but
+    opencode writes no session row until that conversation's *first turn*
+    lands, so at reset time there is nothing to read and nothing to rename the
+    tmux onto. Its headless server does write one straight away: POST /session
+    creates the row under the directory the server was started in.
+
+    So run a server for the two seconds it takes. It listens on 127.0.0.1 on a
+    port picked at random and behind a one-shot password (HTTP Basic, user
+    `opencode`) — without one the API is open to every process on the machine,
+    and that API can spend money.
+
+    Returns {ok, session_id} (ok False with `error`).
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {"ok": False, "error": f"project dir not found: {cwd}"}
+
+    port, password = _free_port(), secrets.token_urlsafe(24)
+    try:
+        proc = subprocess.Popen(
+            [OPENCODE_BIN, "serve", "--port", str(port),
+             "--hostname", "127.0.0.1"],
+            cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, OPENCODE_SERVER_PASSWORD=password))
+    except (FileNotFoundError, OSError) as e:
+        return {"ok": False, "error": f"could not start opencode serve: {e}"}
+
+    auth = base64.b64encode(f"opencode:{password}".encode()).decode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/session", data=b"{}",
+        headers={"content-type": "application/json",
+                 "authorization": f"Basic {auth}"})
+    try:
+        waited, last = 0.0, "server never answered"
+        while waited < timeout:
+            if proc.poll() is not None:
+                return {"ok": False,
+                        "error": f"opencode serve exited ({proc.returncode})"}
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    body = json.loads(r.read().decode())
+                sid = body.get("id")
+                if not sid:
+                    return {"ok": False, "error": "server returned no session id"}
+                return {"ok": True, "session_id": sid}
+            except urllib.error.HTTPError as e:
+                # A real answer with a bad status — retrying won't fix it.
+                return {"ok": False, "error": f"POST /session -> HTTP {e.code}"}
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                last = str(e)          # still booting; try again
+            time.sleep(0.5)
+            waited += 0.5
+        return {"ok": False, "error": f"opencode serve not ready in "
+                                      f"{timeout:.0f}s ({last})"}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def opencode_reset(session_id: str, cwd: Optional[str], model: Optional[str],
+                   ready_timeout: float = 90.0) -> dict:
+    """Start a fresh opencode conversation, under an id the caller can follow.
+
+    Unlike reset() and grok_reset() this does not drive the live REPL. Sending
+    /new would work for the human at the keyboard and be useless here: the new
+    conversation stays anonymous until its first turn, so the tmux would keep
+    the old name for as long as the session sat idle — and the dashboard's one
+    invariant, tmux name == session id, would be a lie the whole time.
+
+    Mint the session first instead (opencode_new_session), then relaunch the
+    pane onto it. That costs a process restart, which /new would not, and buys
+    a new id that is known before anything is torn down: if minting fails, the
+    old session is still sitting there untouched.
+
+    Returns {ok, session_id (the new one), old_id}.
+    """
+    if capture_pane(session_id) is None:
+        return {"ok": False, "error": "no live tmux session"}
+    if not model:
+        return {"ok": False, "error": "session records no model to relaunch with"}
+
+    minted = opencode_new_session(cwd or "")
+    if not minted.get("ok"):
+        return {"ok": False, "old_id": session_id,
+                "error": minted.get("error", "could not create a new session")}
+    new_id = minted["session_id"]
+
+    kill(session_id)
+    try:
+        r = subprocess.run(["tmux", "new-session", "-d", "-s", new_id, "-c", cwd],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return {"ok": False, "old_id": session_id, "session_id": new_id,
+                    "error": r.stderr.strip() or "tmux new-session failed"}
+        time.sleep(1.0)   # let the shell prompt settle before send-keys
+        # cd explicitly: `-c cwd` sets only the shell's *initial* directory, and
+        # a login profile that cds away would put opencode in another project.
+        _send_keys(new_id, "-l", "--",
+                   f"cd {shlex.quote(cwd or '.')} && "
+                   f"{shlex.quote(OPENCODE_BIN)} --model {shlex.quote(model)} "
+                   f"--session {new_id}")
+        _send_keys(new_id, "Enter")
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return {"ok": False, "old_id": session_id, "session_id": new_id,
+                "error": str(e)}
+
+    waited = 0.0
+    while waited < ready_timeout:
+        if OPENCODE_READY_MARKER in (capture_pane(new_id) or ""):
+            return {"ok": True, "old_id": session_id, "session_id": new_id}
+        time.sleep(1.0)
+        waited += 1.0
+    # The pane exists and the id is real, so the reset stands — opencode was
+    # just slow to paint. Say so rather than failing a move already made.
+    return {"ok": True, "old_id": session_id, "session_id": new_id, "ready": False}
 
 
 def relay(from_id: str, to_id: str, message: str) -> dict:
