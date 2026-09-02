@@ -34,6 +34,7 @@ import os
 import sqlite3
 
 from . import parser as claude_parser   # reuse status thresholds + iso helper
+from . import subagents as claude_subagents   # reuse the current-task scope
 
 DATA_DIR = os.path.expanduser(
     os.environ.get("OPENCODE_DATA_DIR", "~/.local/share/opencode"))
@@ -323,46 +324,117 @@ def _apply_subagents(s: dict, sid: str) -> None:
     s["status"] = claude_parser.compute_status(age_from)
 
 
+def _last_prompt(sid: str) -> float | None:
+    """When the session's last user prompt landed, in seconds. None if it has none.
+
+    Read off the parts rather than the message row: a part is what a prompt
+    actually wrote, and `part.time_created` is the column every caller here
+    already relies on.
+    """
+    rows = _query(
+        "SELECT MAX(p.time_created) AS t FROM part p JOIN message m "
+        "ON m.id = p.message_id WHERE p.session_id = ? "
+        "AND json_extract(m.data,'$.role') = 'user'", (sid,))
+    t = rows[0]["t"] if rows else None
+    return _ms(t) if t else None
+
+
 def subagents(sid: str) -> list[dict]:
-    """Full sub-agent roster for one session, oldest first (detail view only).
+    """The sub-agent roster for the session's current task, oldest first.
+
+    Scoped to the newest task — runs spawned since the last user prompt, plus
+    anything still going. An opencode session keeps every `task` part it ever
+    ran, so the unscoped list turned the panel into a log: a run from
+    yesterday's question under a button that reads as live delegation. Older
+    runs stay readable by id (see `subagent_transcript`).
+    """
+    return subagent_log(sid, current_only=True)
+
+
+def subagent_log(sid: str, current_only: bool = False) -> list[dict]:
+    """Every sub-agent run of one session, oldest first.
 
     Joins each `task` part on the parent to the child session it spawned, so the
     row carries both what was asked (the part's input) and what the run actually
     cost (the child's tokens). Ordering is by the part's creation time.
+
+    The child is named in the part itself, at `state.metadata.sessionId`. An
+    earlier version paired the two lists positionally instead, which silently
+    mis-assigned every run after a task that failed before spawning anything: a
+    part that errors early has no metadata and no child, so the positional walk
+    handed it the *next* run's session and left that run pointing at nothing.
+    Both rows then showed the wrong transcript, or none.
     """
     children = {
         r["id"]: r for r in _query(
             "SELECT id, title, agent, model, time_created, time_updated, "
             "tokens_input, tokens_output FROM session WHERE parent_id = ?", (sid,))
     }
-    # opencode does not record which child a task part spawned, so pair them up
-    # in creation order — both lists are per-parent and chronological.
-    kids = sorted(children.values(), key=lambda r: r["time_created"])
     out = []
-    for i, r in enumerate(_query(
+    for r in _query(
             "SELECT id, time_created, time_updated, data FROM part "
             "WHERE session_id = ? AND json_extract(data,'$.tool') = 'task' "
-            "ORDER BY time_created", (sid,))):
+            "ORDER BY time_created", (sid,)):
         try:
             d = json.loads(r["data"])
         except (ValueError, TypeError):
             continue
         state = d.get("state") or {}
         inp = state.get("input") or {}
-        kid = kids[i] if i < len(kids) else None
+        meta = state.get("metadata") or {}
+        kid = children.get(meta.get("sessionId"))
         status = state.get("status")
+        err = state.get("error")
         out.append({
             "agent_id": d.get("callID") or r["id"],
             "agent_type": inp.get("subagent_type") or (kid["agent"] if kid else "") or "agent",
             "description": str(inp.get("description") or "")[:120],
             "running": status not in _DONE_STATES,
             "status": status,
+            "error": (err if isinstance(err, str) else json.dumps(err))[:500] if err else None,
             "started_at": _ms(r["time_created"]),
             "mtime": _ms(r["time_updated"]),
             "turns": None,
             "child_session_id": kid["id"] if kid else None,
         })
+    if current_only:
+        out = claude_subagents.current_task(out, since=_last_prompt(sid))
     return out
+
+
+def subagent_transcript(sid: str, agent_id: str,
+                        limit: int = _MAX_DETAIL_ACT) -> dict | None:
+    """One sub-agent run of an opencode session, expanded into its own turns.
+
+    opencode keeps a sub-agent's conversation in a whole child session rather
+    than beside the parent's transcript the way Claude Code does, so this
+    resolves the run's `task` part to that child and reads its activities.
+
+    Returns None when no run on this session carries `agent_id`. A run that
+    never spawned a child — a task that errored on the way out — resolves to a
+    record with no activities and its error as the reason, which is a truer
+    answer than "not found": the run is real, it just has nothing to show.
+    """
+    for run in subagent_log(sid):
+        if run["agent_id"] != agent_id:
+            continue
+        child = run.get("child_session_id")
+        acts = _activities(child, limit) if child else []
+        total = len(acts)
+        return {
+            "agent_id": run["agent_id"],
+            "agent_type": run["agent_type"],
+            "description": run["description"],
+            "tool_use_id": run["agent_id"],
+            "child_session_id": child,
+            "status": run.get("status"),
+            "error": run.get("error"),
+            "activities": acts[-limit:],
+            "total": total,
+            "truncated": total > limit,
+            "mtime": run["mtime"],
+        }
+    return None
 
 
 def _summarize(row: sqlite3.Row, step_count: int) -> dict:
@@ -419,6 +491,18 @@ def has_session(sid: str) -> bool:
     return bool(_query("SELECT 1 FROM session WHERE id = ? LIMIT 1", (sid,)))
 
 
+def launch_spec(sid: str) -> dict | None:
+    """What it takes to bring this session up again: {cwd, model}.
+
+    `model` comes back the way opencode's own `--model` flag wants it —
+    provider/model — because that is the only form the CLI resolves.
+    """
+    rows = _query("SELECT directory, model FROM session WHERE id = ?", (sid,))
+    if not rows:
+        return None
+    return {"cwd": rows[0]["directory"], "model": _model_label(rows[0]["model"])}
+
+
 def get_summary(sid: str) -> dict | None:
     """Cheap cached board summary (3-turn preview only) for one session."""
     rows = _query(f"SELECT {_SESSION_COLS} FROM session WHERE id = ?", (sid,))
@@ -428,19 +512,26 @@ def get_summary(sid: str) -> dict | None:
     return _summarize(rows[0], int(n[0]["n"]) if n else 0)
 
 
-def list_sessions() -> list[dict]:
+def list_sessions(keep_empty=frozenset()) -> list[dict]:
     """All opencode sessions as dashboard summaries, newest activity first.
 
     Child sessions (parent_id set) are opencode's subagent runs — they belong to
     their parent's transcript, not on the board as sessions of their own. They
     stay reachable by id, so a direct link to one still resolves.
+
+    A session with no messages is normally hidden: opencode writes the row
+    before the conversation, so an abandoned launch leaves one behind with
+    nothing in it. `keep_empty` is the exception — ids the caller knows are in
+    use (a live REPL, a pin in the To-do inbox). Reset lands squarely there: it
+    mints an empty session and relaunches onto it, and hiding that one takes the
+    session off the board along with the to-dos and pins just carried over to it.
     """
     counts = _step_counts()
     out = []
     for row in _query(f"SELECT {_SESSION_COLS} FROM session "
                       "WHERE parent_id IS NULL ORDER BY time_updated DESC"):
         n = counts.get(row["id"], 0)
-        if n <= 0:
+        if n <= 0 and row["id"] not in keep_empty:
             continue                     # never-used session — nothing to show
         out.append(_summarize(row, n))
     return out

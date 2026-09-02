@@ -129,3 +129,78 @@ def test_empty_message_is_rejected_without_touching_tmux(pane):
 def test_no_live_session_is_rejected(monkeypatch):
     monkeypatch.setattr(tmuxio, "capture_pane", lambda sid, history=None: None)
     assert tmuxio.say("s", TEXT) == {"ok": False, "error": "no live tmux session"}
+
+
+# ---- multi-line messages go through a bracketed paste -----------------------
+#
+# send-keys -l writes raw bytes with no paste wrapper, and tmux drains them to
+# the pty in 1022-byte chunks. Every newline arriving outside a paste bracket is
+# an Enter, so a multi-line prompt submits itself in pieces and only the tail
+# lands as the intended turn. _paste wraps the whole payload instead.
+
+LINES = "# Workflow: Ship it\n\n## Stage: Build\nDo the thing.\n"
+
+# What Claude shows once a multi-line block has been pasted: a placeholder, not
+# the text — so there is no snippet left for _input_pending to look for.
+PASTED = (
+    "  ⏺ Done.\n"
+    "────────────────────────────────\n"
+    "❯ [Pasted text #1 +4 lines]\n"
+    "────────────────────────────────\n"
+)
+
+
+@pytest.fixture
+def paned(monkeypatch):
+    """Like `pane`, but also records _paste calls."""
+    calls = {"sent": [], "pasted": []}
+    monkeypatch.setattr(tmuxio.time, "sleep", lambda s: None)
+
+    def _use(frames):
+        seq, state = list(frames), {"i": 0}
+
+        def fake_capture(sid, history=None):
+            return seq[min(state["i"], len(seq) - 1)]
+
+        def fake_send(sid, *keys):
+            calls["sent"].append(keys)
+            if keys == ("Enter",):
+                state["i"] += 1
+
+        monkeypatch.setattr(tmuxio, "capture_pane", fake_capture)
+        monkeypatch.setattr(tmuxio, "_send_keys", fake_send)
+        monkeypatch.setattr(tmuxio, "_paste",
+                            lambda sid, text: calls["pasted"].append(text))
+        return calls
+
+    return _use
+
+
+def test_multiline_is_pasted_not_typed(paned):
+    calls = paned([PASTED, SUBMITTED])
+    tmuxio.say("s", LINES)
+    assert calls["pasted"] == [LINES.rstrip("\n")]   # one atomic paste
+    assert ("-l", "--", LINES) not in calls["sent"]  # never typed literally
+    assert calls["sent"] == [("Enter",)]             # Enter is the only keypress
+
+
+def test_single_line_still_types_literally(paned):
+    calls = paned([COMPOSER, SUBMITTED])
+    tmuxio.say("s", TEXT)
+    assert calls["pasted"] == []
+    assert calls["sent"][0] == ("-l", "--", TEXT)
+
+
+def test_pasted_message_is_verified_by_an_empty_composer(paned):
+    """The placeholder hides the text, so submission is judged by whether the
+    composer still holds anything — retrying Enter until it clears."""
+    calls = paned([PASTED, PASTED, SUBMITTED])
+    assert tmuxio.say("s", LINES) == {"ok": True, "attempts": 2}
+    assert len(_enters(calls["sent"])) == 2
+
+
+def test_grok_multiline_is_pasted_too(paned, monkeypatch):
+    calls = paned([PASTED, SUBMITTED])
+    monkeypatch.setattr(tmuxio, "grok_working", lambda sid: False)
+    tmuxio.grok_say("s", LINES)
+    assert calls["pasted"] == [LINES.rstrip("\n")]

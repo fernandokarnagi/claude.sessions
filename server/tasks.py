@@ -10,7 +10,8 @@ Shape of .tasks.json:
       "tasks": {
         "<session_id>": [
           {"id": "<tid>", "text": "...", "created_at": "<iso>", "updated_at": "<iso>",
-           "asked_at": "<iso>|null", "archived_at": "<iso>|null"}
+           "asked_at": "<iso>|null", "archived_at": "<iso>|null",
+           "pin_id": "<pid>|null"}
         ]
       }
     }
@@ -75,9 +76,16 @@ def list_tasks(session_id: str, archived: bool = False) -> list[dict]:
         return [r for r in items if bool(r.get("archived_at")) == archived]
 
 
-def add_task(session_id: str, text: str, asked: bool = False) -> dict:
+def add_task(session_id: str, text: str, asked: bool = False,
+             pin_id: str | None = None) -> dict:
     """Queue a task. asked=True records it as already sent — that's how a
-    message typed straight into the composer gets logged here."""
+    message typed straight into the composer gets logged here.
+
+    pin_id ties the task back to the pin that spawned it (see pins.add_pin):
+    pinning a message queues the follow-up to send about it. The link is a
+    label, not an owner — deleting either side leaves the other alone, because
+    a task you have already edited is work in its own right.
+    """
     rec = {
         "id": uuid.uuid4().hex[:12],
         "text": text.strip(),
@@ -85,6 +93,7 @@ def add_task(session_id: str, text: str, asked: bool = False) -> dict:
         "updated_at": _now(),
         "asked_at": _now() if asked else None,
         "archived_at": None,
+        "pin_id": pin_id,
     }
     with _lock:
         data = _load()

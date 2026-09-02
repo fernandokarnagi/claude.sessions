@@ -1,18 +1,18 @@
 """
 workflows.py — reusable multi-agent blueprints.
 
-A workflow is a roster of agents (name, role, model, system prompt) plus an
-ordered list of stages. A stage names which agents take part, how they work
-together (mode), what the stage is for, and how you know it is done. Stages
-reference agents by id, so one agent's prompt is stored once however many
-stages use it.
+A workflow is an ordered list of stages. A stage names which agents take part,
+how they work together (mode), what the stage is for, and how you know it is
+done. Agents themselves are NOT stored here: they live in Claude's own agents
+folder and are read through server/agents.py, so there is one definition of any
+agent on this machine and a workflow only ever holds ids.
 
 This module is a blueprint store only: nothing here spawns a session, routes a
 hand-off, or talks to tmux. Composing a stage into a prompt lives in the same
-module (compose_stage) because it is a pure read of this shape and nothing
-else. Binding a workflow to a session lives here too — the binding is one
-pointer into a workflow, and keeping it beside the workflow is what makes a
-delete able to clean up after itself.
+module (compose_stage) because it is a pure read of this shape plus the agent
+roster. Binding a workflow to a session lives here too — the binding is one
+pointer into a workflow plus the log of what has actually been run, and keeping
+it beside the workflow is what makes a delete able to clean up after itself.
 
 Shape of .workflows.json:
     {
@@ -20,16 +20,20 @@ Shape of .workflows.json:
         "<wid>": {
           "title": "...", "description": "...",
           "created_at": "<iso>", "updated_at": "<iso>",
-          "agents": [{"id": "researcher", "name": "Researcher",
-                      "role": "...", "model": "opus", "prompt": "..."}],
           "stages": [{"id": "s1", "name": "Discovery", "goal": "...",
-                      "mode": "parallel", "agent_ids": ["researcher"],
+                      "mode": "parallel", "agent_ids": ["code-reviewer-pro"],
                       "exit_criteria": "..."}]
         }
       },
       "bindings": {
         "<session_id>": {"workflow_id": "<wid>", "stage_index": 0,
-                         "assigned_at": "<iso>", "sent": ["s1"]}
+                         "assigned_at": "<iso>", "sent": ["s1"],
+                         "runs": [{"run_id": "...", "stage_id": "s1",
+                                   "stage_name": "...", "stage_index": 0,
+                                   "model": "claude-opus-5",
+                                   "agent_ids": [...], "edited": false,
+                                   "chars": 926, "started_at": "<iso>",
+                                   "ended_at": "<iso>|null"}]}
       }
     }
 """
@@ -44,14 +48,28 @@ import uuid
 import yaml
 from datetime import datetime, timezone
 
+from . import agents as agent_roster
+
 _PATH = os.path.join(os.path.dirname(__file__), ".workflows.json")
 _lock = threading.RLock()
 
+# An agent has no model of its own. Every agent in a stage is read by the one
+# session the stage was sent to, and that session's model was fixed by whatever
+# launched it. A per-agent model field could only ever be a suggestion the
+# session had no way to act on, so there isn't one.
+#
 # How the agents in one stage work together. Per stage, not per workflow: a
 # real procedure researches in parallel and then writes solo.
 MODES = ("coordinator", "handoff", "parallel", "solo")
 DEFAULT_MODE = "solo"
-DEFAULT_MODEL = "opus"
+# Appended to every composed stage. The stage boundary is the whole point of a
+# workflow, and nothing else in the prompt enforces it.
+SCOPE_NOTE = (
+    "Do this stage only. When the exit criteria are met, stop and report what "
+    "you did. Do not start the next stage, and do not take on work belonging "
+    "to another role in this workflow — a human sends the next stage when they "
+    "are ready."
+)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _STAGE_ID_RE = re.compile(r"^s(\d+)$")
@@ -120,67 +138,33 @@ def _next_stage_n(stages: list[dict]) -> int:
     return max(used, default=0) + 1
 
 
-def validate(agents: list[dict], stages: list[dict],
-             previous: dict | None = None) -> tuple[list[dict], list[dict]]:
-    """Normalise a roster + stage list, or raise ValueError.
+def validate(stages: list[dict], previous: dict | None = None) -> list[dict]:
+    """Normalise a stage list, or raise ValueError.
 
-    Returns cleaned copies: agent ids filled in and made unique, stage ids
-    minted where missing, agent_ids filtered down to agents that still exist.
+    Returns a cleaned copy with stage ids minted where missing. `previous` is
+    the stored record being replaced, when there is one — it carries the stage
+    numbers already used, so deleting the newest stage and adding one in the
+    same save cannot recycle its id.
 
-    `previous` is the stored record being replaced, when there is one. It
-    answers two questions this call cannot answer on its own:
-
-      - An agent id in a stage that is not in the new roster: was it just
-        deleted, or did the caller invent it? Deleting an agent is a normal
-        edit, so its stages are quietly cleaned up; an id that never existed
-        is a mistake and raises.
-      - Which stage numbers have been used before, so deleting the newest
-        stage and adding one in the same save cannot recycle its id.
+    Agent ids are checked for shape and duplicates but NOT for existence. The
+    roster is a folder of files that can change without this module knowing, and
+    a workflow whose agent file was renamed must still be editable and savable —
+    compose_stage and the UI report the missing ones instead.
     """
-    prev_agent_ids = {str(a.get("id") or "")
-                      for a in (previous or {}).get("agents", [])}
     prev_stages = (previous or {}).get("stages", [])
-    clean_agents: list[dict] = []
-    seen: set[str] = set()
-    for i, a in enumerate(agents):
-        if not isinstance(a, dict):
-            raise ValueError(f"agents[{i}] must be a mapping")
-        name = str(a.get("name") or "").strip()
-        if not name:
-            raise ValueError("every agent needs a name")
-        aid = str(a.get("id") or "").strip() or _slug(name)
-        if aid in seen:
-            n = 2
-            while f"{aid}-{n}" in seen:
-                n += 1
-            aid = f"{aid}-{n}"
-        seen.add(aid)
-        clean_agents.append({
-            "id": aid,
-            "name": name,
-            "role": str(a.get("role") or "").strip(),
-            "model": str(a.get("model") or "").strip() or DEFAULT_MODEL,
-            "prompt": str(a.get("prompt") or "").strip(),
-        })
-
-    known = {a["id"] for a in clean_agents}
     clean_stages: list[dict] = []
     seen_stage_ids: set[str] = set()
     next_n = max(_next_stage_n(stages), _next_stage_n(prev_stages))
-    for i, s in enumerate(stages):
-        if not isinstance(s, dict):
+    for i, st in enumerate(stages):
+        if not isinstance(st, dict):
             raise ValueError(f"stages[{i}] must be a mapping")
-        name = str(s.get("name") or "").strip()
+        name = str(st.get("name") or "").strip()
         if not name:
             raise ValueError("every stage needs a name")
-        mode = str(s.get("mode") or DEFAULT_MODE).strip()
+        mode = str(st.get("mode") or DEFAULT_MODE).strip()
         if mode not in MODES:
             raise ValueError(f"stage {name!r}: mode must be one of {MODES}")
-        ids = [str(x) for x in (s.get("agent_ids") or [])]
-        unknown = [i for i in ids if i not in known and i not in prev_agent_ids]
-        if unknown:
-            raise ValueError(f"stage {name!r}: unknown agent id {unknown[0]!r}")
-        ids = [i for i in ids if i in known]
+        ids = [str(x).strip() for x in (st.get("agent_ids") or []) if str(x).strip()]
         dup_seen: set[str] = set()
         for aid in ids:
             if aid in dup_seen:
@@ -190,9 +174,8 @@ def validate(agents: list[dict], stages: list[dict],
             raise ValueError(f"stage {name!r}: a solo stage takes one agent")
         # Stage ids are machine-minted bookkeeping, never operator-authored,
         # so a missing, malformed, or duplicate id is repaired rather than
-        # rejected — unlike a duplicate agent id above, which is content the
-        # operator typed on purpose and so is a real validation error.
-        sid = str(s.get("id") or "").strip()
+        # rejected.
+        sid = str(st.get("id") or "").strip()
         if not _STAGE_ID_RE.match(sid) or sid in seen_stage_ids:
             sid = f"s{next_n}"
             next_n += 1
@@ -200,12 +183,12 @@ def validate(agents: list[dict], stages: list[dict],
         clean_stages.append({
             "id": sid,
             "name": name,
-            "goal": str(s.get("goal") or "").strip(),
+            "goal": str(st.get("goal") or "").strip(),
             "mode": mode,
             "agent_ids": ids,
-            "exit_criteria": str(s.get("exit_criteria") or "").strip(),
+            "exit_criteria": str(st.get("exit_criteria") or "").strip(),
         })
-    return clean_agents, clean_stages
+    return clean_stages
 
 
 def _counts(data: dict) -> dict[str, int]:
@@ -226,7 +209,10 @@ def _row(wid: str, rec: dict, sessions: int) -> dict:
         "description": rec.get("description", ""),
         "created_at": rec.get("created_at", ""),
         "updated_at": rec.get("updated_at", ""),
-        "agent_count": len(rec.get("agents", [])),
+        # Distinct agents used across the stages — the roster is central now,
+        # so "how many agents" can only mean "how many this workflow calls on".
+        "agent_count": len({a for st in rec.get("stages", [])
+                            for a in st.get("agent_ids", [])}),
         "stage_count": len(rec.get("stages", [])),
         "session_count": sessions,
     }
@@ -262,7 +248,6 @@ def create_workflow(title: str, description: str = "") -> dict:
         "description": description.strip(),
         "created_at": now,
         "updated_at": now,
-        "agents": [],
         "stages": [],
     }
     with _lock:
@@ -274,20 +259,18 @@ def create_workflow(title: str, description: str = "") -> dict:
 
 def update_workflow(wid: str, title: str | None = None,
                     description: str | None = None,
-                    agents: list[dict] | None = None,
                     stages: list[dict] | None = None) -> dict | None:
-    """Replace whatever is passed. Agents and stages validate together, because
-    a stage is only valid against the roster it is saved with."""
+    """Replace whatever is passed."""
     with _lock:
         data = _load()
         rec = data["workflows"].get(wid)
         if rec is None:
             return None
-        if agents is not None or stages is not None:
-            next_agents = agents if agents is not None else rec.get("agents", [])
-            next_stages = stages if stages is not None else rec.get("stages", [])
-            rec["agents"], rec["stages"] = validate(next_agents, next_stages,
-                                                    previous=rec)
+        if stages is not None:
+            rec["stages"] = validate(stages, previous=rec)
+        rec.pop("agents", None)      # a workflow written before the central
+                                     # roster still carries its own copy; drop
+                                     # it on the first save rather than keep two
         if title is not None:
             rec["title"] = title.strip() or rec.get("title", "Untitled workflow")
         if description is not None:
@@ -344,22 +327,34 @@ def mode_sentence(mode: str, names: list[str]) -> str:
 
 
 def compose_stage(wid: str, stage_index: int) -> str:
-    """Render one stage as a single markdown prompt."""
+    """Render one STORED stage as a single markdown prompt."""
     wf = get_workflow(wid)
     if wf is None:
         raise ValueError("workflow not found")
     stages = wf.get("stages", [])
     if not 0 <= stage_index < len(stages):
         raise ValueError(f"stage index {stage_index} out of range")
-    stage = stages[stage_index]
-    by_id = {a["id"]: a for a in wf.get("agents", [])}
-    taking_part = [by_id[i] for i in stage.get("agent_ids", []) if i in by_id]
+    return compose(wf["title"], stages[stage_index])
 
-    lines = [f"# Workflow: {wf['title']}"]
-    if wf.get("description"):
-        lines.append(wf["description"])
+
+def compose(title: str, stage: dict) -> str:
+    """Render a stage as a single markdown prompt.
+
+    Takes the stage itself rather than an index, so the editor can preview what
+    is on screen — including edits not saved yet — through the same code that
+    builds what actually gets sent.
+    """
+    taking_part, missing = agent_roster.get_many(stage.get("agent_ids", []))
+
+    # The workflow description and the "of N" count are deliberately NOT sent.
+    # Both tell the agent about work it has not been asked to do yet: the
+    # description states the whole pipeline as the mission, and "1/4" advertises
+    # three more stages. An agent given either will finish the stage and carry
+    # straight on into the next one. The operator sees both in the dashboard,
+    # which is where they belong.
+    lines = [f"# Workflow: {title}"]
     lines.append("")
-    lines.append(f"## Stage {stage_index + 1}/{len(stages)}: {stage['name']}")
+    lines.append(f"## Stage: {stage.get('name', '')}")
     if stage.get("goal"):
         lines.append(f"Goal: {stage['goal']}")
     if stage.get("exit_criteria"):
@@ -370,13 +365,24 @@ def compose_stage(wid: str, stage_index: int) -> str:
     for a in taking_part:
         lines.append("")
         head = f"### {a['name']}"
-        if a.get("role"):
-            head += f" — {a['role']}"
+        if a.get("description"):
+            head += f" — {a['description']}"
         lines.append(head)
-        if a.get("model"):
-            lines.append(f"Model: {a['model']}")
         if a.get("prompt"):
             lines.append(a["prompt"])
+    # Named, not silently skipped: a stage that was written for four agents and
+    # runs with three is a different stage, and the operator reads this prompt
+    # before sending it.
+    if missing:
+        lines.append("")
+        lines.append("> Note: no agent file was found for "
+                     + ", ".join(missing) + ".")
+    # Last, because recency keeps it live: exit criteria say what done looks
+    # like but never say to stop there, and an agent that hits its criteria
+    # with an obvious next step in view will take it.
+    lines.append("")
+    lines.append("## Scope")
+    lines.append(SCOPE_NOTE)
     return "\n".join(lines).strip() + "\n"
 
 
@@ -405,6 +411,7 @@ def _binding_pub(data: dict, sid: str, rec: dict) -> dict | None:
         "stage_name": stages[idx]["name"] if stages else "",
         "assigned_at": rec.get("assigned_at", ""),
         "sent": list(rec.get("sent", [])),
+        "run_count": len(rec.get("runs", [])),
     }
 
 
@@ -419,6 +426,7 @@ def bind(session_id: str, wid: str) -> dict | None:
             "stage_index": 0,
             "assigned_at": _now(),
             "sent": [],
+            "runs": [],
         }
         _save(data)
         return _binding_pub(data, session_id, data["bindings"][session_id])
@@ -470,6 +478,77 @@ def mark_sent(session_id: str, stage_id: str) -> None:
             _save(data)
 
 
+# ---------------------------------------------------------------------------
+# Run log — what was actually sent, when, and to what.
+#
+# The stage pointer says where a workflow HAS GOT TO; it says nothing about
+# what happened. A run is one press of Send: which stage, which agents it named,
+# which model the session was on at the time, and how long the session stayed
+# busy afterwards. Runs are appended and never edited, so re-sending a stage
+# leaves both attempts on the record.
+# ---------------------------------------------------------------------------
+
+def start_run(session_id: str, *, stage_id: str, stage_name: str,
+              stage_index: int, model: str, agent_ids: list[str],
+              chars: int, edited: bool) -> dict | None:
+    """Open a run for a stage that has just been sent. Returns the run."""
+    with _lock:
+        data = _load()
+        rec = data["bindings"].get(session_id)
+        if rec is None:
+            return None
+        run = {
+            "run_id": uuid.uuid4().hex[:12],
+            "stage_id": stage_id,
+            "stage_name": stage_name,
+            "stage_index": int(stage_index),
+            "model": model or "",
+            "agent_ids": list(agent_ids),
+            "chars": int(chars),
+            "edited": bool(edited),
+            "started_at": _now(),
+            "ended_at": None,
+        }
+        runs = rec.setdefault("runs", [])
+        # An earlier run still open means the operator sent again before the
+        # session went quiet. Close it at this moment: whatever it was doing,
+        # this send is where that turn stopped being the one in flight.
+        for prev in runs:
+            if prev.get("ended_at") is None:
+                prev["ended_at"] = run["started_at"]
+                prev["superseded"] = True
+        runs.append(run)
+        _save(data)
+        return dict(run)
+
+
+def close_open_run(session_id: str, ended_at: str) -> bool:
+    """Close the newest open run. `ended_at` is the session's last write, not
+    the moment this was noticed, so a duration is what the session took rather
+    than how often the dashboard was polled."""
+    with _lock:
+        data = _load()
+        rec = data["bindings"].get(session_id)
+        if rec is None:
+            return False
+        for run in reversed(rec.get("runs", [])):
+            if run.get("ended_at") is None:
+                if ended_at <= run["started_at"]:
+                    return False     # nothing written since the send yet
+                run["ended_at"] = ended_at
+                _save(data)
+                return True
+        return False
+
+
+def list_runs(session_id: str) -> list[dict]:
+    """Newest first — the log reads as a history, and the last run is the one
+    being asked about."""
+    with _lock:
+        rec = _load()["bindings"].get(session_id) or {}
+        return [dict(r) for r in reversed(rec.get("runs", []))]
+
+
 def bindings_by_session() -> dict[str, dict]:
     """{session_id: binding} in one file read — for the board and triage
     badges, which decorate many sessions at once."""
@@ -517,7 +596,6 @@ def to_yaml(wid: str) -> str | None:
     ordered = {
         "title": wf.get("title", ""),
         "description": wf.get("description", ""),
-        "agents": wf.get("agents", []),
         "stages": wf.get("stages", []),
     }
     return yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True,
@@ -539,11 +617,13 @@ def from_yaml(text: str) -> dict:
     title = str(doc.get("title") or "").strip()
     if not title:
         raise ValueError("a workflow file needs a title")
-    agents = doc.get("agents") or []
     stages = doc.get("stages") or []
-    if not isinstance(agents, list) or not isinstance(stages, list):
-        raise ValueError("agents and stages must be lists")
+    if not isinstance(stages, list):
+        raise ValueError("stages must be a list")
+    # An "agents:" block from a file written before the central roster is
+    # ignored, not rejected: its stages still name the agents by id, and those
+    # ids are what resolve against ~/.claude/agents now.
     # Validate before creating, so a bad file leaves nothing behind.
-    validate(agents, stages)
+    validate(stages)
     wf = create_workflow(title, str(doc.get("description") or ""))
-    return update_workflow(wf["id"], agents=agents, stages=stages)
+    return update_workflow(wf["id"], stages=stages)

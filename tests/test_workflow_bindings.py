@@ -11,11 +11,10 @@ from server import workflows
 SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
-AGENTS = [{"name": "Builder", "prompt": "build"}]
 STAGES = [
-    {"name": "One", "mode": "solo", "agent_ids": ["builder"]},
-    {"name": "Two", "mode": "solo", "agent_ids": ["builder"]},
-    {"name": "Three", "mode": "solo", "agent_ids": ["builder"]},
+    {"name": "One", "mode": "solo", "agent_ids": ["Builder"]},
+    {"name": "Two", "mode": "solo", "agent_ids": ["Builder"]},
+    {"name": "Three", "mode": "solo", "agent_ids": ["Builder"]},
 ]
 
 
@@ -27,7 +26,7 @@ def scratch(tmp_path, monkeypatch):
 @pytest.fixture
 def wid():
     w = workflows.create_workflow("Feature delivery")["id"]
-    workflows.update_workflow(w, agents=AGENTS, stages=STAGES)
+    workflows.update_workflow(w, stages=STAGES)
     return w
 
 

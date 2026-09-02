@@ -2,8 +2,10 @@
 Pinned messages — the store and its endpoints.
 
 A pin is a copy of one message you want to keep at hand. Nothing is ever sent
-from it, so the whole contract is: add, list newest-first, delete one, delete
-all, survive a /clear rekey.
+from it, so the store's whole contract is: add, list newest-first, delete one,
+delete all, survive a /clear rekey. Pinning through the endpoint does one more
+thing — it queues the task to send about the pinned message, and the two records
+point at each other.
 
 Every test points the store at a tmp file, so the real state under server/ is
 never touched.
@@ -12,7 +14,7 @@ never touched.
 import pytest
 from fastapi.testclient import TestClient
 
-from server import pins
+from server import pins, summarizer, tasks
 from server.app import app
 
 SID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -22,6 +24,14 @@ OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 @pytest.fixture(autouse=True)
 def scratch(tmp_path, monkeypatch):
     monkeypatch.setattr(pins, "_PATH", str(tmp_path / "pins.json"))
+    monkeypatch.setattr(tasks, "_PATH", str(tmp_path / "tasks.json"))
+
+    # Pinning writes a task through the summarizer; the real one shells out to
+    # `claude`. Stubbed here so the endpoint tests stay offline and fast.
+    async def _fake(text, kind="assistant"):
+        return f"[{kind}] follow up on: {text}"
+
+    monkeypatch.setattr(summarizer, "as_pin_task", _fake)
 
 
 @pytest.fixture
@@ -118,6 +128,69 @@ def test_api_add_list_delete(client):
 
     assert client.delete(f"/api/sessions/{SID}/pins/{pid}").status_code == 200
     assert client.get(f"/api/sessions/{SID}/pins").json()["pins"] == []
+
+
+def test_api_pinning_queues_a_linked_task(client):
+    """The point of the pin button: the message is kept verbatim and the task to
+    send about it is queued alongside, each pointing at the other."""
+    pin = client.post(f"/api/sessions/{SID}/pins",
+                      json={"text": "the migration is blocked", "kind": "assistant"}).json()
+    queued = tasks.list_tasks(SID)
+    assert len(queued) == 1
+    task = queued[0]
+    assert pin["task_id"] == task["id"]
+    assert task["pin_id"] == pin["id"]
+    assert task["text"] == "[assistant] follow up on: the migration is blocked"
+    # only the task is rewritten — the pin keeps the message as it was
+    assert pin["text"] == "the migration is blocked"
+
+
+def test_api_task_falls_back_to_the_pinned_text(client, monkeypatch):
+    """A summarizer that is missing or times out must not swallow the pin: the
+    task is queued with the pinned text, which you can edit."""
+    async def _none(text, kind="assistant"):
+        return None
+
+    monkeypatch.setattr(summarizer, "as_pin_task", _none)
+    client.post(f"/api/sessions/{SID}/pins", json={"text": "raw text"})
+    assert [t["text"] for t in tasks.list_tasks(SID)] == ["raw text"]
+
+
+def test_api_re_pinning_does_not_queue_a_second_task(client):
+    """The button survives a repaint, so a double click must stack neither a
+    pin nor a task."""
+    a = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    b = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    assert a["id"] == b["id"] and a["task_id"] == b["task_id"]
+    assert len(tasks.list_tasks(SID)) == 1
+
+
+def test_api_re_pinning_after_the_task_was_deleted_queues_again(client):
+    """Deleting the task is how you say you're done with it. Pinning again is
+    then a fresh ask, not a no-op."""
+    pin = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    tasks.delete_task(SID, pin["task_id"])
+    again = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    assert again["id"] == pin["id"]                 # still one pin
+    assert again["task_id"] != pin["task_id"]
+    assert len(tasks.list_tasks(SID)) == 1
+
+
+def test_api_an_archived_task_is_not_re_queued(client):
+    """Archived is not gone — the pin still has its task."""
+    pin = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    tasks.set_archived(SID, pin["task_id"], True)
+    again = client.post(f"/api/sessions/{SID}/pins", json={"text": "same"}).json()
+    assert again["task_id"] == pin["task_id"]
+    assert tasks.list_tasks(SID) == []
+
+
+def test_api_unpinning_leaves_the_task(client):
+    """By the time you unpin, the task may be edited or already asked — the two
+    are linked, not owned."""
+    pin = client.post(f"/api/sessions/{SID}/pins", json={"text": "one"}).json()
+    client.delete(f"/api/sessions/{SID}/pins/{pin['id']}")
+    assert [t["id"] for t in tasks.list_tasks(SID)] == [pin["task_id"]]
 
 
 def test_api_empty_text_rejected(client):
