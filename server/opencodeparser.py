@@ -42,6 +42,13 @@ DATA_DIR = os.path.expanduser(
 _MAX_ACT = 3           # recent activities on a board summary
 _MAX_DETAIL_ACT = 400  # activities in a full detail view
 
+# How much of a turn's text a *board card* keeps. A card shows three lines of
+# preview, so anything past this is never on screen. The detail and sub-agent
+# transcripts pass cap=None instead: an opencode reply routinely runs past this
+# and cutting it there dropped the end of the answer with nothing to say it had
+# gone.
+_PREVIEW_CHARS = 2000
+
 # _summarize cache: session_id -> (time_updated, summary dict). opencode bumps
 # time_updated on every write, so it invalidates exactly like an mtime would.
 _SUMM_CACHE: dict[str, tuple] = {}
@@ -193,12 +200,15 @@ def _roles(conn: sqlite3.Connection, sid: str) -> dict[str, str]:
     return out
 
 
-def _activities(sid: str, limit: int) -> list[dict]:
+def _activities(sid: str, limit: int, cap: int | None = _PREVIEW_CHARS) -> list[dict]:
     """Recent readable turns for a session, chronological.
 
     `limit` caps the *parts read*, newest-first, before the noise filter — so a
     board preview costs one small indexed read even on a session with tens of
     thousands of parts, rather than a full-transcript scan.
+
+    `cap` caps each turn's text; None keeps it whole, which is what a transcript
+    view wants.
     """
     conn = _connect()
     if conn is None:
@@ -241,7 +251,7 @@ def _activities(sid: str, limit: int) -> list[dict]:
             continue
         acts.append({"kind": kind, "name": name,
                      "ts": claude_parser._iso(_ms(r["time_created"])),
-                     "role": kind, "text": text[:2000]})
+                     "role": kind, "text": text[:cap] if cap else text})
         if limit and len(acts) >= limit:
             break
     acts.reverse()                       # back to chronological
@@ -419,7 +429,7 @@ def subagent_transcript(sid: str, agent_id: str,
         if run["agent_id"] != agent_id:
             continue
         child = run.get("child_session_id")
-        acts = _activities(child, limit) if child else []
+        acts = _activities(child, limit, cap=None) if child else []
         total = len(acts)
         return {
             "agent_id": run["agent_id"],
@@ -435,6 +445,50 @@ def subagent_transcript(sid: str, agent_id: str,
             "mtime": run["mtime"],
         }
     return None
+
+
+# ---- to-do list --------------------------------------------------------------
+#
+# opencode's TUI keeps a Todo panel: the plan the agent wrote for itself, ticked
+# off as it goes. It lives in the `todowrite` tool's input — every call rewrites
+# the whole list, so the newest call *is* the current plan and the older ones are
+# its history. Only the newest is read here, which is what the TUI shows.
+
+_TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
+
+
+def todos(sid: str) -> list[dict]:
+    """The session's current to-do list, in the order the agent wrote it.
+
+    Empty when the session never called `todowrite` — plenty of sessions are one
+    question and an answer, and those have no plan to show.
+    """
+    rows = _query(
+        "SELECT data FROM part WHERE session_id = ? "
+        "AND json_extract(data,'$.tool') = 'todowrite' "
+        "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,))
+    if not rows:
+        return []
+    state = _loads(rows[0]["data"]).get("state") or {}
+    items = (state.get("input") or {}).get("todos")
+    if not isinstance(items, list):
+        # A call still running has no input echoed back yet on some versions;
+        # the completed metadata carries the same list.
+        items = (state.get("metadata") or {}).get("todos")
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(it.get("status") or "pending")
+        out.append({
+            "content": content,
+            "status": status if status in _TODO_STATUSES else "pending",
+            "priority": str(it.get("priority") or "") or None,
+        })
+    return out
 
 
 def _summarize(row: sqlite3.Row, step_count: int) -> dict:
@@ -542,11 +596,12 @@ def get_session(sid: str) -> dict | None:
     s = get_summary(sid)
     if s is None:
         return None
-    acts = _activities(sid, _MAX_DETAIL_ACT)
+    acts = _activities(sid, _MAX_DETAIL_ACT, cap=None)
     acts.reverse()                       # newest first for the history view
     detail = dict(s)
     detail["activities"] = acts
     detail["subagents"] = subagents(sid)
+    detail["todos"] = todos(sid)
     return detail
 
 
