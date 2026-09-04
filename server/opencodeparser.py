@@ -42,13 +42,6 @@ DATA_DIR = os.path.expanduser(
 _MAX_ACT = 3           # recent activities on a board summary
 _MAX_DETAIL_ACT = 400  # activities in a full detail view
 
-# How much of a turn's text a *board card* keeps. A card shows three lines of
-# preview, so anything past this is never on screen. The detail and sub-agent
-# transcripts pass cap=None instead: an opencode reply routinely runs past this
-# and cutting it there dropped the end of the answer with nothing to say it had
-# gone.
-_PREVIEW_CHARS = 2000
-
 # _summarize cache: session_id -> (time_updated, summary dict). opencode bumps
 # time_updated on every write, so it invalidates exactly like an mtime would.
 _SUMM_CACHE: dict[str, tuple] = {}
@@ -200,15 +193,16 @@ def _roles(conn: sqlite3.Connection, sid: str) -> dict[str, str]:
     return out
 
 
-def _activities(sid: str, limit: int, cap: int | None = _PREVIEW_CHARS) -> list[dict]:
+def _activities(sid: str, limit: int) -> list[dict]:
     """Recent readable turns for a session, chronological.
 
     `limit` caps the *parts read*, newest-first, before the noise filter — so a
     board preview costs one small indexed read even on a session with tens of
     thousands of parts, rather than a full-transcript scan.
 
-    `cap` caps each turn's text; None keeps it whole, which is what a transcript
-    view wants.
+    Turn text is never cut. A board card clips its preview in CSS, which is what
+    parser.py has always done for Claude sessions — a character cut here reached
+    the history view too and lost the end of long answers.
     """
     conn = _connect()
     if conn is None:
@@ -251,7 +245,7 @@ def _activities(sid: str, limit: int, cap: int | None = _PREVIEW_CHARS) -> list[
             continue
         acts.append({"kind": kind, "name": name,
                      "ts": claude_parser._iso(_ms(r["time_created"])),
-                     "role": kind, "text": text[:cap] if cap else text})
+                     "role": kind, "text": text})
         if limit and len(acts) >= limit:
             break
     acts.reverse()                       # back to chronological
@@ -429,7 +423,7 @@ def subagent_transcript(sid: str, agent_id: str,
         if run["agent_id"] != agent_id:
             continue
         child = run.get("child_session_id")
-        acts = _activities(child, limit, cap=None) if child else []
+        acts = _activities(child, limit) if child else []
         total = len(acts)
         return {
             "agent_id": run["agent_id"],
@@ -596,7 +590,7 @@ def get_session(sid: str) -> dict | None:
     s = get_summary(sid)
     if s is None:
         return None
-    acts = _activities(sid, _MAX_DETAIL_ACT, cap=None)
+    acts = _activities(sid, _MAX_DETAIL_ACT)
     acts.reverse()                       # newest first for the history view
     detail = dict(s)
     detail["activities"] = acts

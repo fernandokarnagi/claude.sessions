@@ -276,9 +276,10 @@ def test_a_long_reply_reaches_the_detail_view_whole(db):
     assert detail[0]["text"] == long_reply
 
 
-def test_the_board_preview_still_trims_a_long_reply(db):
-    """A card shows three lines; shipping 9k characters per session to render
-    them is the whole reason the cap exists."""
+def test_the_board_preview_is_not_trimmed_either(db):
+    """The card clips its three lines in CSS. A character cut in the parser was
+    the same read the history view used, so it took the end of the answer with
+    it — parser.py has never cut Claude turns here, and neither does this."""
     conn = sqlite3.connect(str(db / "opencode.db"))
     _part(conn, "p21", "m2", "ses_main", 21_000,
           {"type": "text", "text": "y" * 9000})
@@ -286,7 +287,7 @@ def test_the_board_preview_still_trims_a_long_reply(db):
     conn.close()
     opencodeparser._SUMM_CACHE.clear()
     preview = opencodeparser.get_summary("ses_main")["last_activities"]
-    assert len(preview[-1]["text"]) == opencodeparser._PREVIEW_CHARS
+    assert preview[-1]["text"] == "y" * 9000
 
 
 def _todowrite(conn, pid, offset, todos):

@@ -202,7 +202,7 @@ def _summarize(db_path: str) -> dict | None:
     for (idx, step_type, status, _), runs in zip(rows, step_runs):
         text = _step_text(step_type, runs)
         if text and text != title:
-            acts.append({"kind": "agy", "text": text[:200]})
+            acts.append({"kind": "agy", "text": text})
     recent = acts[-3:]
 
     created = claude_parser._iso(os.path.getctime(db_path)) if hasattr(os.path, "getctime") else None
@@ -650,7 +650,7 @@ def get_conversation(cid: str) -> dict | None:
     for idx, step_type, payload in rows:
         text = _step_text(step_type, _runs(payload))
         if text:
-            acts.append({"kind": "agy", "name": None, "text": text[:2000]})
+            acts.append({"kind": "agy", "name": None, "text": text})
     acts.reverse()
     detail = dict(s)
     detail["activities"] = acts
