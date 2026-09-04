@@ -449,6 +449,8 @@ def subagent_transcript(sid: str, agent_id: str,
 # its history. Only the newest is read here, which is what the TUI shows.
 
 _TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
+# Nothing left to watch: a list of only these is a plan that has run its course.
+_DONE_TODOS = ("completed", "cancelled")
 
 
 def todos(sid: str) -> list[dict]:
@@ -456,12 +458,28 @@ def todos(sid: str) -> list[dict]:
 
     Empty when the session never called `todowrite` — plenty of sessions are one
     question and an answer, and those have no plan to show.
+
+    Also empty once the plan belongs to a finished task. A session lives for
+    days and its last `todowrite` stays on disk, so a list written before the
+    newest user prompt is answering an older question — "Todo 5/5 done" on the
+    header while the agent works on something unrelated. The task boundary is
+    the one `subagents` already uses: the last user prompt. The agent rewrites
+    the list as soon as it plans the new task, and the panel returns with it.
+
+    A finished plan is empty too. Every item completed (or cancelled) means
+    nothing is in flight, and the panel is there to answer "where is it right
+    now?" — a 5/5 list hanging on the header after the agent has moved on is
+    the old answer to an old question.
     """
     rows = _query(
-        "SELECT data FROM part WHERE session_id = ? "
+        "SELECT time_created, data FROM part WHERE session_id = ? "
         "AND json_extract(data,'$.tool') = 'todowrite' "
         "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,))
     if not rows:
+        return []
+    since = _last_prompt(sid)
+    written = _ms(rows[0]["time_created"]) or 0
+    if since is not None and written < since:
         return []
     state = _loads(rows[0]["data"]).get("state") or {}
     items = (state.get("input") or {}).get("todos")
@@ -482,6 +500,8 @@ def todos(sid: str) -> list[dict]:
             "status": status if status in _TODO_STATUSES else "pending",
             "priority": str(it.get("priority") or "") or None,
         })
+    if out and all(t["status"] in _DONE_TODOS for t in out):
+        return []
     return out
 
 

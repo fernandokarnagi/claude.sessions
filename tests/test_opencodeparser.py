@@ -358,3 +358,62 @@ def test_a_junk_todo_row_is_dropped_not_rendered_blank(db):
     opencodeparser._SUMM_CACHE.clear()
     assert opencodeparser.todos("ses_main") == [
         {"content": "real item", "status": "pending", "priority": None}]
+
+
+def test_a_plan_from_a_finished_task_leaves_the_header(db):
+    """The last todowrite stays on disk for the life of the session. Once the
+    user asks something else, that list is answering the old question — the TUI
+    would show the new task's plan, so the panel goes quiet until one exists."""
+    conn = sqlite3.connect(str(db / "opencode.db"))
+    _todowrite(conn, "p35", 35_000,
+               [{"content": "ship the old thing", "status": "in_progress"}])
+    _msg(conn, "m4", "ses_main", "user")
+    _part(conn, "p36", "m4", "ses_main", 36_000,
+          {"type": "text", "text": "different question entirely"})
+    conn.commit()
+    conn.close()
+    opencodeparser._SUMM_CACHE.clear()
+    assert opencodeparser.todos("ses_main") == []
+    assert opencodeparser.get_session("ses_main")["todos"] == []
+
+
+def test_the_plan_for_the_current_task_still_shows(db):
+    """The other half of the same rule: a list written after the newest prompt
+    is this task's plan, half-done or not."""
+    conn = sqlite3.connect(str(db / "opencode.db"))
+    _msg(conn, "m4", "ses_main", "user")
+    _part(conn, "p37", "m4", "ses_main", 37_000,
+          {"type": "text", "text": "now do the other thing"})
+    _todowrite(conn, "p38", 38_000,
+               [{"content": "the other thing", "status": "in_progress"}])
+    conn.commit()
+    conn.close()
+    opencodeparser._SUMM_CACHE.clear()
+    assert opencodeparser.todos("ses_main") == [
+        {"content": "the other thing", "status": "in_progress", "priority": None}]
+
+
+def test_a_finished_plan_leaves_the_header(db):
+    """Nothing pending, nothing running: the plan has run its course and the
+    button that asks "where is it right now?" has no answer left to give."""
+    conn = sqlite3.connect(str(db / "opencode.db"))
+    _todowrite(conn, "p39", 39_000, [
+        {"content": "wire it", "status": "completed"},
+        {"content": "the bit we dropped", "status": "cancelled"}])
+    conn.commit()
+    conn.close()
+    opencodeparser._SUMM_CACHE.clear()
+    assert opencodeparser.todos("ses_main") == []
+    assert opencodeparser.get_session("ses_main")["todos"] == []
+
+
+def test_one_item_left_keeps_the_plan_on_the_header(db):
+    conn = sqlite3.connect(str(db / "opencode.db"))
+    _todowrite(conn, "p40", 40_000, [
+        {"content": "wire it", "status": "completed"},
+        {"content": "test it", "status": "pending"}])
+    conn.commit()
+    conn.close()
+    opencodeparser._SUMM_CACHE.clear()
+    assert [t["content"] for t in opencodeparser.todos("ses_main")] == [
+        "wire it", "test it"]
