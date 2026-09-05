@@ -635,6 +635,20 @@ body.embed .attn-rail { display: none; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .rail-row1 .err-badge { font-size: 10px; padding: 1px 5px; max-width: 130px; }
+
+/* Contributor-tier model: the provider trains on this session's traffic. Loud
+   on purpose — it is a data-handling rule, not a status. */
+.badge.training-badge {
+  color: #ffd33d; border-color: rgba(255,211,61,.6) !important;
+  background: rgba(255,211,61,.16); font-weight: 700;
+  letter-spacing: .3px; text-transform: uppercase; white-space: nowrap;
+  animation: blink 1.1s ease-in-out infinite;
+}
+/* Reduced-motion: keep the badge loud, drop the flashing. */
+@media (prefers-reduced-motion: reduce) {
+  .badge.training-badge { animation: none; }
+}
+.now-model .training-badge { font-size: 10px; padding: 1px 6px; }
 /* History entries for the same thing — the outage and the recovery that follows. */
 .event.repl-error { border-left-color: #f85149; }
 .event.repl-error .kind { color: #ff7b72; }
