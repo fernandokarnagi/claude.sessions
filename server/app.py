@@ -1399,8 +1399,14 @@ def api_answer_multi(session_id: str, body: AnswerMultiBody):
 
     A digit only toggles a checkbox in that widget, so this can't go through
     /answer — it ticks each option, walks the cursor to Submit, and confirms.
+
+    opencode has the same widget with different keys: no Submit row to walk to,
+    Tab instead carries the wizard to its Review page, so it gets its own path.
     """
-    result = tmuxio.answer_multi(session_id, body.nums)
+    if opencodeparser.has_session(session_id):
+        result = tmuxio.opencode_answer_multi(session_id, body.nums)
+    else:
+        result = tmuxio.answer_multi(session_id, body.nums)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "answer failed"))
     return result
