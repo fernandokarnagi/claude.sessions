@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (agents, agyparser, archives, attention, autonomy, budgets,
-               descriptions, grokparser, ledger, models, ollamausage,
+               descriptions, grokparser, index, ledger, models, ollamausage,
                opencodeparser, overrides, parser, pins, prices, projects,
                registry, runner, slackbot, subagents, summaries, summarizer,
                tasks, tmuxio, workflows)
@@ -410,40 +410,129 @@ def _apply_opencode_live(s: dict, session_id: str) -> None:
 
 
 @app.get("/api/search")
-def api_search(q: str = Query(""), archived: str | None = Query(None)):
-    """Search by id/title/project. Archived sessions are excluded unless
-    `archived=include`."""
+def api_search(q: str = Query(""), archived: str | None = Query(None),
+               mode: str = Query("both"), limit: int = Query(40),
+               per_session: int = Query(5)):
+    """Search sessions by header (id/title/project) and by transcript text.
+
+    `mode` is meta (headers only — the old behaviour), text (transcripts only),
+    or both (the default). Every session in the answer is the same full board
+    summary the dashboard renders, so a result row can show status, model,
+    tokens, cost and tasks without a second request. Text matches carry their
+    snippets in `hits`, keyed by session id.
+
+    Archived sessions are excluded unless `archived=include`.
+    """
+    mode = (mode or "both").lower()
+    if mode not in ("meta", "text", "both"):
+        raise HTTPException(status_code=400, detail="mode must be meta, text or both")
     include_archived = (archived or "").lower() in ("1", "true", "include", "yes")
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     live_tmux = tmuxio.tmux_sessions()
     arch_ids = archives.archived_ids()
-    data = parser.search_sessions(q, extra_titles=titles)
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
-    kept = []
-    for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
-        if include_archived or not s.get("archived"):
-            s["projects"] = proj_map.get(s["session_id"], [])
-            s["task_count"] = task_counts.get(s["session_id"], 0)
-            kept.append(s)
-    data["sessions"] = kept
-    # Include matching agy conversations (by id / title / project).
+    caps = budgets.all_caps()
     ql = q.lower().strip()
-    if ql:
+
+    def tag(s: dict) -> dict:
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        return s
+
+    data = {"sessions": [], "total": 0}
+    if mode in ("meta", "both"):
+        data = parser.search_sessions(q, extra_titles=titles)
+        kept = []
+        for s in data["sessions"]:
+            _decorate(s, web_mtimes, running, titles, live_ids=live_tmux, caps=caps)
+            if include_archived or not s.get("archived"):
+                kept.append(tag(s))
+        data["sessions"] = kept
+        # Matching agy / grok / opencode conversations (by id / title / project).
+        if ql:
+            marked = attention.marked_ids()
+            for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
+                      + _grok_summaries(titles, arch_ids, marked, mode="all")
+                      + _opencode_summaries(titles, arch_ids, marked, mode="all")):
+                if not include_archived and s.get("archived"):
+                    continue
+                if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
+                        or ql in (s["project"] or "").lower()
+                        or ql in (s["cwd"] or "").lower()):
+                    data["sessions"].append(tag(s))
+
+    hits: dict = {}
+    if ql and mode in ("text", "both"):
+        # Kicked, never waited on: a first build over a large fleet takes tens
+        # of seconds, and a search box that hangs that long is worse than one
+        # that is briefly incomplete.
+        index.ensure_fresh()
+        found = index.search(q, limit=limit, per_session=per_session)
+        hits = found["hits"]
+        have = {s["session_id"] for s in data["sessions"]}
+        extra = [sid for sid in found["order"] if sid not in have]
+        if extra:
+            for s in _summaries_for_ids(extra, titles, arch_ids, web_mtimes,
+                                        running, live_tmux, caps):
+                if not include_archived and s.get("archived"):
+                    continue
+                data["sessions"].append(tag(s))
+        # A text hit is the reason its session is here — put those first, in
+        # the order the index ranked them.
+        rank = {sid: i for i, sid in enumerate(found["order"])}
+        data["sessions"].sort(key=lambda s: rank.get(s["session_id"], len(rank) + 1))
+
+    kept_ids = {s["session_id"] for s in data["sessions"]}
+    data["hits"] = {sid: v for sid, v in hits.items() if sid in kept_ids}
+    data["mode"] = mode
+    data["index"] = index.stats() if mode in ("text", "both") else None
+    data["total"] = len(data["sessions"])
+    return data
+
+
+def _summaries_for_ids(sids, titles, arch_ids, web_mtimes, running,
+                       live_tmux, caps) -> list:
+    """Board summaries for a set of session ids, whatever provider they are on.
+
+    Claude sessions are looked up one at a time (a stat plus a cached parse);
+    the other three are only enumerated if an id is left over, because those
+    stores have no by-id lookup that skips the fleet scan.
+    """
+    out, remaining = [], []
+    for sid in sids:
+        s = parser._summary_for_id(sid)
+        if s is None:
+            remaining.append(sid)
+            continue
+        _decorate(s, web_mtimes, running, titles, live_ids=live_tmux, caps=caps)
+        out.append(s)
+    if remaining:
+        want = set(remaining)
         marked = attention.marked_ids()
         for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
                   + _grok_summaries(titles, arch_ids, marked, mode="all")
                   + _opencode_summaries(titles, arch_ids, marked, mode="all")):
-            if not include_archived and s.get("archived"):
-                continue
-            if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
-                    or ql in (s["project"] or "").lower() or ql in (s["cwd"] or "").lower()):
-                s["projects"] = proj_map.get(s["session_id"], [])
-                s["task_count"] = task_counts.get(s["session_id"], 0)
-                data["sessions"].append(s)
-    data["total"] = len(data["sessions"])
-    return data
+            if s["session_id"] in want:
+                out.append(s)
+    return out
+
+
+@app.get("/api/search/index")
+def api_search_index():
+    """What the full-text index currently holds."""
+    return index.stats()
+
+
+@app.post("/api/search/reindex")
+def api_search_reindex(rebuild: bool = Query(False)):
+    """Kick a pass over the transcripts. `rebuild=true` throws the index away
+    first — the repair for an index you no longer trust. Returns immediately;
+    the pass runs in the background."""
+    if rebuild:
+        index.drop()
+    started = index.ensure_fresh(force=True)
+    return {"started": started, "rebuild": rebuild, "index": index.stats()}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -2074,7 +2163,8 @@ def api_advance_stage(session_id: str, body: AdvanceBody):
 
 
 @app.get("/")
-def index():
+def serve_index():
+    # Not `index` — that name is the full-text index module in this file.
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 

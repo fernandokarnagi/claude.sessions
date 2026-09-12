@@ -112,12 +112,26 @@ fleet over cap pauses autonomy.
 SQLite FTS5 at `server/.search.db` (gitignored).
 
 - `msgs` — FTS5 virtual table over `session_id, provider, seq, role, ts, text`.
-- `files` — `path, mtime, size, session_id`, the incremental ledger.
+- `sources` — `session_id, provider, path, mtime, size, msgs, indexed_at`, the
+  incremental ledger.
+
+**Built as:** the ledger is keyed by session, not by file. opencode keeps every
+session in one database, so a per-file stamp would mark the whole fleet dirty
+on any write; its sessions are stamped by their own `time_updated` and part
+count instead. The other three keep a file (or directory) per session and stamp
+as `(mtime, size)`.
 
 `refresh()` stats every transcript across all four providers, reparses only
-files whose `(mtime, size)` moved, and replaces that file's rows in one
+sessions whose stamp moved, and replaces that session's rows in one
 transaction. A deleted transcript drops its rows. Text comes from the same
-render path the history view uses, so a snippet reads like the UI.
+render path the history view uses, so a snippet reads like the UI. Tool calls
+and their results are capped at 4k characters (prose at 20k) — they are three
+quarters of the raw text on a real fleet and the tail of a file dump is not
+what anyone searches for.
+
+`ensure_fresh()` kicks a pass in a background thread and returns at once: a
+first build over a thousand sessions takes tens of seconds, and a search box
+that hangs that long is worse than one that is briefly incomplete.
 
 `search(q, limit, per_session)` returns hits carrying `snippet()` output,
 role, timestamp and seq.
@@ -129,8 +143,11 @@ is untouched; text hits merge in, and every session still passes through
 `_decorate`, so a result arrives with status, model, tokens, cost, projects and
 task count. The response adds `hits: {session_id: [...]}`.
 
-`POST /api/search/reindex` and `GET /api/search/index` (rows, files, last
-build, whether a build is running).
+`POST /api/search/reindex` (`?rebuild=true` throws the index away first) and
+`GET /api/search/index` (sessions, messages, bytes, last build, whether a build
+is running).
+
+The root route was renamed `serve_index` — `index` is now a module.
 
 ### 7.3 UI
 
@@ -143,6 +160,12 @@ boundary it is everywhere else in the frontend.
 
 ### 7.4 Tests
 
-`test_index.py` — incremental skip, deletion, all four providers, snippet
-shape. `test_search_text_api.py` — mode switching, archived exclusion, hits
-keyed by session.
+`test_index.py` — incremental skip, deletion, clipping, snippet shape.
+`test_index_providers.py` — one session built from scratch in each of the four
+stores, including opencode's shared database and grok's two-level directory.
+`test_search_text_api.py` — mode switching, archived exclusion, hits keyed by
+session, the full session header on every result.
+
+`tests/conftest.py` points the index at a scratch file and disarms the
+background refresh for the whole suite, so no test can spend half a minute
+re-reading the operator's transcripts or write over the running server's index.

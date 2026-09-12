@@ -5,27 +5,33 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Search · Agent OS</title>
   <link rel="icon" href="/static/favicon.svg?v=1" type="image/svg+xml" />
-  <link rel="stylesheet" href="/static/style.css?v=193" />
+  <link rel="stylesheet" href="/static/style.css?v=194" />
 </head>
 <body>
   <header class="topbar">
     <nav id="topnav" class="topnav"></nav>
     <span class="spacer"></span>
+    <button class="toggle" id="reindexBtn" title="Read any transcript that has changed since the last pass">🔄 Reindex</button>
     <span class="meta" id="meta"></span>
   </header>
   <main>
     <div class="search-bar">
       <input id="q" type="text" autofocus
-             placeholder="Search by title, session ID, or path — wildcards ok (e.g. *docker*, build*, df8c1588) …" />
+             placeholder="Search everything ever said — or a title, session ID or path (e.g. kafka retry, *docker*, df8c1588) …" />
+    </div>
+    <div class="search-modes">
+      <button class="search-mode current" data-mode="both">Everything</button>
+      <button class="search-mode" data-mode="text">Transcripts only</button>
+      <button class="search-mode" data-mode="meta">Headers only</button>
     </div>
     <label class="hist-toggle" style="margin:8px 2px 12px">
       <input type="checkbox" id="incArchived" /> include archived
     </label>
     <div id="projFilter" class="proj-filter"></div>
     <div class="grid" id="grid"></div>
-    <div class="empty" id="empty">Type to search by title, session ID, or project path. Wildcards * and ? supported.</div>
+    <div class="empty" id="empty">Type to search. Headers match on title, session ID and project path (wildcards * and ? supported); transcripts match on anything ever said in a session, quoted "like this" for an exact phrase.</div>
   </main>
-  <script src="/static/app.js?v=193"></script>
+  <script src="/static/app.js?v=194"></script>
   <script>renderTopNav("search"); Search.init();</script>
 </body>
 </html>
