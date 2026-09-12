@@ -22,10 +22,11 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (agents, agyparser, archives, attention, autonomy, descriptions,
-               grokparser, models, ollamausage, opencodeparser, overrides,
-               parser, pins, projects, registry, runner, slackbot,
-               subagents, summaries, summarizer, tasks, tmuxio, workflows)
+from . import (agents, agyparser, archives, attention, autonomy, budgets,
+               descriptions, grokparser, ledger, models, ollamausage,
+               opencodeparser, overrides, parser, pins, prices, projects,
+               registry, runner, slackbot, subagents, summaries, summarizer,
+               tasks, tmuxio, workflows)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -81,7 +82,7 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
               titles: dict | None = None, archived: set | None = None,
               live_ids: set | None = None, marked: set | None = None,
               working_ids: set | None = None, errors: dict | None = None,
-              descs: dict | None = None) -> dict:
+              descs: dict | None = None, caps: dict | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -147,6 +148,15 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["error"] = errs.get(sid)
     else:
         summary["error"] = None
+
+    # What the session has spent, and the cap it runs under. cost.priced is
+    # False for subscription and local models: the UI shows their token count
+    # and no dollars, because a dollar figure there would be invented.
+    cost = ledger.for_session(summary)
+    caps = caps if caps is not None else budgets.all_caps()
+    cap = caps.get(sid)
+    summary["cost"] = cost
+    summary["budget"] = budgets.over(summary, cost=cost, cap=cap) if cap else None
     return _apply_delegating(summary)
 
 
@@ -183,8 +193,10 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
     wf_map = workflows.bindings_by_session()
+    caps = budgets.all_caps()
     for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
+        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux,
+                  caps=caps)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
@@ -1508,7 +1520,7 @@ def api_reset(session_id: str):
     # the exact loss this endpoint exists to prevent.
     if new_id and new_id != session_id:
         for store in (overrides, descriptions, tasks, pins, projects, autonomy,
-                      attention, workflows):
+                      attention, workflows, budgets):
             store.rekey(session_id, new_id)
     if not result.get("ok"):
         # Retiring the old id is deliberately *not* done here. A failed rename
@@ -1539,6 +1551,7 @@ def api_triage():
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
     wf_map = workflows.bindings_by_session()
+    caps = budgets.all_caps()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
@@ -1550,7 +1563,7 @@ def api_triage():
         if not (is_live or is_marked):
             continue
         _decorate(s, web_mtimes, running, titles, arch_ids,
-                  live_ids=live_tmux, marked=marked)
+                  live_ids=live_tmux, marked=marked, caps=caps)
         s["pending_approval"] = is_gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
@@ -1633,6 +1646,89 @@ class PauseBody(BaseModel):
 def api_autonomy_pause(body: PauseBody):
     return {"paused": autonomy.set_paused(body.paused),
             "env_disabled": autonomy.env_disabled()}
+
+
+# ---------------------------------------------------------------------------
+# Cost — what the fleet has spent, and the caps it runs under.
+# ---------------------------------------------------------------------------
+@app.get("/api/cost")
+def api_cost(group: str = Query("project"), days: int = Query(30),
+             archived: str | None = Query(None)):
+    """Fleet spend, grouped.
+
+    `group` is project, model, day or all. Every group carries `priced`:
+    False means some of its sessions run on a subscription or locally, so the
+    dollar figure is only the metered part — the token count is the whole of
+    it.
+    """
+    group = (group or "project").lower()
+    if group not in ("project", "model", "day", "all"):
+        raise HTTPException(status_code=400,
+                            detail="group must be project, model, day or all")
+    arch_ids = archives.archived_ids()
+    mode = "all" if (archived or "").lower() in ("1", "true", "include", "yes") \
+        else "exclude"
+    sessions = parser.list_sessions(limit=None, archived_ids=arch_ids,
+                                    archived_mode=mode)["sessions"]
+    out = ledger.rollup(sessions)
+    if group in ("day", "all"):
+        out["by_day"] = ledger.by_day(sessions, days=max(0, days))
+    if group == "project":
+        out.pop("by_model", None)
+    elif group == "model":
+        out.pop("by_project", None)
+    if group == "day":
+        out.pop("by_project", None)
+        out.pop("by_model", None)
+    out["days"] = days
+    out["budgets"] = budgets.state()
+    return out
+
+
+@app.get("/api/sessions/{session_id}/budget")
+def api_get_budget(session_id: str):
+    summary = parser._summary_for_id(session_id)
+    cap = budgets.get(session_id)
+    if not summary:
+        return {"session_id": session_id, "cap": cap, "usd": 0.0,
+                "over": False, "priced": False}
+    out = budgets.over(summary, cap=cap)
+    out["session_id"] = session_id
+    out["enforced"] = budgets.was_enforced(session_id)
+    return out
+
+
+class BudgetBody(BaseModel):
+    # None or 0 clears the cap. A cap is dollars, not tokens: tokens don't
+    # compare across models, so a token ceiling would mean a different amount
+    # of work on every one.
+    cap: float | None = None
+
+
+@app.put("/api/sessions/{session_id}/budget")
+def api_set_budget(session_id: str, body: BudgetBody):
+    cap = budgets.set_cap(session_id, body.cap)
+    return {"session_id": session_id, "cap": cap}
+
+
+@app.get("/api/budget/fleet")
+def api_get_fleet_budget():
+    return budgets.state()
+
+
+@app.put("/api/budget/fleet")
+def api_set_fleet_budget(body: BudgetBody):
+    cap = budgets.set_fleet_cap(body.cap)
+    return {"fleet_cap": cap, "enabled": budgets.enabled()}
+
+
+@app.get("/api/prices")
+def api_prices():
+    """The rate table in force, so the cost page can say where a number came
+    from rather than just showing it."""
+    return {"rates": prices.table(), "builtin": prices.RATES,
+            "classes": [prices.METERED, prices.SUBSCRIPTION,
+                        prices.LOCAL, prices.UNKNOWN]}
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2086,11 @@ def session_page():
 @app.get("/search.html")
 def search_page():
     return FileResponse(os.path.join(STATIC_DIR, "search.html"))
+
+
+@app.get("/cost.html")
+def cost_page():
+    return FileResponse(os.path.join(STATIC_DIR, "cost.html"))
 
 
 @app.get("/archived.html")

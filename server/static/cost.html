@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cost · Agent OS</title>
+  <link rel="icon" href="/static/favicon.svg?v=1" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/style.css?v=193" />
+</head>
+<body>
+  <header class="topbar">
+    <nav id="topnav" class="topnav"></nav>
+    <span class="spacer"></span>
+    <button class="toggle" id="fleetCapBtn" title="Cap what the whole fleet may spend">🎯 Fleet cap</button>
+    <span class="meta" id="meta"></span>
+  </header>
+  <main>
+    <div id="summary" class="cost-summary"></div>
+    <div class="cost-tabs" id="tabs">
+      <button class="cost-tab current" data-group="project">By project</button>
+      <button class="cost-tab" data-group="model">By model</button>
+      <button class="cost-tab" data-group="day">By day</button>
+    </div>
+    <div id="view"></div>
+    <div class="empty" id="empty" hidden>Nothing spent yet.</div>
+    <p class="cost-note">
+      Dollars are shown only for metered API models. A session on a subscription
+      plan or running locally has no per-token price, so it shows its token
+      count and nothing more — those rows are marked <b>tokens only</b>.
+      Rates live in <code>server/prices.py</code> and can be overridden per
+      model in <code>server/.prices.json</code>.
+    </p>
+  </main>
+  <script src="/static/app.js?v=193"></script>
+  <script>renderTopNav("cost"); Cost.init();</script>
+</body>
+</html>

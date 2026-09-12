@@ -22,6 +22,13 @@ server/.pins.json
 server/.workflows.json
 server/.ollama_usage.json
 server/.descriptions.json
+server/.budgets.json
+# Local rate overrides: your own prices, not the ones in prices.py.
+server/.prices.json
+# The full-text search index. Rebuildable from the transcripts.
+server/.search.db
+server/.search.db-wal
+server/.search.db-shm
 server/.*.tmp
 
 # OS / editor

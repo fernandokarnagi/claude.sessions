@@ -1473,3 +1473,53 @@ table.wf-runs tr:last-child td { border-bottom: 0; }
 .todo-row.in_progress .todo-mark,
 .todo-row.in_progress .todo-text { color: var(--delegating-pill); font-weight: 600; }
 .todo-row.cancelled .todo-text { color: var(--muted); text-decoration: line-through; }
+
+/* ---- Cost ------------------------------------------------------------------
+   Money gets its own hue (green) so a dollar figure never reads as a status.
+   A cap that has been passed borrows the error red — it is the one number on
+   the page that means something has already stopped. */
+.cost-badge { font-variant-numeric: tabular-nums; color: var(--assistant);
+  border-color: rgba(63,185,80,.3); }
+.cost-badge.unpriced { color: var(--muted); border-color: var(--border); }
+.cost-badge.over { color: #f85149; border-color: rgba(248,81,73,.45);
+  background: rgba(248,81,73,.12); }
+.budget-btn { font-variant-numeric: tabular-nums; }
+.budget-btn.over { color: #f85149; border-color: rgba(248,81,73,.45); }
+
+.cost-summary { display: flex; flex-wrap: wrap; gap: 10px; margin: 4px 2px 16px; }
+.cost-stat { flex: 1 1 160px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+.cost-stat.over { border-color: rgba(248,81,73,.45); }
+.cost-stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); }
+.cost-stat .v { font-size: 20px; font-weight: 700; color: var(--text);
+  font-variant-numeric: tabular-nums; }
+.cost-stat.over .v { color: #f85149; }
+.cost-stat .sub { font-size: 11px; color: var(--muted); }
+
+.cost-tabs { display: flex; gap: 6px; margin: 0 2px 12px; }
+.cost-tab { font-size: 12px; padding: 5px 12px; border-radius: 999px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted); }
+.cost-tab:hover { border-color: var(--accent); color: var(--accent); }
+.cost-tab.current { color: var(--accent); border-color: var(--accent);
+  background: rgba(88,166,255,.12); }
+
+.cost-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cost-table th { text-align: left; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); font-weight: 600;
+  padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.cost-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.cost-table .num { text-align: right; font-variant-numeric: tabular-nums;
+  white-space: nowrap; }
+.cost-table th.num { text-align: right; }
+.cost-table .label { max-width: 46vw; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--text); }
+.cost-table .tag { font-size: 10px; color: var(--muted); }
+/* The bar is a proportion, not a measurement — it sits last so a long project
+   path never squeezes it into noise. */
+.cost-table td.bar { width: 22%; min-width: 60px; }
+.cost-table td.bar span { display: block; height: 6px; border-radius: 3px;
+  background: rgba(63,185,80,.55); }
+.cost-note { font-size: 11.5px; color: var(--muted); line-height: 1.6;
+  margin: 18px 2px 0; max-width: 70ch; }
+.cost-note code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
