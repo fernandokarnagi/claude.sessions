@@ -4,11 +4,16 @@ Shared fixtures.
 The agent roster is a folder of markdown files on the machine, so every test
 that touches stages points it at a scratch folder of its own. Nothing reads
 the operator's real ~/.claude/agents.
+
+The full-text index is pointed at a scratch file for the same reason, and its
+background refresh is disarmed: a test that calls /api/search must not spend
+half a minute re-reading the operator's transcripts, nor write over the index
+the running server is using.
 """
 
 import pytest
 
-from server import agents
+from server import agents, index
 
 # What a Claude Code agent file actually looks like: YAML frontmatter naming
 # the agent and saying when to use it, then the system prompt as the body.
@@ -38,3 +43,11 @@ def roster(tmp_path, monkeypatch):
     # same second as the last one can fingerprint identically — so clear it.
     monkeypatch.setattr(agents, "_cache", {"at": 0.0, "sig": None, "agents": []})
     return box
+
+
+@pytest.fixture(autouse=True)
+def search_index(tmp_path, monkeypatch):
+    """A scratch index path, and no background refresh unless a test asks."""
+    monkeypatch.setattr(index, "DB_PATH", str(tmp_path / ".search.db"))
+    monkeypatch.setattr(index, "ensure_fresh", lambda force=False: False)
+    return tmp_path / ".search.db"

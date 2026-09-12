@@ -384,6 +384,34 @@ def _auto_answer_note(sid: str, level: str, choice: int, prompt: dict) -> None:
         print(f"[slack] auto_answer_note failed: {e}")
 
 
+def _budget_note(sid: str | None, event: str, detail: dict) -> None:
+    """Say in Slack that a spend cap has fired.
+
+    A session cap goes into that session's thread, and only if one is already
+    open — same rule as an auto-answer note, so an autonomous session can't
+    open threads on its own. The fleet cap goes to the channel: nothing is
+    auto-answering anywhere any more, and that is worth interrupting for.
+    """
+    try:
+        if event == "fleet-cap":
+            _bolt.client.chat_postMessage(
+                channel=CHANNEL,
+                text=f":octagonal_sign: *fleet budget reached* — "
+                     f"${detail.get('usd', 0):.2f} of a ${detail.get('cap', 0):.2f} "
+                     f"cap. Autonomy is paused; raise the cap or resume it by hand.")
+            return
+        if sid not in _threads:
+            return
+        t = _threads[sid]
+        _bolt.client.chat_postMessage(
+            channel=t["channel"], thread_ts=t["ts"],
+            text=f":moneybag: *budget reached* — ${detail.get('usd', 0):.2f} of a "
+                 f"${detail.get('cap', 0):.2f} cap. Back on *manual*: the session "
+                 f"is untouched, it just stops answering its own prompts.")
+    except Exception as e:
+        print(f"[slack] budget_note failed: {e}")
+
+
 def _notify_waiting(sid: str) -> None:
     try:
         t = _ensure_thread(sid)
@@ -597,6 +625,7 @@ def start() -> None:
         pass
     _load_threads()
     autonomy.set_auto_answer_hook(_auto_answer_note)
+    autonomy.set_budget_hook(_budget_note)
     try:
         from slack_bolt.adapter.socket_mode import SocketModeHandler
         _bolt = _build_app()

@@ -219,3 +219,213 @@ def test_the_first_stage_is_still_named():
 def test_a_follow_up_stage_outranks_the_busy_footer_too():
     for frame in (CONFIRM, REJECT):
         assert tmuxio._OPENCODE_GATE_HEAD_RE.search(frame)
+
+
+# The `question` wizard's closing Review page, captured from a live opencode
+# 1.18.30 on a 120-column pane. A wizard of more than one page ends here rather
+# than committing on the last answer; a lone single-select question submits on
+# the digit and never shows it, which is why it appears only sometimes.
+#
+# It is what the ask parser cannot see: no numbered rows, and a footer reading
+# "enter submit" where the question pages read "enter confirm" (single select)
+# or "enter toggle" (multi). Both of opencode_pending's old anchors missed it,
+# so a session blocked on it was reported idle and nobody ever pressed Enter.
+REVIEW = """\
+  ┃
+  ┃   Favourite colour   Favourite pet   Favourite drink   Confirm
+  ┃
+  ┃  Review
+  ┃
+  ┃  Favourite colour: Red
+  ┃
+  ┃  Favourite pet: Cat
+  ┃
+  ┃  Favourite drink: Tea
+  ┃
+  ┃  ⇆ tab  enter submit  esc dismiss
+  ┃
+"""
+
+# The same page after a one-question wizard. The dialog covers opencode's own
+# footer, so there is no "esc interrupt" left on screen to read either way.
+REVIEW_ONE = """\
+  ┃
+  ┃   Languages   Confirm
+  ┃
+  ┃  Review
+  ┃
+  ┃  Languages: Python
+  ┃
+  ┃  ⇆ tab  enter submit  esc dismiss
+  ┃
+"""
+
+# The question page the wizard sits on *before* the review, for contrast: it
+# has the numbered rows and the "↑↓ select" footer the ask parser keys on.
+ASK = """\
+  ┃
+  ┃   Favourite colour   Favourite pet   Favourite drink   Confirm
+  ┃
+  ┃  What is your favourite colour?
+  ┃
+  ┃  1. Red
+  ┃     Red is bold and energetic.
+  ┃  2. Blue
+  ┃     Blue is calm and steady.
+  ┃  3. Type your own answer
+  ┃
+  ┃  ⇆ tab  ↑↓ select  enter confirm  esc dismiss
+  ┃
+"""
+
+
+def test_the_review_page_is_a_pending_card():
+    """The bug: the wizard's last page answered to neither anchor, so a session
+    blocked on it read as idle and the confirmation never reached the board."""
+    for frame in (REVIEW, REVIEW_ONE):
+        card = tmuxio.parse_opencode_review(frame)
+        assert card is not None
+        assert card["stage"] == "review"
+
+
+def test_the_review_page_offers_submit_and_dismiss():
+    """Enter sends the answers, Escape drops the question. Numbered 1..N like
+    every other card so the board's approval UI needs no special case."""
+    card = tmuxio.parse_opencode_review(REVIEW)
+    assert [(o["num"], o["label"]) for o in card["options"]] == [
+        (1, "Submit"), (2, "Dismiss")]
+    assert card["options"][0]["selected"]      # Enter is the default
+
+
+def test_the_review_page_carries_the_answers_being_submitted():
+    """Confirming blind is the whole failure mode this replaces, so the answers
+    have to travel with the card."""
+    assert tmuxio.parse_opencode_review(REVIEW)["question"] == (
+        "Review — Favourite colour: Red — Favourite pet: Cat "
+        "— Favourite drink: Tea")
+
+
+def test_the_tab_strip_is_not_mistaken_for_an_answer():
+    """It sits above the heading, which is why the body is read downwards from
+    there rather than upwards from the footer."""
+    assert "Confirm" not in tmuxio.parse_opencode_review(REVIEW)["question"]
+
+
+def test_a_question_page_is_not_a_review_page():
+    """"enter confirm" is not "enter submit" — the ask parser still owns the
+    numbered pages, and the review parser must not claim them."""
+    assert tmuxio.parse_opencode_review(ASK) is None
+    assert tmuxio.parse_opencode_ask(ASK) is not None
+
+
+def test_neither_gate_stage_is_a_review_page():
+    for frame in (GATE, CONFIRM, REJECT):
+        assert tmuxio.parse_opencode_review(frame) is None
+
+
+def test_an_idle_or_busy_screen_is_not_a_review_page():
+    assert tmuxio.parse_opencode_review(IDLE) is None
+    assert tmuxio.parse_opencode_review(BUSY) is None
+    assert tmuxio.parse_opencode_review(None) is None
+
+
+def test_the_review_page_outranks_the_busy_footer():
+    """Its dialog covers opencode's footer, but a stale spinner line above it
+    would otherwise leave the session reading THINKING while it is blocked."""
+    assert tmuxio._OPENCODE_REVIEW_FOOT_RE.search(REVIEW)
+    assert not tmuxio._OPENCODE_REVIEW_FOOT_RE.search(BUSY)
+    assert not tmuxio._OPENCODE_REVIEW_FOOT_RE.search(IDLE)
+
+
+# A multiSelect question. Same numbered dialog as ASK, but every row carries a
+# box and the footer says "enter toggle" instead of "enter confirm" — a digit
+# ticks a box and the page stays up, so the digit is not the answer. Real
+# captures from a 120-column pane; MULTI_TICKED is the same page after 2 and 4
+# were pressed.
+MULTI = """\
+  ┃
+  ┃   Languages   Confirm
+  ┃
+  ┃  Which languages should I use? (select all that apply)
+  ┃
+  ┃  1. [ ] Python
+  ┃     Python
+  ┃  2. [ ] TypeScript
+  ┃     TypeScript
+  ┃  3. [ ] Go
+  ┃     Go
+  ┃  4. [ ] Rust
+  ┃     Rust
+  ┃  5. [ ] Type your own answer
+  ┃
+  ┃  ⇆ tab  ↑↓ select  enter toggle  esc dismiss
+  ┃
+"""
+
+MULTI_TICKED = """\
+  ┃
+  ┃   Langs   Confirm
+  ┃
+  ┃  Pick languages (select all that apply)
+  ┃
+  ┃  1. [ ] Python
+  ┃     Python
+  ┃  2. [✓] TypeScript
+  ┃     TypeScript
+  ┃  3. [ ] Go
+  ┃     Go
+  ┃  4. [✓] Rust
+  ┃     Rust
+  ┃  5. [ ] Type your own answer
+  ┃
+  ┃  ⇆ tab  ↑↓ select  enter toggle  esc dismiss
+  ┃
+"""
+
+
+def test_a_checkbox_question_is_flagged_as_multi():
+    """The board draws a tick-many panel off this flag. Without it the page got
+    the pick-one buttons, whose digit only ticks a box."""
+    assert tmuxio.parse_opencode_ask(MULTI)["multi"]
+    assert not tmuxio.parse_opencode_ask(ASK).get("multi")
+
+
+def test_the_box_is_split_off_the_label():
+    """The label reaches the board as the option's text, not "[ ] Python"."""
+    card = tmuxio.parse_opencode_ask(MULTI)
+    assert [(o["num"], o["label"]) for o in card["options"]] == [
+        (1, "Python"), (2, "TypeScript"), (3, "Go"), (4, "Rust")]
+
+
+def test_a_ticked_box_comes_back_checked():
+    """The board pre-ticks from this, and sends back only what changed — so a
+    box read the wrong way round un-ticks an answer the user meant to keep."""
+    checked = {o["label"]: o["checked"]
+               for o in tmuxio.parse_opencode_ask(MULTI_TICKED)["options"]}
+    assert checked == {"Python": False, "TypeScript": True,
+                       "Go": False, "Rust": True}
+    assert not any(o["checked"]
+                   for o in tmuxio.parse_opencode_ask(MULTI)["options"])
+
+
+def test_the_free_text_row_is_not_a_checkbox():
+    """"Type your own answer" wears a box too, but it opens a textarea rather
+    than ticking, so it stays out of the list and keeps its own number."""
+    card = tmuxio.parse_opencode_ask(MULTI)
+    assert card["custom"] == 5
+    assert all(o["num"] != 5 for o in card["options"])
+
+
+def test_each_row_keeps_its_description():
+    card = tmuxio.parse_opencode_ask(MULTI)
+    assert [o["desc"] for o in card["options"]] == [
+        "Python", "TypeScript", "Go", "Rust"]
+
+
+def test_a_checkbox_question_refuses_a_pick_one_answer():
+    """Sending the digit would tick a box and report the question answered,
+    which is how the wizard used to stall on the same page."""
+    out = tmuxio._opencode_ask_answer("nope", tmuxio.parse_opencode_ask(MULTI),
+                                      1, None)
+    assert not out["ok"]
+    assert "answer-multi" in out["error"]

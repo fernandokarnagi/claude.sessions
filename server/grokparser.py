@@ -217,7 +217,11 @@ def _activities(session_dir: str, limit: int, with_ts: bool = False) -> list[dic
     """Recent readable turns (chronological). Reads only the file's tail lines.
 
     with_ts also mines updates.jsonl for per-turn timestamps (detail view only —
-    the board's 3-line preview doesn't show times and isn't worth the read)."""
+    the board's 3-line preview doesn't show times and isn't worth the read).
+
+    Turn text is never cut. A board card clips its preview in CSS, which is what
+    parser.py has always done for Claude sessions — a character cut here reached
+    the history view too and lost the end of long answers."""
     path = os.path.join(session_dir, "chat_history.jsonl")
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -251,7 +255,7 @@ def _activities(session_dir: str, limit: int, with_ts: bool = False) -> list[dic
         # kind carries the role (user/assistant/thinking/tool_result) so the UI
         # labels each turn and styles assistant replies — not a flat "grok".
         acts.append({"kind": kind, "name": None, "ts": ts,
-                     "role": kind, "text": text[:2000]})
+                     "role": kind, "text": text})
     if with_ts:
         # Fill across the whole transcript, then trim — a kept turn's neighbour
         # may well be one that got sliced off.

@@ -199,6 +199,10 @@ def _activities(sid: str, limit: int) -> list[dict]:
     `limit` caps the *parts read*, newest-first, before the noise filter — so a
     board preview costs one small indexed read even on a session with tens of
     thousands of parts, rather than a full-transcript scan.
+
+    Turn text is never cut. A board card clips its preview in CSS, which is what
+    parser.py has always done for Claude sessions — a character cut here reached
+    the history view too and lost the end of long answers.
     """
     conn = _connect()
     if conn is None:
@@ -241,7 +245,7 @@ def _activities(sid: str, limit: int) -> list[dict]:
             continue
         acts.append({"kind": kind, "name": name,
                      "ts": claude_parser._iso(_ms(r["time_created"])),
-                     "role": kind, "text": text[:2000]})
+                     "role": kind, "text": text})
         if limit and len(acts) >= limit:
             break
     acts.reverse()                       # back to chronological
@@ -437,6 +441,70 @@ def subagent_transcript(sid: str, agent_id: str,
     return None
 
 
+# ---- to-do list --------------------------------------------------------------
+#
+# opencode's TUI keeps a Todo panel: the plan the agent wrote for itself, ticked
+# off as it goes. It lives in the `todowrite` tool's input — every call rewrites
+# the whole list, so the newest call *is* the current plan and the older ones are
+# its history. Only the newest is read here, which is what the TUI shows.
+
+_TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
+# Nothing left to watch: a list of only these is a plan that has run its course.
+_DONE_TODOS = ("completed", "cancelled")
+
+
+def todos(sid: str) -> list[dict]:
+    """The session's current to-do list, in the order the agent wrote it.
+
+    Empty when the session never called `todowrite` — plenty of sessions are one
+    question and an answer, and those have no plan to show.
+
+    Also empty once the plan belongs to a finished task. A session lives for
+    days and its last `todowrite` stays on disk, so a list written before the
+    newest user prompt is answering an older question — "Todo 5/5 done" on the
+    header while the agent works on something unrelated. The task boundary is
+    the one `subagents` already uses: the last user prompt. The agent rewrites
+    the list as soon as it plans the new task, and the panel returns with it.
+
+    A finished plan is empty too. Every item completed (or cancelled) means
+    nothing is in flight, and the panel is there to answer "where is it right
+    now?" — a 5/5 list hanging on the header after the agent has moved on is
+    the old answer to an old question.
+    """
+    rows = _query(
+        "SELECT time_created, data FROM part WHERE session_id = ? "
+        "AND json_extract(data,'$.tool') = 'todowrite' "
+        "ORDER BY time_created DESC, id DESC LIMIT 1", (sid,))
+    if not rows:
+        return []
+    since = _last_prompt(sid)
+    written = _ms(rows[0]["time_created"]) or 0
+    if since is not None and written < since:
+        return []
+    state = _loads(rows[0]["data"]).get("state") or {}
+    items = (state.get("input") or {}).get("todos")
+    if not isinstance(items, list):
+        # A call still running has no input echoed back yet on some versions;
+        # the completed metadata carries the same list.
+        items = (state.get("metadata") or {}).get("todos")
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        content = str(it.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(it.get("status") or "pending")
+        out.append({
+            "content": content,
+            "status": status if status in _TODO_STATUSES else "pending",
+            "priority": str(it.get("priority") or "") or None,
+        })
+    if out and all(t["status"] in _DONE_TODOS for t in out):
+        return []
+    return out
+
+
 def _summarize(row: sqlite3.Row, step_count: int) -> dict:
     sid = row["id"]
     mtime = _ms(row["time_updated"])
@@ -547,6 +615,7 @@ def get_session(sid: str) -> dict | None:
     detail = dict(s)
     detail["activities"] = acts
     detail["subagents"] = subagents(sid)
+    detail["todos"] = todos(sid)
     return detail
 
 

@@ -22,10 +22,11 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (agents, agyparser, archives, attention, autonomy, descriptions,
-               grokparser, models, ollamausage, opencodeparser, overrides,
-               parser, pins, projects, registry, runner, slackbot,
-               subagents, summaries, summarizer, tasks, tmuxio, workflows)
+from . import (agents, agyparser, archives, attention, autonomy, budgets,
+               descriptions, grokparser, index, ledger, models, ollamausage,
+               opencodeparser, overrides, parser, pins, prices, projects,
+               registry, runner, slackbot, subagents, summaries, summarizer,
+               tasks, tmuxio, workflows)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -81,7 +82,7 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
               titles: dict | None = None, archived: set | None = None,
               live_ids: set | None = None, marked: set | None = None,
               working_ids: set | None = None, errors: dict | None = None,
-              descs: dict | None = None) -> dict:
+              descs: dict | None = None, caps: dict | None = None) -> dict:
     """Attach origin (cli/vscode/web), live flags, title override, archived flag.
 
     A session is 'web' only if either (a) a web turn is generating right now,
@@ -147,6 +148,15 @@ def _decorate(summary: dict, web_mtimes: dict, running: set[str],
         summary["error"] = errs.get(sid)
     else:
         summary["error"] = None
+
+    # What the session has spent, and the cap it runs under. cost.priced is
+    # False for subscription and local models: the UI shows their token count
+    # and no dollars, because a dollar figure there would be invented.
+    cost = ledger.for_session(summary)
+    caps = caps if caps is not None else budgets.all_caps()
+    cap = caps.get(sid)
+    summary["cost"] = cost
+    summary["budget"] = budgets.over(summary, cost=cost, cap=cap) if cap else None
     return _apply_delegating(summary)
 
 
@@ -183,8 +193,10 @@ def api_sessions(limit: str = Query("10"), offset: int = Query(0),
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
     wf_map = workflows.bindings_by_session()
+    caps = budgets.all_caps()
     for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux)
+        _decorate(s, web_mtimes, running, titles, arch_ids, live_ids=live_tmux,
+                  caps=caps)
         sid = s["session_id"]
         s["pending_approval"] = sid in gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
@@ -398,40 +410,129 @@ def _apply_opencode_live(s: dict, session_id: str) -> None:
 
 
 @app.get("/api/search")
-def api_search(q: str = Query(""), archived: str | None = Query(None)):
-    """Search by id/title/project. Archived sessions are excluded unless
-    `archived=include`."""
+def api_search(q: str = Query(""), archived: str | None = Query(None),
+               mode: str = Query("both"), limit: int = Query(40),
+               per_session: int = Query(5)):
+    """Search sessions by header (id/title/project) and by transcript text.
+
+    `mode` is meta (headers only — the old behaviour), text (transcripts only),
+    or both (the default). Every session in the answer is the same full board
+    summary the dashboard renders, so a result row can show status, model,
+    tokens, cost and tasks without a second request. Text matches carry their
+    snippets in `hits`, keyed by session id.
+
+    Archived sessions are excluded unless `archived=include`.
+    """
+    mode = (mode or "both").lower()
+    if mode not in ("meta", "text", "both"):
+        raise HTTPException(status_code=400, detail="mode must be meta, text or both")
     include_archived = (archived or "").lower() in ("1", "true", "include", "yes")
     web_mtimes, running, titles = registry.web_mtimes(), runner.running_ids(), overrides.all_titles()
     live_tmux = tmuxio.tmux_sessions()
     arch_ids = archives.archived_ids()
-    data = parser.search_sessions(q, extra_titles=titles)
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
-    kept = []
-    for s in data["sessions"]:
-        _decorate(s, web_mtimes, running, titles, live_ids=live_tmux)
-        if include_archived or not s.get("archived"):
-            s["projects"] = proj_map.get(s["session_id"], [])
-            s["task_count"] = task_counts.get(s["session_id"], 0)
-            kept.append(s)
-    data["sessions"] = kept
-    # Include matching agy conversations (by id / title / project).
+    caps = budgets.all_caps()
     ql = q.lower().strip()
-    if ql:
+
+    def tag(s: dict) -> dict:
+        s["projects"] = proj_map.get(s["session_id"], [])
+        s["task_count"] = task_counts.get(s["session_id"], 0)
+        return s
+
+    data = {"sessions": [], "total": 0}
+    if mode in ("meta", "both"):
+        data = parser.search_sessions(q, extra_titles=titles)
+        kept = []
+        for s in data["sessions"]:
+            _decorate(s, web_mtimes, running, titles, live_ids=live_tmux, caps=caps)
+            if include_archived or not s.get("archived"):
+                kept.append(tag(s))
+        data["sessions"] = kept
+        # Matching agy / grok / opencode conversations (by id / title / project).
+        if ql:
+            marked = attention.marked_ids()
+            for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
+                      + _grok_summaries(titles, arch_ids, marked, mode="all")
+                      + _opencode_summaries(titles, arch_ids, marked, mode="all")):
+                if not include_archived and s.get("archived"):
+                    continue
+                if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
+                        or ql in (s["project"] or "").lower()
+                        or ql in (s["cwd"] or "").lower()):
+                    data["sessions"].append(tag(s))
+
+    hits: dict = {}
+    if ql and mode in ("text", "both"):
+        # Kicked, never waited on: a first build over a large fleet takes tens
+        # of seconds, and a search box that hangs that long is worse than one
+        # that is briefly incomplete.
+        index.ensure_fresh()
+        found = index.search(q, limit=limit, per_session=per_session)
+        hits = found["hits"]
+        have = {s["session_id"] for s in data["sessions"]}
+        extra = [sid for sid in found["order"] if sid not in have]
+        if extra:
+            for s in _summaries_for_ids(extra, titles, arch_ids, web_mtimes,
+                                        running, live_tmux, caps):
+                if not include_archived and s.get("archived"):
+                    continue
+                data["sessions"].append(tag(s))
+        # A text hit is the reason its session is here — put those first, in
+        # the order the index ranked them.
+        rank = {sid: i for i, sid in enumerate(found["order"])}
+        data["sessions"].sort(key=lambda s: rank.get(s["session_id"], len(rank) + 1))
+
+    kept_ids = {s["session_id"] for s in data["sessions"]}
+    data["hits"] = {sid: v for sid, v in hits.items() if sid in kept_ids}
+    data["mode"] = mode
+    data["index"] = index.stats() if mode in ("text", "both") else None
+    data["total"] = len(data["sessions"])
+    return data
+
+
+def _summaries_for_ids(sids, titles, arch_ids, web_mtimes, running,
+                       live_tmux, caps) -> list:
+    """Board summaries for a set of session ids, whatever provider they are on.
+
+    Claude sessions are looked up one at a time (a stat plus a cached parse);
+    the other three are only enumerated if an id is left over, because those
+    stores have no by-id lookup that skips the fleet scan.
+    """
+    out, remaining = [], []
+    for sid in sids:
+        s = parser._summary_for_id(sid)
+        if s is None:
+            remaining.append(sid)
+            continue
+        _decorate(s, web_mtimes, running, titles, live_ids=live_tmux, caps=caps)
+        out.append(s)
+    if remaining:
+        want = set(remaining)
         marked = attention.marked_ids()
         for s in (_agy_summaries(titles, arch_ids, marked, mode="all")
                   + _grok_summaries(titles, arch_ids, marked, mode="all")
                   + _opencode_summaries(titles, arch_ids, marked, mode="all")):
-            if not include_archived and s.get("archived"):
-                continue
-            if (ql in s["session_id"].lower() or ql in (s["title"] or "").lower()
-                    or ql in (s["project"] or "").lower() or ql in (s["cwd"] or "").lower()):
-                s["projects"] = proj_map.get(s["session_id"], [])
-                s["task_count"] = task_counts.get(s["session_id"], 0)
-                data["sessions"].append(s)
-    data["total"] = len(data["sessions"])
-    return data
+            if s["session_id"] in want:
+                out.append(s)
+    return out
+
+
+@app.get("/api/search/index")
+def api_search_index():
+    """What the full-text index currently holds."""
+    return index.stats()
+
+
+@app.post("/api/search/reindex")
+def api_search_reindex(rebuild: bool = Query(False)):
+    """Kick a pass over the transcripts. `rebuild=true` throws the index away
+    first — the repair for an index you no longer trust. Returns immediately;
+    the pass runs in the background."""
+    if rebuild:
+        index.drop()
+    started = index.ensure_fresh(force=True)
+    return {"started": started, "rebuild": rebuild, "index": index.stats()}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -1399,8 +1500,14 @@ def api_answer_multi(session_id: str, body: AnswerMultiBody):
 
     A digit only toggles a checkbox in that widget, so this can't go through
     /answer — it ticks each option, walks the cursor to Submit, and confirms.
+
+    opencode has the same widget with different keys: no Submit row to walk to,
+    Tab instead carries the wizard to its Review page, so it gets its own path.
     """
-    result = tmuxio.answer_multi(session_id, body.nums)
+    if opencodeparser.has_session(session_id):
+        result = tmuxio.opencode_answer_multi(session_id, body.nums)
+    else:
+        result = tmuxio.answer_multi(session_id, body.nums)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error", "answer failed"))
     return result
@@ -1502,7 +1609,7 @@ def api_reset(session_id: str):
     # the exact loss this endpoint exists to prevent.
     if new_id and new_id != session_id:
         for store in (overrides, descriptions, tasks, pins, projects, autonomy,
-                      attention, workflows):
+                      attention, workflows, budgets):
             store.rekey(session_id, new_id)
     if not result.get("ok"):
         # Retiring the old id is deliberately *not* done here. A failed rename
@@ -1533,6 +1640,7 @@ def api_triage():
     proj_map = projects.tags_by_session()
     task_counts = tasks.counts_by_session()
     wf_map = workflows.bindings_by_session()
+    caps = budgets.all_caps()
     out = []
     for s in data["sessions"]:
         sid = s["session_id"]
@@ -1544,7 +1652,7 @@ def api_triage():
         if not (is_live or is_marked):
             continue
         _decorate(s, web_mtimes, running, titles, arch_ids,
-                  live_ids=live_tmux, marked=marked)
+                  live_ids=live_tmux, marked=marked, caps=caps)
         s["pending_approval"] = is_gated
         s["autonomy"] = levels.get(sid, autonomy.DEFAULT)
         s["prompt"] = tmuxio.pending(sid) if is_gated else None
@@ -1627,6 +1735,89 @@ class PauseBody(BaseModel):
 def api_autonomy_pause(body: PauseBody):
     return {"paused": autonomy.set_paused(body.paused),
             "env_disabled": autonomy.env_disabled()}
+
+
+# ---------------------------------------------------------------------------
+# Cost — what the fleet has spent, and the caps it runs under.
+# ---------------------------------------------------------------------------
+@app.get("/api/cost")
+def api_cost(group: str = Query("project"), days: int = Query(30),
+             archived: str | None = Query(None)):
+    """Fleet spend, grouped.
+
+    `group` is project, model, day or all. Every group carries `priced`:
+    False means some of its sessions run on a subscription or locally, so the
+    dollar figure is only the metered part — the token count is the whole of
+    it.
+    """
+    group = (group or "project").lower()
+    if group not in ("project", "model", "day", "all"):
+        raise HTTPException(status_code=400,
+                            detail="group must be project, model, day or all")
+    arch_ids = archives.archived_ids()
+    mode = "all" if (archived or "").lower() in ("1", "true", "include", "yes") \
+        else "exclude"
+    sessions = parser.list_sessions(limit=None, archived_ids=arch_ids,
+                                    archived_mode=mode)["sessions"]
+    out = ledger.rollup(sessions)
+    if group in ("day", "all"):
+        out["by_day"] = ledger.by_day(sessions, days=max(0, days))
+    if group == "project":
+        out.pop("by_model", None)
+    elif group == "model":
+        out.pop("by_project", None)
+    if group == "day":
+        out.pop("by_project", None)
+        out.pop("by_model", None)
+    out["days"] = days
+    out["budgets"] = budgets.state()
+    return out
+
+
+@app.get("/api/sessions/{session_id}/budget")
+def api_get_budget(session_id: str):
+    summary = parser._summary_for_id(session_id)
+    cap = budgets.get(session_id)
+    if not summary:
+        return {"session_id": session_id, "cap": cap, "usd": 0.0,
+                "over": False, "priced": False}
+    out = budgets.over(summary, cap=cap)
+    out["session_id"] = session_id
+    out["enforced"] = budgets.was_enforced(session_id)
+    return out
+
+
+class BudgetBody(BaseModel):
+    # None or 0 clears the cap. A cap is dollars, not tokens: tokens don't
+    # compare across models, so a token ceiling would mean a different amount
+    # of work on every one.
+    cap: float | None = None
+
+
+@app.put("/api/sessions/{session_id}/budget")
+def api_set_budget(session_id: str, body: BudgetBody):
+    cap = budgets.set_cap(session_id, body.cap)
+    return {"session_id": session_id, "cap": cap}
+
+
+@app.get("/api/budget/fleet")
+def api_get_fleet_budget():
+    return budgets.state()
+
+
+@app.put("/api/budget/fleet")
+def api_set_fleet_budget(body: BudgetBody):
+    cap = budgets.set_fleet_cap(body.cap)
+    return {"fleet_cap": cap, "enabled": budgets.enabled()}
+
+
+@app.get("/api/prices")
+def api_prices():
+    """The rate table in force, so the cost page can say where a number came
+    from rather than just showing it."""
+    return {"rates": prices.table(), "builtin": prices.RATES,
+            "classes": [prices.METERED, prices.SUBSCRIPTION,
+                        prices.LOCAL, prices.UNKNOWN]}
 
 
 # ---------------------------------------------------------------------------
@@ -1972,7 +2163,8 @@ def api_advance_stage(session_id: str, body: AdvanceBody):
 
 
 @app.get("/")
-def index():
+def serve_index():
+    # Not `index` — that name is the full-text index module in this file.
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
@@ -1984,6 +2176,11 @@ def session_page():
 @app.get("/search.html")
 def search_page():
     return FileResponse(os.path.join(STATIC_DIR, "search.html"))
+
+
+@app.get("/cost.html")
+def cost_page():
+    return FileResponse(os.path.join(STATIC_DIR, "cost.html"))
 
 
 @app.get("/archived.html")

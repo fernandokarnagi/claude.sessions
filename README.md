@@ -79,9 +79,16 @@ pytest), and starts uvicorn. Open the URL in your browser. Stop with **Ctrl+C**.
   reply live, with a permission-mode dropdown and a "now using <model>" badge.
 
 ### Search (`/search.html`)
-- Match by **title, session ID, cwd/project path, or renamed title**.
-- Case-insensitive; supports **glob wildcards** (`*docker*`, `build*`, `report?`). Plain text
+- **Headers** — match by **title, session ID, cwd/project path, or renamed title**.
+  Case-insensitive; supports **glob wildcards** (`*docker*`, `build*`, `report?`). Plain text
   is a "contains" match.
+- **Transcripts** — full-text over everything ever said in a session, on all four providers
+  (Claude, agy, grok, opencode). Quote a phrase (`"retry topic"`) for an exact match.
+- A result carries the **whole session header** — status, model, tokens, cost, project, tasks —
+  plus every matching message with the hit highlighted, and an `open session →` link.
+- The index is SQLite FTS5 at `server/.search.db`, built in the background and refreshed
+  incrementally; only a session whose transcript actually moved is re-read. **🔄 Reindex**
+  forces a pass. Delete the file and it rebuilds itself — the transcripts are never touched.
 
 ### CLI transcript viewer
 - `watch_session.py` / `watch.sh` — tail a running session's transcript in the terminal with
@@ -262,8 +269,9 @@ claude.sessions/
 │   ├── overrides.py         # persisted custom title overrides
 │   ├── summaries.py         # persisted "what's expected" summaries (keyed by mtime)
 │   ├── summarizer.py        # generates summaries via `claude --print` (isolated + cleaned up)
+│   ├── index.py             # SQLite FTS5 full-text index over every provider's transcripts
 │   └── static/              # index.html, session.html, search.html, app.js, style.css
-└── tests/                   # pytest suite (391 tests)
+└── tests/                   # pytest suite (604 tests)
 ```
 
 - **`parser.py`** is pure/file-based and independently testable. Summaries are cached per file
@@ -282,13 +290,16 @@ claude.sessions/
 | PUT | `/api/sessions/{id}/title` | Set custom title (empty body reverts) |
 | DELETE | `/api/sessions/{id}/title` | Clear custom title |
 | POST | `/api/sessions/{id}/send` | Resume a turn; **SSE** stream of events |
-| GET | `/api/search?q=` | Search by title/id/path (wildcards) |
+| GET | `/api/search?q=&mode=` | Search headers (`meta`), transcripts (`text`), or both (default) |
+| GET | `/api/search/index` | What the full-text index holds |
+| POST | `/api/search/reindex` | Kick an index pass (`?rebuild=true` starts over) |
 
 ### Local state files (gitignored, never committed)
 - `server/.web_sessions.json` — per-session mtime of the last web-driven turn (WEB/CLI origin).
 - `server/.title_overrides.json` — your custom session titles.
 - `server/.waiting_summaries.json` — cached "what's expected" summaries.
 - `server/.workflows.json` — workflow blueprints (stages) plus their per-session bindings and stage run logs.
+- `server/.search.db` — the full-text index. Derived from the transcripts; delete it to rebuild.
 
 These hold per-user runtime data. Back them up if you want to preserve renames across machines.
 
@@ -311,7 +322,7 @@ These hold per-user runtime data. Back them up if you want to preserve renames a
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # run the test suite (391 tests)
+.venv/bin/python -m pytest tests/ -q     # run the test suite (604 tests)
 ```
 
 Static assets are referenced with a `?v=N` query; bump it (and rely on the `no-store` header)

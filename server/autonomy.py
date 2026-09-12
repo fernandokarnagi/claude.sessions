@@ -31,7 +31,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from . import agyparser, tmuxio
+from . import agyparser, budgets, ledger, parser, tmuxio
 
 _PATH = os.path.join(os.path.dirname(__file__), ".autonomy.json")
 _lock = threading.Lock()
@@ -67,6 +67,16 @@ _fails: dict[str, tuple[str, int]] = {}
 MAX_ATTEMPTS = 3
 
 POLL_SECS = float(os.environ.get("AUTONOMY_POLL_SECS", "2"))
+
+# How often the watcher prices the fleet against its budget caps. Far slower
+# than the gate poll on purpose: a cap check reads every session summary, and
+# spend cannot move meaningfully inside two seconds.
+BUDGET_SECS = float(os.environ.get("BUDGET_POLL_SECS", "30"))
+_last_budget_check = 0.0
+
+# Hook(sid|None, event, detail) called best-effort when a budget cap fires.
+# `sid` is None for the fleet cap. Events: "session-cap", "fleet-cap".
+_budget_hook: Optional[Callable[[Optional[str], str, dict], None]] = None
 
 
 # --- persistent per-session levels ------------------------------------------
@@ -149,6 +159,14 @@ def set_paused(paused: bool) -> bool:
 def set_auto_answer_hook(fn: Optional[Callable[[str, str, int, dict], None]]) -> None:
     global _hook
     _hook = fn
+
+
+def set_budget_hook(fn: Optional[Callable[[Optional[str], str, dict], None]]) -> None:
+    """Register the notifier for a cap firing. Separate from the auto-answer
+    hook: a budget stop is not an answer, and mirroring it as one would read
+    in Slack as though the agent had approved something."""
+    global _budget_hook
+    _budget_hook = fn
 
 
 # --- policy -----------------------------------------------------------------
@@ -286,9 +304,90 @@ def _agy_pending_ids() -> set:
             and agyparser.parse_gate(tmuxio.capture_pane(sid)) is not None}
 
 
+def _notify_budget(sid: Optional[str], event: str, detail: dict) -> None:
+    if not _budget_hook:
+        return
+    try:
+        _budget_hook(sid, event, detail)
+    except Exception as e:
+        print(f"[budget] hook failed: {e}")
+
+
+def enforce_budgets() -> dict:
+    """Stop sessions that have spent past their cap.
+
+    A session over its cap drops to `manual`: it keeps its place and its
+    context, it just stops answering its own gates. Over the fleet cap, the
+    whole watcher pauses. Nothing is killed — a cap is a brake, not a bin.
+
+    Each breach acts once (budgets.mark_enforced), so raising a cap is the
+    only way to release a session, and a lingering breach doesn't re-post to
+    Slack on every pass.
+
+    Only sessions with a metered model can breach; see budgets.over. The
+    fleet total covers Claude transcripts only — agy, grok and opencode carry
+    no priced usage, so including them would add nothing but a slower pass.
+
+    Returns what it did, so a test (or an operator) can see the decision.
+    """
+    out = {"checked": 0, "stopped": [], "total_usd": 0.0, "fleet_stopped": False}
+    if not budgets.enabled():
+        return out
+    state = budgets.state()
+    caps, fleet = state["caps"], state["fleet_cap"]
+    if not caps and not fleet:
+        return out
+
+    sessions = parser.list_sessions(limit=None)["sessions"]
+    out["checked"] = len(sessions)
+    total = 0.0
+    for s in sessions:
+        c = ledger.for_session(s)
+        total += float(c.get("usd") or 0.0)
+        sid = s.get("session_id") or ""
+        cap = caps.get(sid)
+        if not cap or budgets.was_enforced(sid):
+            continue
+        verdict = budgets.over(s, cost=c, cap=cap)
+        if not verdict["over"]:
+            continue
+        if get(sid) != DEFAULT:
+            set(sid, DEFAULT)
+        budgets.mark_enforced(sid)
+        out["stopped"].append(sid)
+        print(f"[budget] {sid[:8]} spent ${verdict['usd']:.2f} of "
+              f"${cap:.2f} cap → forced to manual")
+        _notify_budget(sid, "session-cap", verdict)
+
+    out["total_usd"] = total
+    if fleet and budgets.fleet_over(total) and not budgets.fleet_enforced():
+        set_paused(True)
+        budgets.mark_fleet_enforced(True)
+        out["fleet_stopped"] = True
+        print(f"[budget] fleet spent ${total:.2f} of ${fleet:.2f} cap "
+              f"→ autonomy paused")
+        _notify_budget(None, "fleet-cap", {"usd": total, "cap": fleet})
+    return out
+
+
+def _budget_pass() -> None:
+    """Run the cap check, at most once every BUDGET_SECS."""
+    global _last_budget_check
+    now = time.time()
+    if now - _last_budget_check < BUDGET_SECS:
+        return
+    _last_budget_check = now
+    enforce_budgets()
+
+
 def _watch() -> None:
     while True:
         try:
+            # Caps are checked even while autonomy is paused: the fleet cap is
+            # what did the pausing, and a session can still be spending by
+            # hand. The check only ever *removes* permission, so running it
+            # under a pause cannot start anything.
+            _budget_pass()
             if not is_paused():
                 gated = tmuxio.pending_ids()
                 for sid in gated:

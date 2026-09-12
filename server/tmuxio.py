@@ -1117,7 +1117,8 @@ def opencode_working(session_id: str) -> bool:
     if not screen:
         return False
     if _OPENCODE_GATE_HEAD_RE.search(screen) \
-            or _OPENCODE_ASK_FOOT_RE.search(screen):
+            or _OPENCODE_ASK_FOOT_RE.search(screen) \
+            or _OPENCODE_REVIEW_FOOT_RE.search(screen):
         return False                      # sitting at a gate, not generating
     tail = "\n".join(screen.splitlines()[-6:])
     return bool(_OPENCODE_BUSY_RE.search(tail))
@@ -1247,6 +1248,34 @@ def parse_opencode_gate(screen: Optional[str],
 _OPENCODE_ASK_FOOT_RE = re.compile(r"↑↓\s*select")
 _OPENCODE_ASK_OPTION_RE = re.compile(r"^(\d+)\.\s+(.+?)\s*$")
 _OPENCODE_ASK_CUSTOM_RE = re.compile(r"^(\[.\]\s*)?Type your own answer$", re.I)
+# A multiSelect question is the same numbered dialog with checkboxes, but its
+# keys mean something else: the footer swaps "enter confirm" for "enter toggle",
+# and a digit ticks a box and leaves the page up instead of answering and moving
+# on. Driving it like a single-select ticked one box and called the question
+# answered, so the wizard sat on the same page forever.
+_OPENCODE_ASK_TOGGLE_RE = re.compile(r"enter\s+toggle", re.I)
+# A wizard of more than one page does not commit on the last answer: it lands on
+# a Review page under the tab strip's closing "Confirm" tab, listing the answers
+# collected so far, and waits for Enter to send them. (A lone single-select
+# question skips it and submits on the digit, which is why the page shows up
+# only sometimes.) Neither of the widget's anchors is on it — no numbered rows,
+# and a footer reading "⇆ tab  enter submit  esc dismiss" rather than
+# "↑↓ select" — so a session parked there read as idle while it was blocked,
+# which is why it needs a parser of its own.
+#
+# "enter submit" is the marker. The question pages say "enter confirm" (single
+# select) or "enter toggle" (multi), and both follow-up stages of the permission
+# gate say "enter confirm" too, so nothing else on screen claims it.
+_OPENCODE_REVIEW_FOOT_RE = re.compile(r"enter\s+submit", re.I)
+# The heading above the answers, and the second half of the anchor: it is what
+# separates the page from a transcript line that merely says "enter submit". It
+# names the page, so it is not itself one of the answers.
+_OPENCODE_REVIEW_HEAD_RE = re.compile(r"^Review$", re.I)
+# Its two actions are the footer's key hints, as with the gate's reject box.
+_OPENCODE_REVIEW_OPTIONS = ("Submit", "Dismiss")
+# Enough answers to read a long wizard back before confirming it, bounded so a
+# tall frame can't turn the question into a wall of text.
+_OPENCODE_REVIEW_MAX = 12
 # A background colour run. The whole dialog is painted with theme.surface, so
 # "has a background" means nothing — the *odd one out* is the highlighted row.
 _OPENCODE_BG_RE = re.compile(r"\x1b\[[0-9;]*?(48;(?:2;\d+;\d+;\d+|5;\d+))")
@@ -1339,7 +1368,7 @@ def parse_opencode_ask(screen: Optional[str],
     selected = _opencode_ask_selected(ansi, len(rows))
     custom = next((n for _, n, label in rows
                    if _OPENCODE_ASK_CUSTOM_RE.match(label)), None)
-    return {
+    out = {
         "question": question or "Question",
         "options": [{"num": n, "label": label, "selected": i == selected}
                     for i, (_, n, label) in enumerate(rows)],
@@ -1348,6 +1377,77 @@ def parse_opencode_ask(screen: Optional[str],
         "raw": "\n".join(lines[top + 1:foot + 1]),
     }
 
+    # A checkbox page: tick any number, then submit. Split the box state off
+    # each label and keep the lines under it as that option's description, which
+    # is the shape parse_prompt already hands the board for Claude Code's own
+    # checkbox widget — so the same tick-many UI renders both.
+    if _OPENCODE_ASK_TOGGLE_RE.search(lines[foot]):
+        opts = []
+        for idx, (i, n, label) in enumerate(rows):
+            m = _CHECKBOX_RE.match(label)
+            if not m:
+                continue
+            text = m.group(2).strip()
+            if _OPENCODE_ASK_CUSTOM_RE.match(text):
+                continue          # free-text row — it opens a box, not a tick
+            end = rows[idx + 1][0] if idx + 1 < len(rows) else foot
+            desc = " ".join(d for d in (_opencode_unbox(l)
+                                        for l in lines[i + 1:end]) if d)
+            opts.append({"num": n, "label": text, "desc": desc,
+                         "checked": m.group(1) != " ",
+                         "selected": idx == selected})
+        if opts:
+            out["multi"] = True
+            out["options"] = opts
+    return out
+
+
+def parse_opencode_review(screen: Optional[str]) -> Optional[dict]:
+    """The `question` wizard's closing Review page, or None.
+
+    Same shape as the other opencode parsers, with `stage` "review". The page
+    holds no selection of its own — Enter sends the answers, Escape drops the
+    whole question — so those two key hints are offered as options 1 and 2 and
+    there is no colour capture to read, unlike the gate and the ask card.
+    """
+    if not screen:
+        return None
+    lines = screen.splitlines()
+    foot = next((i for i in range(len(lines) - 1, -1, -1)
+                 if _OPENCODE_REVIEW_FOOT_RE.search(lines[i])), None)
+    if foot is None:
+        return None
+
+    # The answers sit between the "Review" heading and the footer, one per line
+    # with a blank line between each, inside the dialog's box border. Reading
+    # down from the heading rather than up from the footer keeps the tab strip
+    # above it — which is chrome, not an answer — out of the question.
+    head = next((i for i in range(foot - 1, -1, -1)
+                 if _OPENCODE_REVIEW_HEAD_RE.match(_opencode_unbox(lines[i]))),
+                None)
+    if head is None:
+        return None
+    answers = [b for b in (_opencode_unbox(l) for l in lines[head + 1:foot])
+               if b and not _OPENCODE_HINT_RE.search(b)]
+
+    return {
+        "question": " — ".join(["Review", *answers[:_OPENCODE_REVIEW_MAX]]),
+        "options": [{"num": i + 1, "label": l, "selected": i == 0}
+                    for i, l in enumerate(_OPENCODE_REVIEW_OPTIONS)],
+        "stage": "review",
+        "raw": "\n".join(lines[head:foot + 1]),
+    }
+
+
+def _opencode_review_answer(session_id: str, choice: int) -> dict:
+    """Answer the Review page: Enter sends the collected answers, Escape
+    dismisses the question without answering it."""
+    if choice == 2:
+        _send_keys(session_id, "Escape")
+        return {"ok": True, "choice": 2, "label": "Dismiss"}
+    _send_keys(session_id, "Enter")
+    return {"ok": True, "choice": 1, "label": "Submit"}
+
 
 def _opencode_ask_answer(session_id: str, ask: dict, choice: int,
                          text: Optional[str]) -> dict:
@@ -1355,6 +1455,9 @@ def _opencode_ask_answer(session_id: str, ask: dict, choice: int,
     this row and act on it", so the digit is the whole answer — except on the
     free-text row, where it opens a textarea we then have to fill and submit.
     """
+    if ask.get("multi"):
+        return {"ok": False,
+                "error": "this question ticks boxes — answer it with answer-multi"}
     label = next(o["label"] for o in ask["options"] if o["num"] == choice)
     if choice > 9:
         return {"ok": False,
@@ -1376,11 +1479,14 @@ def opencode_pending(session_id: str) -> Optional[dict]:
     screen = capture_pane(session_id, history=0)
     if screen is None:
         return None
-    # Two unrelated widgets can be waiting on the user: the permission gate and
-    # the `question` tool's dialog. Cheap-reject both before the -e capture.
+    # Three unrelated cards can be waiting on the user: the permission gate, the
+    # `question` tool's numbered dialog, and the Review page that closes that
+    # dialog. Cheap-reject all three before paying for the -e capture, which
+    # only the first two need — the Review page marks nothing by colour.
     is_gate = bool(_OPENCODE_GATE_HEAD_RE.search(screen))
-    if not is_gate and not _OPENCODE_ASK_FOOT_RE.search(screen):
-        return None
+    is_ask = bool(_OPENCODE_ASK_FOOT_RE.search(screen))
+    if not is_gate and not is_ask:
+        return parse_opencode_review(screen)
     ansi = capture_pane_ansi(session_id)
     if is_gate:
         return parse_opencode_gate(screen, ansi)
@@ -1467,6 +1573,10 @@ def opencode_answer(session_id: str, choice: int, text: Optional[str] = None,
     "Allow always" and "Reject" only open a follow-up — Confirm/Cancel, or a box
     asking what to do instead — so this drives that one too and a single call
     finishes the gate. `text` is the reason to type into a rejection box.
+
+    The `question` tool's cards come through here as well: its numbered dialog,
+    and the Review page that closes it, where option 1 sends the answers and
+    option 2 dismisses the question.
     """
     gate = opencode_pending(session_id)
     if gate is None:
@@ -1476,6 +1586,8 @@ def opencode_answer(session_id: str, choice: int, text: Optional[str] = None,
         return {"ok": False,
                 "error": f"choice {choice} out of range (1..{len(opts)})"}
 
+    if gate.get("stage") == "review":
+        return _opencode_review_answer(session_id, choice)
     if gate.get("stage") == "ask":
         return _opencode_ask_answer(session_id, gate, choice, text)
     if gate.get("stage") == "reject":
@@ -1488,6 +1600,51 @@ def opencode_answer(session_id: str, choice: int, text: Optional[str] = None,
     if follow:
         picked.update(follow)
     return picked
+
+
+def opencode_answer_multi(session_id: str, nums: list[int],
+                          timeout: float = 8.0) -> dict:
+    """Tick `nums` on a live opencode checkbox question, then move it along.
+
+    `nums` are the rows whose state must change, since the digit is a toggle —
+    the same contract the board's checkbox panel already sends. Nothing on the
+    page commits the answer: Enter toggles too, and the page only ends when Tab
+    carries the wizard to its next tab. So this ticks, tabs once, and presses
+    Enter if that tab is the closing Review page; if it is another question
+    instead, it leaves it standing for the board to show.
+    """
+    ask = opencode_pending(session_id)
+    if ask is None:
+        return {"ok": False, "error": "no opencode question on screen"}
+    if not ask.get("multi"):
+        return {"ok": False, "error": "the question on screen is not a checkbox one"}
+
+    live = {o["num"] for o in ask["options"]}
+    bad = [n for n in nums if n not in live]
+    if bad:
+        return {"ok": False,
+                "error": f"no such option: {', '.join(str(n) for n in bad)}"}
+    if any(n > 9 for n in nums):
+        return {"ok": False,
+                "error": "options past 9 have no digit key in opencode"}
+
+    for n in nums:
+        _send_keys(session_id, str(n))
+        time.sleep(0.35)                   # the box redraws before the next key
+
+    _send_keys(session_id, "Tab")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.4)
+        nxt = opencode_pending(session_id)
+        if nxt is None:
+            break                          # the wizard closed on its own
+        if nxt.get("stage") == "review":
+            _send_keys(session_id, "Enter")
+            return {"ok": True, "nums": nums, "submitted": True}
+        if nxt.get("raw") != ask.get("raw"):
+            return {"ok": True, "nums": nums, "submitted": False}
+    return {"ok": True, "nums": nums, "submitted": False}
 
 
 def _opencode_input_pending(session_id: str, snippet: str) -> bool:
